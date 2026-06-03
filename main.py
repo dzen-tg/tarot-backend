@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from urllib.parse import parse_qsl
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, EmailStr
@@ -23,9 +24,16 @@ from aiogram.types import LabeledPrice, PreCheckoutQuery, SuccessfulPayment
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен твоего бота от @BotFather (очищается от кавычек, пробелов и переносов строк)
+# Токен твоего бота от @BotFather
 BOT_TOKEN_RAW = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY")
-BOT_TOKEN = BOT_TOKEN_RAW.strip().strip("'").strip('"').replace("\r", "").replace("\n", "")
+
+# Жесткая очистка токена от любых невидимых символов, пробелов, кавычек и спецсимволов
+BOT_TOKEN = BOT_TOKEN_RAW.strip().strip("'").strip('"')
+BOT_TOKEN = re.sub(r'[^a-zA-Z0-9:]', '', BOT_TOKEN)
+
+logger.info(f"BOT_TOKEN raw length: {len(BOT_TOKEN_RAW)}, sanitized length: {len(BOT_TOKEN)}")
+if len(BOT_TOKEN) > 8:
+    logger.info(f"BOT_TOKEN preview: {BOT_TOKEN[:4]}...{BOT_TOKEN[-4:]}")
 
 app = FastAPI(title="Tarot 78 Cards Core Backend", version="1.0.0")
 bot = Bot(token=BOT_TOKEN)
@@ -78,8 +86,15 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
             detail="Ошибка сервера: Переменная TELEGRAM_BOT_TOKEN не настроена на Render.com!"
         )
 
+    # Очищаем заголовок от возможных префиксов авторизации (например, "tga <data>" или "Bearer <data>")
+    telegram_init_data = telegram_init_data.strip()
+    if " " in telegram_init_data:
+        parts = telegram_init_data.split(" ", 1)
+        if "=" not in parts[0]:
+            telegram_init_data = parts[1]
+
     try:
-        parsed_data = dict(parse_qsl(telegram_init_data))
+        parsed_data = dict(parse_qsl(telegram_init_data, keep_blank_values=True))
         if "hash" not in parsed_data:
             logger.error(f"Telegram validation error: Hash missing in initData. Received keys: {list(parsed_data.keys())}")
             raise HTTPException(
@@ -96,7 +111,10 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
         if calculated_hash != received_hash:
-            logger.error(f"Telegram validation error: Hash mismatch! Calculated: {calculated_hash}, Received: {received_hash}")
+            logger.error("Telegram validation error: Hash mismatch!")
+            logger.error(f"Calculated hash: {calculated_hash}")
+            logger.error(f"Received hash: {received_hash}")
+            logger.error(f"Data check string: {data_check_string}")
             raise HTTPException(
                 status_code=403, 
                 detail="Ошибка подписи: Токен бота в Render.com не совпадает с реальным токеном вашего бота. Проверьте вкладку Environment!"
@@ -132,7 +150,7 @@ class InvoiceRequest(BaseModel):
     package_id: int  # 1, 5 или 15 раскладов
 
 
-# --- STREAMING_CHUNK: API ЭНДПОИНТЫ ДЛЯ МИНИ-АПП ---
+# --- API ЭНДПОИНТЫ ДЛЯ МИНИ-АПП ---
 
 @app.get("/")
 async def health_check():
@@ -220,7 +238,7 @@ async def create_invoice(payload: InvoiceRequest, authorization: str = Header(No
         raise HTTPException(status_code=500, detail=f"Ошибка генерации счета: {str(e)}")
 
 
-# --- STREAMING_CHUNK: ОБРАБОТКА ВЕБХУКОВ И ПЛАТЕЖЕЙ STARS (AIOGRAM) ---
+# --- ОБРАБОТКА ВЕБХУКОВ И ПЛАТЕЖЕЙ STARS (AIOGRAM) ---
 
 @dp.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
