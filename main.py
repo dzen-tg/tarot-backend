@@ -23,8 +23,9 @@ from aiogram.types import LabeledPrice, PreCheckoutQuery, SuccessfulPayment
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен твоего бота от @BotFather (автоматически очищается от пробелов и кавычек)
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY").strip().strip("'").strip('"')
+# Токен твоего бота от @BotFather (очищается от кавычек, пробелов и переносов строк)
+BOT_TOKEN_RAW = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY")
+BOT_TOKEN = BOT_TOKEN_RAW.strip().strip("'").strip('"').replace("\r", "").replace("\n", "")
 
 app = FastAPI(title="Tarot 78 Cards Core Backend", version="1.0.0")
 bot = Bot(token=BOT_TOKEN)
@@ -60,30 +61,65 @@ class UserState:
 
 def verify_telegram_init_data(telegram_init_data: str) -> dict:
     """
-    Проверяет валидность данных инициализации Telegram WebApp
-    во избежание подделки запросов начислений баланса.
+    Проверяет валидность данных инициализации Telegram WebApp.
+    Возвращает точные технические ошибки для быстрой настройки.
     """
+    if not telegram_init_data:
+        logger.error("Telegram validation error: Auth header is empty")
+        raise HTTPException(
+            status_code=400, 
+            detail="Вход не выполнен: сессия пуста. Вы запустили приложение внутри Telegram?"
+        )
+        
+    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not BOT_TOKEN:
+        logger.error("CRITICAL CONFIG ERROR: TELEGRAM_BOT_TOKEN environment variable is not configured on Render!")
+        raise HTTPException(
+            status_code=500, 
+            detail="Ошибка сервера: Переменная TELEGRAM_BOT_TOKEN не настроена на Render.com!"
+        )
+
     try:
         parsed_data = dict(parse_qsl(telegram_init_data))
         if "hash" not in parsed_data:
-            logger.error("Telegram validation error: Hash missing in initData")
-            raise HTTPException(status_code=400, detail="Hash missing")
+            logger.error(f"Telegram validation error: Hash missing in initData. Received keys: {list(parsed_data.keys())}")
+            raise HTTPException(
+                status_code=400, 
+                detail="Ошибка сессии: отсутствует цифровой хэш Telegram."
+            )
         
         received_hash = parsed_data.pop("hash")
+        # Сортировка параметров в алфавитном порядке
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
         
+        # Генерация секретного ключа на основе токена бота
         secret_key = hmac.new(b"WebApps", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
         if calculated_hash != received_hash:
             logger.error(f"Telegram validation error: Hash mismatch! Calculated: {calculated_hash}, Received: {received_hash}")
-            raise HTTPException(status_code=403, detail="Hash mismatch")
+            raise HTTPException(
+                status_code=403, 
+                detail="Ошибка подписи: Токен бота в Render.com не совпадает с реальным токеном вашего бота. Проверьте вкладку Environment!"
+            )
         
+        if "user" not in parsed_data:
+            raise HTTPException(
+                status_code=400, 
+                detail="Ошибка данных: Telegram не передал информацию о пользователе."
+            )
+            
         user_data = json.loads(parsed_data["user"])
         return user_data
+        
+    except HTTPException as http_err:
+        # Пробрасываем наши понятные HTTPException без изменений
+        raise http_err
     except Exception as e:
-        logger.error(f"Telegram validation error: {e}")
-        raise HTTPException(status_code=401, detail="Unauthorized session")
+        logger.error(f"Telegram validation unexpected crash: {e}")
+        raise HTTPException(
+            status_code=401, 
+            detail=f"Непредвиденная ошибка валидации сессии: {str(e)}"
+        )
 
 
 class RegisterRequest(BaseModel):
@@ -96,7 +132,7 @@ class InvoiceRequest(BaseModel):
     package_id: int  # 1, 5 или 15 раскладов
 
 
-# --- API ЭНДПОИНТЫ ДЛЯ МИНИ-АПП ---
+# --- STREAMING_CHUNK: API ЭНДПОИНТЫ ДЛЯ МИНИ-АПП ---
 
 @app.get("/")
 async def health_check():
@@ -108,21 +144,18 @@ async def register_user(payload: RegisterRequest, authorization: str = Header(No
     """
     Эндпоинт для легальной регистрации пользователя по законам РК.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing auth header")
-    
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg["id"]
 
     if not payload.consent:
-        raise HTTPException(status_code=400, detail="Consent is mandatory")
+        raise HTTPException(status_code=400, detail="Необходимо ваше согласие с политикой")
 
     user_profile = UserState.get_or_create(user_id, user_tg.get("username"))
     user_profile["name"] = payload.name
     user_profile["email"] = payload.email
     user_profile["consent_given"] = True
     
-    logger.info(f"User {user_id} registered: {payload.name} ({payload.email})")
+    logger.info(f"User {user_id} registered successfully: {payload.name} ({payload.email})")
     
     return {
         "status": "success",
@@ -136,9 +169,6 @@ async def get_user_profile(authorization: str = Header(None)):
     """
     Загружает профиль пользователя при старте приложения.
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing auth header")
-    
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg["id"]
     
@@ -159,9 +189,6 @@ async def create_invoice(payload: InvoiceRequest, authorization: str = Header(No
     - 5 Вопросов: 340 звезд (~$4.5)
     - 15 Вопросов: 900 звезд (~$12)
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing auth header")
-    
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg["id"]
 
@@ -173,7 +200,7 @@ async def create_invoice(payload: InvoiceRequest, authorization: str = Header(No
 
     pkg = packages.get(payload.package_id)
     if not pkg:
-        raise HTTPException(status_code=400, detail="Invalid package ID")
+        raise HTTPException(status_code=400, detail="Неверный ID пакета")
 
     prices = [LabeledPrice(label=pkg["title"], amount=pkg["stars"])]
 
@@ -190,10 +217,10 @@ async def create_invoice(payload: InvoiceRequest, authorization: str = Header(No
         return {"invoice_link": invoice_link}
     except Exception as e:
         logger.error(f"Error producing invoice link: {e}")
-        raise HTTPException(status_code=500, detail="Invoice generation failed")
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации счета: {str(e)}")
 
 
-# --- ОБРАБОТКА ВЕБХУКОВ И ПЛАТЕЖЕЙ STARS (AIOGRAM) ---
+# --- STREAMING_CHUNK: ОБРАБОТКА ВЕБХУКОВ И ПЛАТЕЖЕЙ STARS (AIOGRAM) ---
 
 @dp.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
