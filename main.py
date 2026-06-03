@@ -23,8 +23,8 @@ from aiogram.types import LabeledPrice, PreCheckoutQuery, SuccessfulPayment
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен твоего бота от @BotFather (подгружается из переменных окружения на Render)
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY")
+# Токен твоего бота от @BotFather (автоматически очищается от пробелов и кавычек)
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY").strip().strip("'").strip('"')
 
 app = FastAPI(title="Tarot 78 Cards Core Backend", version="1.0.0")
 bot = Bot(token=BOT_TOKEN)
@@ -66,6 +66,7 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
     try:
         parsed_data = dict(parse_qsl(telegram_init_data))
         if "hash" not in parsed_data:
+            logger.error("Telegram validation error: Hash missing in initData")
             raise HTTPException(status_code=400, detail="Hash missing")
         
         received_hash = parsed_data.pop("hash")
@@ -75,6 +76,7 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
         if calculated_hash != received_hash:
+            logger.error(f"Telegram validation error: Hash mismatch! Calculated: {calculated_hash}, Received: {received_hash}")
             raise HTTPException(status_code=403, detail="Hash mismatch")
         
         user_data = json.loads(parsed_data["user"])
