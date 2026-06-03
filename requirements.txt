@@ -3,3 +3,4 @@ uvicorn
 aiogram
 pydantic
 pydantic-settings
+email-validator
