@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 # Токен твоего бота от @BotFather
 BOT_TOKEN_RAW = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY")
 
-# Жесткая очистка токена от любых невидимых символов, пробелов, кавычек и спецсимволов
+# Очистка токена только от пробелов, переносов строк и кавычек (оставляем _ и -)
 BOT_TOKEN = BOT_TOKEN_RAW.strip().strip("'").strip('"')
-BOT_TOKEN = re.sub(r'[^a-zA-Z0-9:]', '', BOT_TOKEN)
+BOT_TOKEN = re.sub(r'\s+', '', BOT_TOKEN)
 
 logger.info(f"BOT_TOKEN raw length: {len(BOT_TOKEN_RAW)}, sanitized length: {len(BOT_TOKEN)}")
 if len(BOT_TOKEN) > 8:
