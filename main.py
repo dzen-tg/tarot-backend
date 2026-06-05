@@ -148,7 +148,8 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Приветствие при команде /start с кнопкой запуска приложения"""
-    web_app_url = "https://tarot-frontend.vercel.app"  # Твоя ссылка на Vercel
+    web_app=WebAppInfo(url="[https://tarot-frontend-wine.vercel.app](https://tarot-frontend-wine.vercel.app)")
+
     
     # 1. Текст приветствия
     welcome_text = (
