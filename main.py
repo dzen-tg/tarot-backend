@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Инициализация токена бота
-BOT_TOKEN_RAW = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+BOT_TOKEN_RAW = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY")
 BOT_TOKEN = BOT_TOKEN_RAW.strip().strip("'").strip('"')
 BOT_TOKEN = re.sub(r'\s+', '', BOT_TOKEN)  # Удаляем любые пробелы и переносы
 
