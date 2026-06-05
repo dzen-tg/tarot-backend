@@ -22,20 +22,21 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import LabeledPrice, PreCheckoutQuery, SuccessfulPayment, WebAppInfo, MenuButtonWebApp
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация токена бота
-BOT_TOKEN_RAW = os.environ.get("TELEGRAM_BOT_TOKEN", "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY")
+# ЖЕСТКО ВШИТЫЕ КЛЮЧИ И ССЫЛКИ ПОЛЬЗОВАТЕЛЯ
+BOT_TOKEN_RAW = "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY"
+WEB_APP_FRONTEND_URL = "https://tarot-frontend-wine.vercel.app"
+
+# Очистка токена (на всякий случай)
 BOT_TOKEN = BOT_TOKEN_RAW.strip().strip("'").strip('"')
-BOT_TOKEN = re.sub(r'\s+', '', BOT_TOKEN)  # Удаляем любые пробелы и переносы
+BOT_TOKEN = re.sub(r'\s+', '', BOT_TOKEN)
 
 app = FastAPI(title="Tarot Complete Backend")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Настройка CORS для работы с Vercel фронтендом
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,7 +45,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === РАБОТА С БАЗОЙ ДАННЫХ SQLITE ===
 DB_FILE = "users.db"
 
 def init_db():
@@ -101,16 +101,11 @@ def save_or_update_user(user_id: int, username: Optional[str], name: str = "Ис
     conn.close()
     return get_user_from_db(user_id)
 
-# === ВЕРИФИКАЦИЯ ТЕЛЕГРАМ СЕССИИ ===
 def verify_telegram_init_data(telegram_init_data: str) -> dict:
     """Усиленная проверка цифровой подписи Telegram WebApp"""
     if not telegram_init_data:
         raise HTTPException(status_code=400, detail="Сессия не найдена. Пожалуйста, откройте приложение в Telegram.")
         
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not BOT_TOKEN:
-        raise HTTPException(status_code=500, detail="Ошибка конфигурации сервера: отсутствует токен бота.")
-
-    # Очистка заголовка от префиксов tga/Bearer
     telegram_init_data = telegram_init_data.strip()
     if " " in telegram_init_data:
         parts = telegram_init_data.split(" ", 1)
@@ -134,7 +129,7 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
         if calculated_hash != received_hash:
             raise HTTPException(
                 status_code=403, 
-                detail="Сбой авторизации: токен бота на сервере не совпадает с вашим ботом в Telegram."
+                detail="Сбой авторизации: подпись Telegram не совпадает."
             )
         
         return json.loads(parsed_data.get("user", "{}"))
@@ -144,12 +139,9 @@ def verify_telegram_init_data(telegram_init_data: str) -> dict:
         logger.error(f"Error validating initData: {e}")
         raise HTTPException(status_code=401, detail=f"Ошибка валидации сессии: {str(e)}")
 
-# === ВАЛИДАЦИЯ КОМАНДЫ /START И КНОПКИ МЕНЮ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Приветствие при команде /start с кнопкой запуска приложения"""
-    web_app=WebAppInfo(url="[https://tarot-frontend-wine.vercel.app](https://tarot-frontend-wine.vercel.app)")
-
     
     # 1. Текст приветствия
     welcome_text = (
@@ -160,23 +152,22 @@ async def cmd_start(message: types.Message):
         "Нажмите кнопку ниже, чтобы открыть Оракул и вытянуть свою карту."
     )
     
-    # 2. Кнопка под сообщением
+    # 2. Кнопка под сообщением со вшитой ссылкой
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="🔮 Открыть Оракул", web_app=WebAppInfo(url=web_app_url))]
+        [types.InlineKeyboardButton(text="🔮 Открыть Оракул", web_app=WebAppInfo(url=WEB_APP_FRONTEND_URL))]
     ])
     
     # 3. Настройка постоянной кнопки «Оракул» слева от поля ввода сообщения
     try:
         await bot.set_chat_menu_button(
             chat_id=message.chat.id,
-            menu_button=MenuButtonWebApp(text="Оракул", web_app=WebAppInfo(url=web_app_url))
+            menu_button=MenuButtonWebApp(text="Оракул", web_app=WebAppInfo(url=WEB_APP_FRONTEND_URL))
         )
     except Exception as e:
         logger.error(f"Ошибка настройки Menu Button: {e}")
 
     await message.answer(welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
-# === МОДЕЛИ ДАННЫХ ===
 class RegisterRequest(BaseModel):
     name: str
     email: str
@@ -184,8 +175,6 @@ class RegisterRequest(BaseModel):
 
 class InvoiceRequest(BaseModel):
     package_id: int
-
-# --- API ДЛЯ МИНИ-АПП ---
 
 @app.get("/api/user/profile")
 async def get_user_profile(authorization: str = Header(None)):
@@ -263,7 +252,6 @@ async def create_invoice(payload: InvoiceRequest, authorization: str = Header(No
         logger.error(f"Error creating invoice: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка генерации счета: {str(e)}")
 
-# === АДМИН-ПАНЕЛЬ ДЛЯ EMAIL-РАССЫЛОК (ВЫГРУЗКА CSV) ===
 @app.get("/api/admin/export-users")
 async def export_users():
     """Открой в браузере: твой-бэкенд.onrender.com/api/admin/export-users для скачивания базы"""
@@ -284,8 +272,6 @@ async def export_users():
         media_type="text/csv", 
         headers={"Content-Disposition": "attachment; filename=tarot_email_database.csv"}
     )
-
-# === ОБРАБОТКА ТРАНЗАКЦИЙ (AIOGRAM WEBHOOK) ===
 
 @dp.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
