@@ -301,11 +301,10 @@ def get_tarot_deck():
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
     """
-    Отправляет запрос к модели Gemini. Оракул самостоятельно анализирует вопрос пользователя
-    и решает, сколько именно карт (от 3 до 6) требуется извлечь из предложенного списка для 
-    полноценного ответа, возвращая результат в структурированном JSON.
+    Отправляет запрос к модели Gemini. Оракул последовательно пытается обратиться
+    к релизным стабильным моделям gemini-2.5-flash и gemini-1.5-flash.
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={GEMINI_API_KEY}"
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
     
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
     prompt = (
@@ -352,33 +351,34 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
         }
     }
     
-    delays = [1, 2, 4, 8, 16]
     async with httpx.AsyncClient() as client:
-        for i, delay in enumerate(delays):
-            try:
-                response = await client.post(url, json=payload, timeout=40.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                    if raw_text:
-                        clean_text = raw_text.strip()
-                        if clean_text.startswith("```json"):
-                            clean_text = clean_text[7:]
-                        if clean_text.startswith("```"):
-                            clean_text = clean_text[3:]
-                        if clean_text.endswith("```"):
-                            clean_text = clean_text[:-3]
-                        clean_text = clean_text.strip()
-                        return json.loads(clean_text)
-                else:
-                    # Логируем точный ответ об ошибке от Google в логи Render для диагностики
-                    print(f"Ошибка Gemini (попытка {i+1}). Статус: {response.status_code}")
-                    print(f"Ответ Google: {response.text}")
-                await asyncio.sleep(delay)
-            except Exception as e:
-                print(f"Сбой Оракула (попытка {i+1}): {e}")
-                await asyncio.sleep(delay)
-                
+        for model in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            delays = [1, 2, 4]
+            for i, delay in enumerate(delays):
+                try:
+                    response = await client.post(url, json=payload, timeout=40.0)
+                    if response.status_code == 200:
+                        data = response.json()
+                        raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        if raw_text:
+                            clean_text = raw_text.strip()
+                            if clean_text.startswith("```json"):
+                                clean_text = clean_text[7:]
+                            if clean_text.startswith("```"):
+                                clean_text = clean_text[3:]
+                            if clean_text.endswith("```"):
+                                clean_text = clean_text[:-3]
+                            clean_text = clean_text.strip()
+                            return json.loads(clean_text)
+                    else:
+                        print(f"Ошибка Gemini ({model}, попытка {i+1}). Статус: {response.status_code}")
+                        print(f"Ответ Google: {response.text}")
+                    await asyncio.sleep(delay)
+                except Exception as e:
+                    print(f"Сбой Оракула ({model}, попытка {i+1}): {e}")
+                    await asyncio.sleep(delay)
+                    
         return {
             "cards_used_indices": [0, 1, 2],
             "reading": "Оракул на мгновение скрылся за туманной дымкой космических энергий. Пожалуйста, повторите ваш вопрос немного позже."
