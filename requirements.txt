@@ -4,3 +4,5 @@ aiogram
 pydantic
 pydantic-settings
 email-validator
+httpx
+psycopg2-binary
