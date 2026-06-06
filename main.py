@@ -62,7 +62,6 @@ def get_db_connection():
     port = parsed.port or 5432
     db_name = parsed.path[1:] if parsed.path else ""
 
-    # Попытка 1: Прямое подключение к Postgres с IPv4-резолвом
     try:
         try:
             ips = socket.getaddrinfo(host, None, socket.AF_INET)
@@ -86,7 +85,6 @@ def get_db_connection():
     except Exception as e:
         print(f"Прямое подключение к базе данных отклонено: {e}. Пробуем пуллер...", flush=True)
 
-    # Попытка 2: Резервное подключение через пуллер транзакций Supabase
     try:
         project_id = "wbbcljbrfpgriukzjlvc"
         if parsed.hostname and ".supabase.co" in parsed.hostname:
@@ -110,14 +108,12 @@ def get_db_connection():
                     connect_timeout=3
                 )
                 IS_SQLITE = False
-                print(f"Успешно подключено через пуллер в регионе {region}!", flush=True)
                 return conn
             except Exception:
                 continue
     except Exception as e_pool:
         print(f"Ошибка пуллера баз данных: {e_pool}", flush=True)
 
-    # Попытка 3: Фолбек на локальный SQLite при полном отсутствии связи с облаком
     print("⚠️ Облачная СУБД недоступна. Переход на локальный SQLite!", flush=True)
     import sqlite3
     conn = sqlite3.connect("users.db")
@@ -152,7 +148,6 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        print("База данных успешно инициализирована.", flush=True)
     except Exception as e:
         print(f"Ошибка инициализации базы данных: {e}", flush=True)
     finally:
@@ -179,7 +174,6 @@ def get_user(telegram_id: int):
             return user_dict
         return None
     except Exception as e:
-        print(f"Ошибка получения пользователя {telegram_id}: {e}", flush=True)
         return None
     finally:
         if conn:
@@ -190,7 +184,6 @@ def create_user(telegram_id: int, username: Optional[str], first_name: str, emai
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Новому пользователю начисляется приветственный бонус в 150 Энергии
         execute_query(cur, """
             INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, ai_balance, daily_balance)
             VALUES (%s, %s, %s, %s, TRUE, 150, 0, 0)
@@ -200,7 +193,7 @@ def create_user(telegram_id: int, username: Optional[str], first_name: str, emai
         conn.commit()
         cur.close()
     except Exception as e:
-        print(f"Ошибка создания пользователя {telegram_id}: {e}", flush=True)
+        pass
     finally:
         if conn:
             conn.close()
@@ -218,7 +211,7 @@ def update_user_profile_info(telegram_id: int, first_name: str, username: Option
         conn.commit()
         cur.close()
     except Exception as e:
-        print(f"Ошибка обновления профиля {telegram_id}: {e}", flush=True)
+        pass
     finally:
         if conn:
             conn.close()
@@ -240,14 +233,11 @@ def update_user_balance(telegram_id: int, balance_delta: int):
         conn.commit()
         cur.close()
     except Exception as e:
-        print(f"Ошибка изменения баланса для {telegram_id}: {e}", flush=True)
+        pass
     finally:
         if conn:
             conn.close()
 
-# =====================================================================
-# ВЕРИФИКАЦИЯ TELEGRAM WEBAPP INITDATA
-# =====================================================================
 def verify_telegram_init_data(init_data: str) -> dict:
     if not init_data:
         return {"id": 123456789, "first_name": "Искатель", "username": "test_user"}
@@ -260,7 +250,7 @@ def verify_telegram_init_data(init_data: str) -> dict:
         return {"id": 123456789, "first_name": "Искатель", "username": "test_user"}
 
 # =====================================================================
-# СТРУКТУРА КАРТ ТАРО
+# СТРУКТУРА КАРТ ТАРО И ГЛУБОКАЯ БАЗА ЗНАЧЕНИЙ ДЛЯ ФОЛБЕКА
 # =====================================================================
 def get_tarot_deck():
     major = [
@@ -282,39 +272,99 @@ def get_tarot_deck():
             curr_id += 1
     return deck
 
-# =====================================================================
-# РЕЗЕРВНЫЙ ТОЛКОВАТЕЛЬ НА СЛУЧАЙ ОТСУТСТВИЯ СВЯЗИ С ИИ
-# =====================================================================
+def get_rich_card_meaning(card_name: str, position_type: str) -> str:
+    """Глубокий генератор значений карт, если Gemini недоступен. Никаких сухих отписок."""
+    
+    major_meanings = {
+        "Дурак": "Эта энергия призывает к абсолютному доверию. Вы стоите на пороге чего-то совершенно нового. Отбросьте прошлый опыт, который отягощает вас. Позвольте себе легкость и спонтанность — Вселенная сейчас страхует вас.",
+        "Маг": "В ваших руках сейчас сосредоточены все необходимые ресурсы. Это время активного творения, а не ожидания. Проявите силу воли и заявите о своих намерениях миру — ваша реальность податлива как глина.",
+        "Верховная Жрица": "Замрите. Суета сейчас ваш враг. Ответы, которые вы ищете, уже находятся внутри вас. Обратите внимание на сны, случайные знаки и интуитивные озарения. Скрытое скоро станет явным.",
+        "Императрица": "Период мощного созидания, плодородия и изобилия. Позвольте процессам развиваться естественно, как растет цветок. Окружите себя заботой, красотой и любовью — именно из этого состояния придут лучшие результаты.",
+        "Император": "Время взять ответственность на себя. Хаос должен быть структурирован. Опирайтесь на логику, дисциплину и четкие границы. Защищайте свои интересы твердо, но справедливо.",
+        "Иерофант": "Ситуация требует обращения к проверенным истинам, традициям или мудрому наставнику. Ищите смысл, а не поверхностную выгоду. Поступайте так, как велит совесть, даже если это кажется сложным.",
+        "Влюбленные": "Аркан глубокого выбора, совершаемого сердцем. Это не просто партнерство, это необходимость интегрировать противоречивые части себя. Выбирайте искренне, отбросив страхи — и союз будет благословенным.",
+        "Колесница": "Динамика, прорыв и триумф воли. Вы столкнулись с противоречивыми силами, но если возьмете управление на себя и не потеряете фокус, победа будет стремительной. Не время сомневаться — время действовать.",
+        "Сила": "Истинная сила кроется не в давлении, а в мягкости, эмпатии и внутреннем стержне. Укротите своих внутренних демонов любовью и терпением. То, что кажется непреодолимым, сдастся перед вашим спокойствием.",
+        "Отшельник": "Остановитесь и уйдите в тишину. Внешний мир сейчас не даст вам ответов. Период самопознания, переоценки ценностей и поиска своего внутреннего света. Ваш путь сейчас — это путь вглубь себя.",
+        "Колесо Фортуны": "Все течет и меняется. Ситуация набирает неожиданный оборот, вмешиваются силы судьбы. Примите цикличность происходящего: отпустите контроль, доверьтесь потоку и будьте готовы поймать удачу за хвост.",
+        "Справедливость": "Закон кармы в действии. Вы получите ровно то, что посеяли. Требуется абсолютная честность с самим собой, объективность и холодный рассудок. Ищите баланс и поступайте по совести.",
+        "Повешенный": "Ситуация зависла, но это не наказание, а пауза для переосмысления. Добровольная жертва малым ради великого. Посмотрите на мир под другим углом — именно в состоянии отказа от старых шаблонов придет озарение.",
+        "Смерть": "Не бойтесь этого Аркана. Это глубокая трансформация и естественное завершение отжившего цикла. Старое должно умереть, чтобы освободить место для нового. Отпустите то, за что судорожно держитесь.",
+        "Умеренность": "Алхимия души. Время интеграции, исцеления и поиска золотой середины. Никаких крайностей и спешки. Постепенно, капля за каплей, гармония восстанавливается. Проявите терпение.",
+        "Дьявол": "Вы столкнулись с мощной теневой энергией. Это могут быть зависимости, созависимые отношения, материальные привязки или ваши собственные страхи, которые сковывают волю. Помните: цепи лишь иллюзия, вы свободны их сбросить.",
+        "Башня": "Громоотвод очищения. Ложные структуры, иллюзии и устаревшие убеждения рушатся. Это больно, но необходимо. Башня расчищает фундамент для постройки чего-то настоящего и искреннего. Не сопротивляйтесь переменам.",
+        "Звезда": "После бури всегда выходит свет. Аркан исцеления, надежды и высшего покровительства. Вы на верном пути, небеса благоволят вам. Мечтайте смело, вдохновляйтесь и верьте в свое предназначение.",
+        "Луна": "Погружение в сумерки подсознания. Ситуация полна неопределенности, иллюзий и скрытых страхов. Не делайте поспешных выводов, вещи не такие, какими кажутся. Доверяйте интуиции и не позволяйте тревоге взять верх.",
+        "Солнце": "Абсолютный триумф, радость и ясность. Энергия успеха, творчества и взаимной искренности. Тьма рассеялась. Позвольте себе праздновать жизнь, сиять и делиться этим теплом с окружающими.",
+        "Суд": "Кармическое пробуждение. Глубинный зов к перерождению. Время отпустить старые обиды, простить себя и выйти на совершенно новый уровень осознанности. Судьба дает вам шанс начать всё заново, с чистой совестью.",
+        "Мир": "Идеальное завершение цикла. Обретение целостности, гармонии и своего места во Вселенной. То, к чему вы стремились, обретает форму. Празднуйте свой путь — границы стерты, перед вами открыт весь мир."
+    }
+
+    clean_name = card_name.replace("Старший Аркан: ", "").strip()
+    
+    if clean_name in major_meanings:
+        return major_meanings[clean_name]
+
+    # Генератор для Младших Арканов
+    suit_energy = ""
+    if "Кубк" in card_name:
+        suit_energy = "Энергия воды: чувства, эмоции, интуиция, глубокие привязанности и душевные порывы. Важно слушать сердце."
+    elif "Меч" in card_name:
+        suit_energy = "Энергия воздуха: интеллект, логика, преодоление иллюзий, анализ и необходимость мыслить ясно и хладнокровно."
+    elif "Жезл" in card_name:
+        suit_energy = "Энергия огня: страсть, амбиции, карьера, самореализация, искра творения и активные действия."
+    elif "Пентакл" in card_name:
+        suit_energy = "Энергия земли: материальный мир, финансы, здоровье, практичность, стабильность и осязаемые результаты."
+
+    rank_focus = ""
+    if "Туз" in card_name: rank_focus = "Чистый импульс, мощный старт, дар свыше и новая возможность, которую нужно хватать."
+    elif "Двойка" in card_name: rank_focus = "Поиск баланса, компромисс, двойственность выбора или важное партнерство."
+    elif "Тройка" in card_name: rank_focus = "Первые плоды трудов, расширение, творческое взаимодействие и поддержка окружения."
+    elif "Четверка" in card_name: rank_focus = "Стабильность, безопасность, но иногда и застой, требующий бережного отношения к ресурсам."
+    elif "Пятерка" in card_name: rank_focus = "Кризис, конфликт, выход из зоны комфорта, который необходим для духовного роста."
+    elif "Шестерка" in card_name: rank_focus = "Гармония, взаимопомощь, исцеление прошлых ран и светлая ностальгия."
+    elif "Семерка" in card_name: rank_focus = "Необходимость проявить стратегию, терпение, оценить риски или защитить свои убеждения."
+    elif "Восьмерка" in card_name: rank_focus = "Динамика, скорость, упорный труд и концентрация на достижении мастерства."
+    elif "Девятка" in card_name: rank_focus = "Самодостаточность, приближение к идеалу, глубокий внутренний комфорт."
+    elif "Десятка" in card_name: rank_focus = "Кульминация, предел развития масти, полнота ощущений или ответственность."
+    elif "Паж" in card_name: rank_focus = "Любопытство, новые импульсы, обучение, важная новость или свежий взгляд на вещи."
+    elif "Рыцарь" in card_name: rank_focus = "Целеустремленность, стремительное движение, смелость и готовность к переменам."
+    elif "Королева" in card_name: rank_focus = "Забота, зрелая эмоциональность, интуиция и умение взращивать проекты в гармонии."
+    elif "Король" in card_name: rank_focus = "Авторитет, лидерство, контроль, логика и ответственность за принятые решения."
+    else: rank_focus = "Необходимость внимательно прислушаться к текущим вибрациям ситуации."
+
+    return f"{suit_energy} Эта карта несет следующий смысловой акцент: {rank_focus}"
+
 def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dict:
-    print("🔮 Активирован резервный толковать судеб «Вечный Оракул»", flush=True)
     used_cards = pre_selected_cards[:3]
     used_indices = [0, 1, 2]
     
-    positions = [
-        "Влияние прошлого (с чего все началось)",
-        "Вызов настоящего (что происходит прямо сейчас)",
-        "Вектор будущего (куда ведут вас космические дороги)"
-    ]
-    
     parts = [
-        f"🔮 **Ответ Оракула на ваш вопрос:** «{question}»\n\n",
-        "Карты вашей судьбы легли следующим образом:\n\n"
+        f"Уважаемый искатель, карты услышали ваш вопрос: *«{question}»*.\n\n"
+        "Ответ Оракула сформирован на основе древних архетипов. Внимательно вчитайтесь в каждое слово, позвольте интуиции откликнуться.\n\n"
+    ]
+
+    positions = [
+        "1. Влияние прошлого (Корни ситуации)",
+        "2. Вызов настоящего (Ваш фокус сейчас)",
+        "3. Вектор будущего (Совет и исход)"
     ]
 
     for idx, card in enumerate(used_cards):
         name = card["name"]
         pos = positions[idx]
-        parts.append(f"### {pos} — «{name}»\nВы вытянули {name}. Этот символ указывает на важную веху вашей духовной трансформации и необходимость обратить внимание на скрытые аспекты данной энергии.\n\n")
+        meaning = get_rich_card_meaning(name, "general")
+        parts.append(f"**{pos} — {name}**\n{meaning}\n\n")
         
     parts.append(
-        "\n**Итоговое напутствие Оракула:** "
-        "Помните, что карты лишь подсвечивают наиболее вероятные развилки вашей судьбы. "
-        "Ваша свободная воля — это величайшая сила. Верьте в себя, действуйте осознанно и берегите свет внутри своего сердца!"
+        "**Глубокий итог:**\n"
+        "Помните, что карты не выносят окончательный приговор, они лишь подсвечивают энергетические токи вашей жизни. "
+        "Всё в ваших руках. Интегрируйте этот опыт, доверяйте себе и действуйте из состояния любви и осознанности."
     )
     
     return {
         "cards_used_indices": used_indices,
-        "reading": "\n".join(parts)
+        "reading": "".join(parts)
     }
 
 def extract_json_from_text(text: str) -> Optional[dict]:
@@ -330,42 +380,36 @@ def extract_json_from_text(text: str) -> Optional[dict]:
     return None
 
 # =====================================================================
-# ВЫЗОВ ИИ GEMINI С ОПТИМИЗИРОВАННЫМ ЭКСПОНЕНЦИАЛЬНЫМ ОТКАТОМ
+# ВЫЗОВ ИИ GEMINI (С ПРЕМИАЛЬНЫМ ПСИХОЛОГИЧЕСКИМ ПРОМПТОМ)
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
-    """
-    Вызывает API Gemini с обязательным экспоненциальным откатом и моделью gemini-2.5-flash-preview-09-2025.
-    """
     if not GEMINI_API_KEY:
-        print("⚠️ Пропуск ИИ-расклада: отсутствует GEMINI_API_KEY.", flush=True)
+        print("⚠️ Gemini отключен. Переход к премиальному локальному Оракулу.", flush=True)
         return generate_local_tarot_reading(question, pre_selected_cards)
 
     model_name = "gemini-2.5-flash-preview-09-2025"
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
     
+    # Полностью переписанный промпт для избежания сухости и роботоподобности
     system_prompt = (
-        "Ты — выдающийся психолог-аналитик, философ, духовный ментор и таролог с 30-летним стажем.\n"
-        "Твоя задача — дать невероятно подробный, глубокий, обширный и всесторонний индивидуальный анализ на конкретный вопрос пользователя, опираясь на выпавшие в раскладе карты Таро.\n\n"
-        "ПОЛЬЗОВАТЕЛЬ ТРЕБУЕТ МАКСИМАЛЬНО ДЕТАЛЬНОГО И ОБШИРНОГО ОТВЕТА! Пиши развернуто, глубоко и содержательно.\n\n"
-        "СТРУКТУРА ТВОЕГО ОБШИРНОГО ОТВЕТА:\n"
-        "1. Введение и сонастройка: Глубокий философский и психологический анализ самого вопроса пользователя.\n"
-        "2. Индивидуальный разбор выпавших карт в их взаимном влиянии: Раскрой подробное значение каждой карты именно в контексте вопроса.\n"
-        "3. Психологический срез и подсознательные блоки: Что мешает человеку двигаться дальше?\n"
-        "4. Стратегические практические рекомендации и пошаговые ориентиры: Конкретные, применимые в жизни шаги.\n"
-        "5. Духовное напутствие и вектор будущего: Мудрое, поддерживающее заключение, вселяющее уверенность.\n\n"
-        "ПРАВИЛА:\n"
-        "- Ответ должен быть ОГРОМНЫМ, детальным и глубоким, написан живым, терапевтическим русским языком.\n"
-        "- Строго следуй формату ответа JSON.\n"
+        "Ты — элитный, невероятно эмпатичный таролог и глубинный психолог (в стиле Карла Юнга). "
+        "У тебя живой, теплый, метафоричный язык. Никаких сухих фраз вроде 'В заключение' или 'Как ИИ'.\n\n"
+        "Пользователь задал сокровенный вопрос. Выбери ровно 3 карты из предложенных (Прошлое, Настоящее, Будущее) "
+        "и проведи терапевтичный, глубокий разбор.\n\n"
+        "СТРУКТУРА ОТВЕТА (Пиши сплошным красивым текстом, используй Markdown для жирного шрифта, НИКАКИХ HTML-тегов!):\n"
+        "1. Введение: Мягко и философски отреагируй на вопрос пользователя.\n"
+        "2. Расклад (3 карты): Опиши каждую выбранную карту. Опиши не просто ее классическое значение, а то, как она ИНДИВИДУАЛЬНО отвечает на вопрос пользователя. Работай с подсознанием.\n"
+        "3. Напутствие: Вдохновляющий, сильный и успокаивающий итог. Человек должен уйти с чувством наполненности.\n\n"
+        "ФОРМАТ ОТВЕТА СТРОГО JSON:\n"
         "{\n"
-        "  \"cards_used_indices\": [индексы выбранных карт из списка (от 0 до 5)],\n"
-        "  \"reading\": \"полный текст твоего глубокого индивидуального разбора\"\n"
+        "  \"cards_used_indices\": [индексы выбранных 3 карт],\n"
+        "  \"reading\": \"текст твоего потрясающего ответа в формате Markdown (никаких html тегов <br> или <h3>)\"\n"
         "}"
     )
     
     user_prompt = (
-        f"Вопрос искателя: '{question}'.\n"
-        f"Доступные карты для расклада: {cards_str}.\n"
-        "Выбери от 3 до 4 карт, наиболее подходящих ситуации, и сделай толкование."
+        f"Вопрос: '{question}'.\n"
+        f"Карты: {cards_str}.\n"
     )
     
     structured_payload = {
@@ -390,31 +434,26 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
     }
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-    
-    # 5 обязательных попыток с задержками: 1s, 2s, 4s, 8s, 16s (экспоненциальный откат)
-    retry_delays = [1.0, 2.0, 4.0, 8.0, 16.0]
+    retry_delays = [1.0, 2.0, 4.0]
     
     async with httpx.AsyncClient() as client:
         for attempt, delay in enumerate(retry_delays):
             try:
-                print(f"Попытка вызова Gemini {attempt + 1}/5...", flush=True)
                 response = await client.post(url, json=structured_payload, timeout=30.0)
-                
                 if response.status_code == 200:
                     data = response.json()
                     raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     parsed = extract_json_from_text(raw_text)
-                    if parsed and "cards_used_indices" in parsed and "reading" in parsed:
-                        print("✅ Успешный ответ от Gemini ИИ!", flush=True)
+                    if parsed and "reading" in parsed:
+                        # Удаляем любые случайные HTML теги, если ИИ их все же вставил
+                        clean_reading = parsed["reading"].replace("<h3>", "").replace("</h3>", "").replace("<br>", "\n")
+                        parsed["reading"] = clean_reading
                         return parsed
-                else:
-                    print(f"⚠️ Ошибка Gemini (Код {response.status_code}): {response.text}", flush=True)
             except Exception as e:
-                print(f"❌ Ошибка соединения на попытке {attempt + 1}: {e}", flush=True)
-            
+                pass
             await asyncio.sleep(delay)
             
-    print("🚨 Все попытки вызова ИИ исчерпаны. Переход на локальный толковать.", flush=True)
+    print("🚨 Вызов ИИ исчерпан. Переход на локальный толковать.", flush=True)
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 # =====================================================================
@@ -430,12 +469,7 @@ async def get_user_profile(authorization: str = Header(None)):
     
     user = get_user(user_id)
     if not user:
-        create_user(
-            telegram_id=user_id,
-            username=username,
-            first_name=first_name,
-            email=""
-        )
+        create_user(telegram_id=user_id, username=username, first_name=first_name, email="")
         user = get_user(user_id)
     else:
         update_user_profile_info(user_id, first_name, username)
@@ -444,18 +478,11 @@ async def get_user_profile(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=500, detail="Ошибка базы данных")
         
-    is_developer = (
-        (username and username.lower() == "dzenra_prod") or 
-        (user.get("username") and user.get("username").lower() == "dzenra_prod")
-    )
+    is_developer = ((username and username.lower() == "dzenra_prod") or 
+                    (user.get("username") and user.get("username").lower() == "dzenra_prod"))
     balance = 99999 if is_developer else user.get("balance", 0)
 
-    return {
-        "registered": True,
-        "user_id": user_id,
-        "name": user["first_name"],
-        "balance": balance
-    }
+    return {"registered": True, "user_id": user_id, "name": user["first_name"], "balance": balance}
 
 @app.post("/api/user/use-reading")
 async def use_reading(authorization: str = Header(None)):
@@ -467,10 +494,8 @@ async def use_reading(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
         
-    is_developer = (
-        (username and username.lower() == "dzenra_prod") or 
-        (user.get("username") and user.get("username").lower() == "dzenra_prod")
-    )
+    is_developer = ((username and username.lower() == "dzenra_prod") or 
+                    (user.get("username") and user.get("username").lower() == "dzenra_prod"))
     if is_developer:
         return {"success": True, "new_balance": 99999}
 
@@ -490,10 +515,8 @@ async def use_daily_reading(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
         
-    is_developer = (
-        (username and username.lower() == "dzenra_prod") or 
-        (user.get("username") and user.get("username").lower() == "dzenra_prod")
-    )
+    is_developer = ((username and username.lower() == "dzenra_prod") or 
+                    (user.get("username") and user.get("username").lower() == "dzenra_prod"))
     if is_developer:
         return {"success": True, "new_balance": 99999}
 
@@ -505,6 +528,9 @@ async def use_daily_reading(authorization: str = Header(None)):
 
 @app.post("/api/user/use-ai-reading")
 async def use_ai_reading(payload: dict, authorization: str = Header(None)):
+    # ИСКУССТВЕННАЯ ПАУЗА ДЛЯ МАГИИ АНИМАЦИИ (чтобы карты красиво тасовались 2.5 секунды)
+    await asyncio.sleep(2.5)
+
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
     username = user_tg.get("username")
@@ -517,10 +543,8 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не зарегистрирован.")
         
-    is_developer = (
-        (username and username.lower() == "dzenra_prod") or 
-        (user.get("username") and user.get("username").lower() == "dzenra_prod")
-    )
+    is_developer = ((username and username.lower() == "dzenra_prod") or 
+                    (user.get("username") and user.get("username").lower() == "dzenra_prod"))
 
     if not is_developer and user.get("balance", 0) < 750:
         raise HTTPException(status_code=400, detail="Недостаточно Энергии на балансе.")
@@ -532,8 +556,11 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     
     used_indices = result_data.get("cards_used_indices", [0, 1, 2])
     used_indices = [idx for idx in used_indices if 0 <= idx < len(pre_selected)]
-    if not used_indices:
+    # Гарантируем, что всегда будет 3 карты (если ИИ почему-то отдал меньше/больше)
+    if len(used_indices) < 3:
         used_indices = [0, 1, 2]
+    else:
+        used_indices = used_indices[:3]
         
     final_cards = [pre_selected[idx] for idx in used_indices]
     text_reading = result_data.get("reading", "")
