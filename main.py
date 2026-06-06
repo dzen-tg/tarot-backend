@@ -500,26 +500,24 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
         
     try:
-        # Принудительно выводим лог с flush=True
         print(f"Попытка выставить счет на Telegram Stars: UserID {user_id}, Pack '{pack}', Amount {amount}", flush=True)
         
+        # start_parameter полностью убран из метода create_invoice_link,
+        # так как в установленной на Render версии aiogram 3.x он вызывает критическую ошибку.
         invoice_link = await bot.create_invoice_link(
             title=title,
             description=description,
             payload=payload_str,
             provider_token="",  # Для Stars оставляем пустым
             currency="XTR",
-            prices=[LabeledPrice(label="Telegram Stars", amount=int(amount))],
-            start_parameter="tarot-shop"
+            prices=[LabeledPrice(label="Telegram Stars", amount=int(amount))]
         )
         print(f"Ссылка на оплату успешно сгенерирована: {invoice_link}", flush=True)
         return {"invoice_link": invoice_link}
     except Exception as e:
-        # Логируем точную ошибку в Render с flush=True
         print(f"КРИТИЧЕСКАЯ ОШИБКА TELEGRAM ПРИ СОЗДАНИИ СЧЕТА STARS: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        # Возвращаем точную ошибку во фронтенд, чтобы пользователь увидел её на экране
         raise HTTPException(status_code=500, detail=str(e))
 
 # =====================================================================
@@ -575,7 +573,7 @@ async def telegram_webhook(request: Request):
         await dp.feed_update(bot=bot, update=telegram_update)
         return {"status": "ok"}
     except Exception as e:
-        print(f"Ошибка парсинга вебхука Telegram: {e}", flush=True)
+        print(f"Ошибка parsing вебхука Telegram: {e}", flush=True)
         return {"status": "error", "message": str(e)}
 
 @app.on_event("startup")
