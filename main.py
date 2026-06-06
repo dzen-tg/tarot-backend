@@ -4,6 +4,7 @@ import urllib.parse
 import json
 import random
 import asyncio
+import socket
 from typing import Optional
 from datetime import datetime
 
@@ -62,6 +63,15 @@ def get_db_connection():
         port = parsed.port or 5432
         db_name = parsed.path[1:] if parsed.path else ""
         
+        # Резолвим имя хоста в IPv4, чтобы избежать багов IPv6 на Render
+        try:
+            ips = socket.getaddrinfo(host, None, socket.AF_INET)
+            if ips:
+                host = ips[0][4][0]
+                print(f"ℹ️ Хост Supabase успешно разрешен в IPv4: {host}", flush=True)
+        except Exception as e_res:
+            print(f"⚠️ Ошибка IPv4-резолва для {host}: {e_res}", flush=True)
+
         conn = psycopg2.connect(
             database=db_name,
             user=user,
@@ -90,6 +100,14 @@ def get_db_connection():
         
         for region in regions:
             pooler_host = f"{region}.pooler.supabase.com"
+            # Тоже резолвим пуллер в IPv4
+            try:
+                ips = socket.getaddrinfo(pooler_host, None, socket.AF_INET)
+                if ips:
+                    pooler_host = ips[0][4][0]
+            except Exception:
+                pass
+
             try:
                 conn = psycopg2.connect(
                     database="postgres",
@@ -283,7 +301,6 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
     print("🔮 Активирован резервный генератор судеб «Вечный Оракул»", flush=True)
     q_lower = question.lower()
     
-    # 1. Интеллектуальный разбор темы вопроса
     theme = "общий жизненный путь"
     if any(w in q_lower for w in ["работ", "карьер", "бизнес", "проект", "увольн", "найти", "деньг", "финанс"]):
         theme = "профессиональное развитие и материальное изобилие"
@@ -292,14 +309,13 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
     elif any(w in q_lower for w in ["себя", "предназнач", "духов", "выбор", "делать", "почему"]):
         theme = "самопознание и раскрытие внутреннего потенциала"
 
-    # Выбираем ровно 3 карты из предложенных
     used_cards = pre_selected_cards[:3]
     used_indices = [0, 1, 2]
     
     interpretations = {
         "профессиональное развитие и материальное изобилие": {
-            "Старший Аркан": "призывает вас к масштабной трансформации. Это кармический знак того, что текущие трудности — лишь ступень к вашему триумфу. Действуйте смело и нестандартно.",
-            "Кубки": "символизируют творческое горение. Ваши идеи найдут отклик у коллектива, а работа принесет не только финансовый доход, но и искреннюю душевную радость.",
+            "Старший Аркан": "призывает вас к масштабной трансформации. Это знак того, что текущие трудности — лишь ступень к вашему триумфу. Действуйте смело и нестандартно.",
+            "Кубки": "символизируют творческое горение. Ваши идеи найдут отклик у окружающих, а работа принесет не только финансовый доход, но и искреннюю душевную радость.",
             "Мечи": "требуют от вас максимальной концентрации и защиты своих личных интересов. Избегайте сплетен и стройте планы на основе точных цифр и фактов.",
             "Жезлы": "зажигают искру грандиозного лидерского успеха. Перед вами открыты двери новых амбициозных проектов. Ваша харизма — ваш главный капитал.",
             "Пентакли": "обещают долгожданную стабильность и твердую почву под ногами. Ваши прошлые труды начинают окупаться, впереди период заслуженных наград."
@@ -325,21 +341,19 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
         theme_key = "самопознание и раскрытие внутреннего потенциала"
         
     parts = [
-        f"✨ **Оракул настроился на вибрации вашего вопроса:**\n*«{question}»*\n",
-        f"🔮 **Глубинная тема вашего запроса:** {theme.capitalize()}.\n",
-        "**Карты вашей судьбы легли следующим образом:**\n"
+        f"Оракул настроился на вибрации вашего вопроса: «{question}»\n",
+        f"Глубинная тема вашего запроса: {theme}.\n",
+        "Карты вашей судьбы легли следующим образом:\n"
     ]
     
     positions = [
-        "1. Влияние прошлого (с чего все началось)",
-        "2. Вызов настоящего (что происходит прямо сейчас)",
-        "3. Вектор будущего (куда ведут вас космические дороги)"
+        "Влияние прошлого (с чего все началось)",
+        "Вызов настоящего (что происходит прямо сейчас)",
+        "Вектор будущего (куда ведут вас космические дороги)"
     ]
     
     for idx, card in enumerate(used_cards):
         card_type = card["type"]
-        
-        # Определяем ключ для толкования карты
         card_key = card_type
         if card_key not in interpretations[theme_key]:
             card_key = "Старший Аркан" if "Старший" in card_type else "Пентакли"
@@ -347,12 +361,12 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
         meaning = interpretations[theme_key].get(card_key)
         
         parts.append(
-            f"🔸 **{positions[idx]}** — Аркан **«{card['name']}»** ({card['type']}):\n"
+            f"Карта {idx+1}: {positions[idx]} — Аркан «{card['name']}» ({card['type']}):\n"
             f"Этот священный символ {meaning}\n"
         )
         
     parts.append(
-        "\n💡 **Итоговое напутствие Оракула:** "
+        "\nИтоговое напутствие Оракула: "
         "Помните, что карты лишь подсвечивают наиболее вероятные развилки дорог перед вами. "
         "Ваша свободная воля — это величайшая сила. Верьте в себя, действуйте осознанно и берегите свет внутри своего сердца!"
     )
@@ -363,18 +377,37 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
     }
 
 # =====================================================================
+# ВСПОМОГАТЕЛЬНЫЙ ЭКСТРАКТОР JSON ИЗ ЛЮБОГО ТЕКСТА GEMINI
+# =====================================================================
+def extract_json_from_text(text: str) -> Optional[dict]:
+    """
+    Абсолютно пуленепробиваемый экстрактор JSON.
+    Находит первую фигурную скобку { и последнюю скобку }, вырезает их и парсит,
+    игнорируя любые вводные слова, markdown-блоки и мусор в выводе ИИ.
+    """
+    try:
+        text_strip = text.strip()
+        start_idx = text_strip.find("{")
+        end_idx = text_strip.rfind("}")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = text_strip[start_idx:end_idx + 1]
+            return json.loads(json_str)
+    except Exception as e:
+        print(f"⚠️ Ошибка глубинного парсинга JSON: {e}", flush=True)
+    return None
+
+# =====================================================================
 # ИИ-ТОЛКОВАНИЕ С САМОЛЕЧЕНИЕМ (GEMINI MULTI-TIER ENGINE)
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
     """
     Пытается получить толкование у ИИ. 
-    Использует 4 различных каскадных попытки (с JSON-схемой и без),
-    а при любом сетевом сбое бесшовно переключается на локальный генератор.
+    Использует каскадные попытки к стабильным моделям (1.5-flash / 1.5-pro),
+    а при любом сетевом сбое бесшовно переключается на чистый локальный генератор.
     """
     models = ["gemini-1.5-flash", "gemini-1.5-pro"]
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
     
-    # ----------------- ПОПЫТКА 1 & 2: ИСПОЛЬЗОВАНИЕ JSON SCHEMA -----------------
     system_prompt = (
         "Ты — профессиональный психолог-аналитик и таролог с 20-летним стажем. "
         "Сделай клиенту глубокий, бережный и воодушевляющий расклад. "
@@ -421,16 +454,15 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
                 response = await client.post(url, json=structured_payload, timeout=20.0)
                 if response.status_code == 200:
                     data = response.json()
-                    raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                    parsed = json.loads(raw_text)
-                    if "cards_used_indices" in parsed and "reading" in parsed:
+                    raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    parsed = extract_json_from_text(raw_text)
+                    if parsed and "cards_used_indices" in parsed and "reading" in parsed:
                         print("Успешный разбор через JSON-схему!", flush=True)
                         return parsed
             except Exception as e:
                 print(f"Сбой метода со схемой на {model}: {e}", flush=True)
                 
             # ----------------- ПОПЫТКА 3 & 4: ОРАКУЛ В СВОБОДНОМ ТЕКСТОВОМ РЕЖИМЕ -----------------
-            # (Самый надежный способ, обходящий любые ограничения старых API ключей)
             fallback_prompt = (
                 f"{system_prompt}\n\n"
                 f"Карты для выбора: {cards_str}.\n"
@@ -447,22 +479,9 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
                 response = await client.post(url, json=unstructured_payload, timeout=25.0)
                 if response.status_code == 200:
                     data = response.json()
-                    raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                    
-                    # Очистка от markdown оберток типа ```json ... ```
-                    clean_text = raw_text
-                    if clean_text.startswith("```"):
-                        lines = clean_text.split("```")
-                        for line in lines:
-                            line_strip = line.strip()
-                            if line_strip.startswith("json"):
-                                line_strip = line_strip[4:].strip()
-                            if line_strip.startswith("{") and line_strip.endswith("}"):
-                                clean_text = line_strip
-                                break
-                                
-                    parsed = json.loads(clean_text)
-                    if "cards_used_indices" in parsed and "reading" in parsed:
+                    raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    parsed = extract_json_from_text(raw_text)
+                    if parsed and "cards_used_indices" in parsed and "reading" in parsed:
                         print("Успешный ручной разбор текста в JSON!", flush=True)
                         return parsed
             except Exception as e_text:
