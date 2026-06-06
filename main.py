@@ -20,16 +20,21 @@ from aiogram.types import Update, LabeledPrice, PreCheckoutQuery, Message
 from aiogram.filters import Command
 
 # =====================================================================
-# КОНФИГУРАЦИЯ И КЛЮЧИ
+# КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (БЕЗОПАСНЫЙ ЗАПУСК)
 # =====================================================================
-BOT_TOKEN = "8838358841:AAFf3LnY3Rd2LV46d09FGu_PkOpRlQoIYRY"
-FRONTEND_URL = "https://tarot-frontend-wine.vercel.app"
+# Считываем конфиденциальные данные, настроенные в панели управления Render
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tarot-frontend-wine.vercel.app")
 
-# Строка подключения к базе данных Supabase
-DATABASE_URL = "postgresql://postgres:We15935728%21%21%21%21%21@db.wbbcljbrfpgriukzjlvc.supabase.co:5432/postgres"
-
-# Ключ для доступа к Gemini API
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Строгая проверка наличия всех критических переменных при запуске контейнера
+if not BOT_TOKEN:
+    raise RuntimeError("Критическая ошибка: Переменная TELEGRAM_BOT_TOKEN не задана на Render!")
+if not DATABASE_URL:
+    raise RuntimeError("Критическая ошибка: Переменная DATABASE_URL не задана на Render!")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Критическая ошибка: Переменная GEMINI_API_KEY не задана на Render!")
 
 # Инициализация веб-сервера FastAPI и Telegram-бота
 app = FastAPI()
@@ -58,8 +63,6 @@ def get_db_connection():
     активирует резервную локальную базу SQLite, защищая приложение от любых падений.
     """
     global IS_SQLITE
-    if not DATABASE_URL:
-        raise RuntimeError("Переменная DATABASE_URL не задана!")
     
     # 1. Сначала пробуем прямое подключение (Supabase)
     try:
