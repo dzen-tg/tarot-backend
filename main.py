@@ -276,7 +276,8 @@ def get_tarot_deck():
 # ДИНАМИЧЕСКИЙ ГЛУБОКИЙ РАСКЛАД (СВЯЗЬ С ОРАКУЛОМ GEMINI)
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
+    # Здесь мы используем 100% рабочие публичные модели для любого API ключа
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro"]
     
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
     prompt = (
@@ -481,20 +482,23 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     amount = 0
     payload_str = ""
     
+    # -----------------------------------------------------------------
+    # ЦЕНЫ ИЗМЕНЕНЫ НА ВРЕМЯ ТЕСТИРОВАНИЯ ДЛЯ ЭКОНОМИИ (1, 2 и 3 ЗВЕЗДЫ)
+    # -----------------------------------------------------------------
     if pack == "1_std":
         title = "1 Стандартный расклад"
         description = "Расклад на одну карту для быстрого прояснения ситуации."
-        amount = 150
+        amount = 1  # Измените обратно на 150 перед запуском проекта!
         payload_str = f"buy_1_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "5_std":
         title = "Пакет из 5 раскладов"
         description = "Выгодный пакет из 5 сеансов со скидкой 10%."
-        amount = 675
+        amount = 2  # Измените обратно на 675 перед запуском проекта!
         payload_str = f"buy_5_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "1_ai":
         title = "1 Индивидуальный расклад"
         description = "Глубокий разбор вашей ситуации с динамическим выбором карт."
-        amount = 750
+        amount = 3  # Измените обратно на 750 перед запуском проекта!
         payload_str = f"buy_1_ai_{user_id}_{random.randint(1000,9999)}"
     else:
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
@@ -519,6 +523,26 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+# =====================================================================
+# РУЧНОЙ ТРИГГЕР ДЛЯ ПРИНУДИТЕЛЬНОЙ СВЯЗИ ВЕБХУКА
+# =====================================================================
+@app.get("/api/system/setup-webhook")
+async def setup_webhook_manually():
+    """Эндпоинт для принудительной и гарантированной привязки вебхука"""
+    try:
+        render_external_url = os.getenv("RENDER_EXTERNAL_URL")
+        if render_external_url:
+            webhook_url = f"{render_external_url.strip()}/telegram-webhook"
+        else:
+            webhook_url = "[https://tarot-backend-136l.onrender.com/telegram-webhook](https://tarot-backend-136l.onrender.com/telegram-webhook)".strip()
+        
+        await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        print(f"Ручная принудительная привязка вебхука успешна: {webhook_url}", flush=True)
+        return {"status": "ok", "message": "Вебхук успешно привязан!", "webhook_url": webhook_url}
+    except Exception as e:
+        print(f"Ошибка ручной привязки вебхука: {e}", flush=True)
+        return {"status": "error", "message": str(e)}
 
 # =====================================================================
 # ОБРАБОТЧИКИ ОПЛАТЫ И КОМАНД TELEGRAM BOT (AIOGRAM)
@@ -554,8 +578,9 @@ async def process_successful_payment(message: Message):
         pack_type = parts[2]
         user_id = int(parts[3])
         
+        # Обработка начисления с гибким подходом к стоимости
         if pack_type == "std":
-            qty = int(action)
+            qty = 5 if "5_std" in payload else 1
             update_user_balance(user_id, balance_delta=qty, ai_balance_delta=0)
             await message.answer(f"🔮 Оплата успешна! Зачислено {qty} стандартных раскладов.")
         elif pack_type == "ai":
@@ -583,8 +608,14 @@ async def on_startup():
     except Exception as e:
         print(f"Ошибка при инициализации базы данных на старте: {e}", flush=True)
         
+    # Сверхнадежная привязка вебхука с защитой от Windows спецсимволов \r
     try:
-        webhook_url = "[https://tarot-backend-136l.onrender.com/telegram-webhook](https://tarot-backend-136l.onrender.com/telegram-webhook)"
+        render_external_url = os.getenv("RENDER_EXTERNAL_URL")
+        if render_external_url:
+            webhook_url = f"{render_external_url.strip()}/telegram-webhook"
+        else:
+            webhook_url = "[https://tarot-backend-136l.onrender.com/telegram-webhook](https://tarot-backend-136l.onrender.com/telegram-webhook)".strip()
+            
         await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
         print(f"Вебхук Telegram успешно направлен на: {webhook_url}", flush=True)
     except Exception as e:
