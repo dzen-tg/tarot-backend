@@ -180,8 +180,8 @@ def get_user(telegram_id: int):
         cur.close()
         if user:
             user_dict = dict(user)
-            # Проверка на тестовый аккаунт Dzenra_prod
-            if user_dict.get("username") == "Dzenra_prod":
+            # Проверка на тестовый аккаунт Dzenra_prod (регистронезависимая)
+            if user_dict.get("username") and user_dict.get("username").lower() == "dzenra_prod":
                 user_dict["balance"] = 99999
                 user_dict["ai_balance"] = 99999
             return user_dict
@@ -235,9 +235,9 @@ def update_user_profile_info(telegram_id: int, first_name: str, username: Option
 def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: int = 0):
     """Начисляет или списывает балансы раскладов"""
     conn = None
-    # Защита баланса разработчика
+    # Защита баланса разработчика (регистронезависимая)
     user = get_user(telegram_id)
-    if user and user.get("username") == "Dzenra_prod":
+    if user and user.get("username") and user.get("username").lower() == "dzenra_prod":
         return
 
     try:
@@ -409,8 +409,11 @@ async def get_user_profile(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=500, detail="Ошибка работы базы данных")
         
-    # Выдаем бесконечный баланс на фронтенд для аккаунта Dzenra_prod
-    is_developer = (username == "Dzenra_prod" or user.get("username") == "Dzenra_prod")
+    # Выдаем бесконечный баланс на фронтенд для аккаунта Dzenra_prod (регистронезависимо)
+    is_developer = (
+        (username and username.lower() == "dzenra_prod") or 
+        (user.get("username") and user.get("username").lower() == "dzenra_prod")
+    )
     balance = 99999 if is_developer else user["balance"]
     ai_balance = 99999 if is_developer else user["ai_balance"]
 
@@ -433,8 +436,12 @@ async def use_reading(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
         
-    # Блокируем списания для Dzenra_prod
-    if username == "Dzenra_prod" or user.get("username") == "Dzenra_prod":
+    # Блокируем списания для Dzenra_prod (регистронезависимо)
+    is_developer = (
+        (username and username.lower() == "dzenra_prod") or 
+        (user.get("username") and user.get("username").lower() == "dzenra_prod")
+    )
+    if is_developer:
         return {"success": True, "new_balance": 99999}
 
     if user["balance"] < 1:
@@ -458,8 +465,11 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не зарегистрирован.")
         
-    # Проверка на разработчика
-    is_developer = (username == "Dzenra_prod" or user.get("username") == "Dzenra_prod")
+    # Проверка на разработчика (регистронезависимо)
+    is_developer = (
+        (username and username.lower() == "dzenra_prod") or 
+        (user.get("username") and user.get("username").lower() == "dzenra_prod")
+    )
 
     if not is_developer and user["ai_balance"] < 1:
         raise HTTPException(status_code=400, detail="Недостаточно энергии расклада. Пополните баланс.")
