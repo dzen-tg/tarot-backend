@@ -22,13 +22,11 @@ from aiogram.filters import Command
 # =====================================================================
 # КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (БЕЗОПАСНЫЙ ЗАПУСК)
 # =====================================================================
-# Считываем конфиденциальные данные, настроенные в панели управления Render
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tarot-frontend-wine.vercel.app")
 
-# Строгая проверка наличия всех критических переменных при запуске контейнера
 if not BOT_TOKEN:
     raise RuntimeError("Критическая ошибка: Переменная TELEGRAM_BOT_TOKEN не задана на Render!")
 if not DATABASE_URL:
@@ -41,7 +39,6 @@ app = FastAPI()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Настройка правил CORS для работы фронтенда на Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,21 +47,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Индикатор аварийного переключения на локальную базу данных SQLite
 IS_SQLITE = False
 
 # =====================================================================
 # РАБОТА С ГИБРИДНОЙ БАЗОЙ ДАННЫХ (SUPABASE + SQLITE FALLBACK)
 # =====================================================================
 def get_db_connection():
-    """
-    Создает подключение к базе данных. Пробует прямое подключение к Supabase,
-    при ошибке переключается на стабильный IPv4 Пуллер, а в случае полной недоступности облака —
-    активирует резервную локальную базу SQLite, защищая приложение от любых падений.
-    """
     global IS_SQLITE
-    
-    # 1. Сначала пробуем прямое подключение (Supabase)
     try:
         parsed = urllib.parse.urlparse(DATABASE_URL)
         user = urllib.parse.unquote(parsed.username) if parsed.username else ""
@@ -85,13 +74,11 @@ def get_db_connection():
         IS_SQLITE = False
         return conn
     except Exception as e:
-        print(f"Прямое подключение к Supabase отклонено (IPv6): {e}. Переключаемся на IPv4 Пуллер...")
+        print(f"Прямое подключение к Supabase отклонено (IPv6): {e}. Переключаемся на пуллер...", flush=True)
 
-    # 2. Пробуем пул транзакций Supabase (надежный обход ограничений бесплатного Render)
     try:
         parsed = urllib.parse.urlparse(DATABASE_URL)
         password = urllib.parse.unquote(parsed.password) if parsed.password else ""
-        
         project_id = "wbbcljbrfpgriukzjlvc"
         if parsed.hostname and ".supabase.co" in parsed.hostname:
             host_parts = parsed.hostname.split(".")
@@ -109,20 +96,19 @@ def get_db_connection():
                     user=pooler_user,
                     password=password,
                     host=pooler_host,
-                    port=6543,  # Порт транзакций Supabase
+                    port=6543,
                     sslmode="require",
                     connect_timeout=3
                 )
                 IS_SQLITE = False
-                print(f"Успешно подключено через пуллер Supabase в регионе {region}!")
+                print(f"Успешно подключено через пуллер Supabase в регионе {region}!", flush=True)
                 return conn
             except Exception:
                 continue
     except Exception as e_pool:
-        print(f"Ошибка пуллера Supabase: {e_pool}")
+        print(f"Ошибка пуллера Supabase: {e_pool}", flush=True)
 
-    # 3. Безопасный SQLite фолбэк при отсутствии интернета или проблемах в Supabase
-    print("⚠️ Облако недоступно. Включаем локальный SQLite сейвер!")
+    print("⚠️ Облако недоступно. Включаем локальный SQLite сейвер!", flush=True)
     import sqlite3
     conn = sqlite3.connect("users.db")
     conn.row_factory = sqlite3.Row
@@ -130,7 +116,6 @@ def get_db_connection():
     return conn
 
 def execute_query(cur, sql, params=()):
-    """Вспомогательная функция для автоматической адаптации SQL-синтаксиса под SQLite"""
     global IS_SQLITE
     if IS_SQLITE:
         sql = sql.replace("%s", "?")
@@ -138,7 +123,6 @@ def execute_query(cur, sql, params=()):
     cur.execute(sql, params)
 
 def init_db():
-    """Создает структуру таблиц при первом запуске приложения"""
     conn = None
     try:
         conn = get_db_connection()
@@ -157,15 +141,14 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        print("База данных успешно инициализирована.")
+        print("База данных успешно инициализирована.", flush=True)
     except Exception as e:
-        print(f"Критическая ошибка инициализации базы: {e}")
+        print(f"Критическая ошибка инициализации базы: {e}", flush=True)
     finally:
         if conn:
             conn.close()
 
 def get_user(telegram_id: int):
-    """Возвращает информацию о пользователе"""
     global IS_SQLITE
     conn = None
     try:
@@ -180,21 +163,19 @@ def get_user(telegram_id: int):
         cur.close()
         if user:
             user_dict = dict(user)
-            # Проверка на тестовый аккаунт Dzenra_prod (регистронезависимая)
             if user_dict.get("username") and user_dict.get("username").lower() == "dzenra_prod":
                 user_dict["balance"] = 99999
                 user_dict["ai_balance"] = 99999
             return user_dict
         return None
     except Exception as e:
-        print(f"Ошибка получения пользователя {telegram_id}: {e}")
+        print(f"Ошибка получения пользователя {telegram_id}: {e}", flush=True)
         return None
     finally:
         if conn:
             conn.close()
 
 def create_user(telegram_id: int, username: Optional[str], first_name: str, email: str = ""):
-    """Создает нового пользователя в системе при первом входе"""
     conn = None
     try:
         conn = get_db_connection()
@@ -208,13 +189,12 @@ def create_user(telegram_id: int, username: Optional[str], first_name: str, emai
         conn.commit()
         cur.close()
     except Exception as e:
-        print(f"Ошибка создания пользователя {telegram_id}: {e}")
+        print(f"Ошибка создания пользователя {telegram_id}: {e}", flush=True)
     finally:
         if conn:
             conn.close()
 
 def update_user_profile_info(telegram_id: int, first_name: str, username: Optional[str]):
-    """Обновляет имя и юзернейм пользователя (для синхронизации с Telegram)"""
     conn = None
     try:
         conn = get_db_connection()
@@ -227,15 +207,13 @@ def update_user_profile_info(telegram_id: int, first_name: str, username: Option
         conn.commit()
         cur.close()
     except Exception as e:
-        print(f"Ошибка обновления информации профиля {telegram_id}: {e}")
+        print(f"Ошибка обновления информации профиля {telegram_id}: {e}", flush=True)
     finally:
         if conn:
             conn.close()
 
 def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: int = 0):
-    """Начисляет или списывает балансы раскладов"""
     conn = None
-    # Защита баланса разработчика (регистронезависимая)
     user = get_user(telegram_id)
     if user and user.get("username") and user.get("username").lower() == "dzenra_prod":
         return
@@ -252,7 +230,7 @@ def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: 
         conn.commit()
         cur.close()
     except Exception as e:
-        print(f"Ошибка обновления баланса для {telegram_id}: {e}")
+        print(f"Ошибка обновления баланса для {telegram_id}: {e}", flush=True)
     finally:
         if conn:
             conn.close()
@@ -261,7 +239,6 @@ def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: 
 # ВЕРИФИКАЦИЯ TELEGRAM WEBAPP INITDATA
 # =====================================================================
 def verify_telegram_init_data(init_data: str) -> dict:
-    """Парсит данные инициализации Telegram WebApp для проверки подлинности пользователя"""
     if not init_data:
         return {"id": 123456789, "first_name": "Искатель", "username": "test_user"}
     try:
@@ -276,7 +253,6 @@ def verify_telegram_init_data(init_data: str) -> dict:
 # СТРУКТУРА КАРТ ТАРО
 # =====================================================================
 def get_tarot_deck():
-    """Генерирует полную классическую колоду из 78 карт Таро"""
     major = [
         "Дурак", "Маг", "Верховная Жрица", "Императрица", "Император", "Иерофант", 
         "Влюбленные", "Колесница", "Сила", "Отшельник", "Колесо Фортуны", "Справедливость", 
@@ -300,10 +276,6 @@ def get_tarot_deck():
 # ДИНАМИЧЕСКИЙ ГЛУБОКИЙ РАСКЛАД (СВЯЗЬ С ОРАКУЛОМ GEMINI)
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
-    """
-    Отправляет запрос к модели Gemini. Оракул последовательно пытается обратиться
-    к релизным стабильным моделям gemini-2.5-flash и gemini-1.5-flash.
-    """
     models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
     
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
@@ -372,11 +344,11 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
                             clean_text = clean_text.strip()
                             return json.loads(clean_text)
                     else:
-                        print(f"Ошибка Gemini ({model}, попытка {i+1}). Статус: {response.status_code}")
-                        print(f"Ответ Google: {response.text}")
+                        print(f"Ошибка Gemini ({model}, попытка {i+1}). Статус: {response.status_code}", flush=True)
+                        print(f"Ответ Google: {response.text}", flush=True)
                     await asyncio.sleep(delay)
                 except Exception as e:
-                    print(f"Сбой Оракула ({model}, попытка {i+1}): {e}")
+                    print(f"Сбой Оракула ({model}, попытка {i+1}): {e}", flush=True)
                     await asyncio.sleep(delay)
                     
         return {
@@ -390,7 +362,6 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
 
 @app.get("/api/user/profile")
 async def get_user_profile(authorization: str = Header(None)):
-    """Возвращает актуальный профиль пользователя или регистрирует его при первом входе"""
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
     first_name = user_tg.get("first_name", "Искатель")
@@ -406,14 +377,12 @@ async def get_user_profile(authorization: str = Header(None)):
         )
         user = get_user(user_id)
     else:
-        # Синхронизируем имя при каждом входе в приложение
         update_user_profile_info(user_id, first_name, username)
         user = get_user(user_id)
         
     if not user:
         raise HTTPException(status_code=500, detail="Ошибка работы базы данных")
         
-    # Выдаем бесконечный баланс на фронтенд для аккаунта Dzenra_prod (регистронезависимо)
     is_developer = (
         (username and username.lower() == "dzenra_prod") or 
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
@@ -431,7 +400,6 @@ async def get_user_profile(authorization: str = Header(None)):
 
 @app.post("/api/user/use-reading")
 async def use_reading(authorization: str = Header(None)):
-    """Списывает со счета 1 стандартный расклад"""
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
     username = user_tg.get("username")
@@ -440,7 +408,6 @@ async def use_reading(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
         
-    # Блокируем списания для Dzenra_prod (регистронезависимо)
     is_developer = (
         (username and username.lower() == "dzenra_prod") or 
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
@@ -456,7 +423,6 @@ async def use_reading(authorization: str = Header(None)):
 
 @app.post("/api/user/use-ai-reading")
 async def use_ai_reading(payload: dict, authorization: str = Header(None)):
-    """Запускает индивидуальный глубокий расклад с динамическим подбором карт"""
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
     username = user_tg.get("username")
@@ -469,7 +435,6 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не зарегистрирован.")
         
-    # Проверка на разработчика (регистронезависимо)
     is_developer = (
         (username and username.lower() == "dzenra_prod") or 
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
@@ -478,7 +443,6 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     if not is_developer and user["ai_balance"] < 1:
         raise HTTPException(status_code=400, detail="Недостаточно энергии расклада. Пополните баланс.")
         
-    # Пре-выбираем 6 карт, из которых Оракул отберет нужные
     deck = get_tarot_deck()
     pre_selected = random.sample(deck, 6)
     
@@ -536,25 +500,33 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
         
     try:
+        # Принудительно выводим лог с flush=True
+        print(f"Попытка выставить счет на Telegram Stars: UserID {user_id}, Pack '{pack}', Amount {amount}", flush=True)
+        
         invoice_link = await bot.create_invoice_link(
             title=title,
             description=description,
             payload=payload_str,
-            provider_token="",
+            provider_token="",  # Для Stars оставляем пустым
             currency="XTR",
-            prices=[LabeledPrice(label="Telegram Stars", amount=amount)],
+            prices=[LabeledPrice(label="Telegram Stars", amount=int(amount))],
             start_parameter="tarot-shop"
         )
+        print(f"Ссылка на оплату успешно сгенерирована: {invoice_link}", flush=True)
         return {"invoice_link": invoice_link}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка платежного шлюза: {str(e)}")
+        # Логируем точную ошибку в Render с flush=True
+        print(f"КРИТИЧЕСКАЯ ОШИБКА TELEGRAM ПРИ СОЗДАНИИ СЧЕТА STARS: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # Возвращаем точную ошибку во фронтенд, чтобы пользователь увидел её на экране
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =====================================================================
 # ОБРАБОТЧИКИ ОПЛАТЫ И КОМАНД TELEGRAM BOT (AIOGRAM)
 # =====================================================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Приветствие бота и кнопка быстрого открытия Mini App"""
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -571,12 +543,10 @@ async def cmd_start(message: Message):
 
 @dp.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    """Подтверждение готовности принять платеж Telegram Stars"""
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
-    """Начисление раскладов на баланс пользователя при успешной оплате"""
     payment = message.successful_payment
     payload = payment.invoice_payload
     
@@ -599,28 +569,25 @@ async def process_successful_payment(message: Message):
 # =====================================================================
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    """Принимает входящие события от Telegram (сообщения, оплаты)"""
     try:
         raw_json = await request.json()
         telegram_update = Update.model_validate(raw_json, context={"bot": bot})
         await dp.feed_update(bot=bot, update=telegram_update)
         return {"status": "ok"}
     except Exception as e:
-        print(f"Ошибка парсинга вебхука Telegram: {e}")
+        print(f"Ошибка парсинга вебхука Telegram: {e}", flush=True)
         return {"status": "error", "message": str(e)}
 
 @app.on_event("startup")
 async def on_startup():
-    """Действия при инициализации и старте контейнера сервера"""
     try:
         init_db()
     except Exception as e:
-        print(f"Ошибка при инициализации базы данных на старте: {e}")
+        print(f"Ошибка при инициализации базы данных на старте: {e}", flush=True)
         
-    # Сверхбезопасное подключение вебхука (предотвращает падение при сетевых задержках)
     try:
         webhook_url = "[https://tarot-backend-136l.onrender.com/telegram-webhook](https://tarot-backend-136l.onrender.com/telegram-webhook)"
         await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-        print(f"Вебхук Telegram успешно направлен на: {webhook_url}")
+        print(f"Вебхук Telegram успешно направлен на: {webhook_url}", flush=True)
     except Exception as e:
-        print(f"⚠️ Предупреждение: Не удалось установить вебхук на старте (продолжаем запуск): {e}")
+        print(f"⚠️ Предупреждение: Не удалось установить вебхук на старте (продолжаем запуск): {e}", flush=True)
