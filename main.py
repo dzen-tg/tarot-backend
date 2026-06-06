@@ -139,6 +139,8 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Поля ai_balance и daily_balance сохраняются в структуре для безопасности обратной совместимости,
+        # однако основным полем энергии отныне выступает единое поле "balance"
         execute_query(cur, """
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id BIGINT PRIMARY KEY,
@@ -146,21 +148,12 @@ def init_db():
                 first_name VARCHAR(255),
                 email VARCHAR(255),
                 consent_given BOOLEAN DEFAULT FALSE,
-                balance INTEGER DEFAULT 0,
+                balance INTEGER DEFAULT 150,
                 ai_balance INTEGER DEFAULT 0,
-                daily_balance INTEGER DEFAULT 1,
+                daily_balance INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Безопасная фоновая миграция для добавления новой колонки daily_balance
-        try:
-            if not IS_SQLITE:
-                execute_query(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_balance INTEGER DEFAULT 1;")
-            else:
-                execute_query(cur, "ALTER TABLE users ADD COLUMN daily_balance INTEGER DEFAULT 1;")
-        except Exception as e_col:
-            print(f"ℹ️ Колонка daily_balance уже существует или успешно создана: {e_col}", flush=True)
-            
         conn.commit()
         cur.close()
         print("База данных успешно инициализирована.", flush=True)
@@ -187,8 +180,6 @@ def get_user(telegram_id: int):
             user_dict = dict(user)
             if user_dict.get("username") and user_dict.get("username").lower() == "dzenra_prod":
                 user_dict["balance"] = 99999
-                user_dict["ai_balance"] = 99999
-                user_dict["daily_balance"] = 99999
             return user_dict
         return None
     except Exception as e:
@@ -203,9 +194,10 @@ def create_user(telegram_id: int, username: Optional[str], first_name: str, emai
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Новому искателю дарится приветственные 150 единиц Энергии (хватает на 1 Обычный расклад или 2 Карты Дня)
         execute_query(cur, """
             INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, ai_balance, daily_balance)
-            VALUES (%s, %s, %s, %s, TRUE, 1, 0, 1)
+            VALUES (%s, %s, %s, %s, TRUE, 150, 0, 0)
             ON CONFLICT (telegram_id) DO UPDATE 
             SET username = EXCLUDED.username, first_name = EXCLUDED.first_name;
         """, (telegram_id, username, first_name, email))
@@ -235,7 +227,7 @@ def update_user_profile_info(telegram_id: int, first_name: str, username: Option
         if conn:
             conn.close()
 
-def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: int = 0, daily_balance_delta: int = 0):
+def update_user_balance(telegram_id: int, balance_delta: int):
     conn = None
     user = get_user(telegram_id)
     if user and user.get("username") and user.get("username").lower() == "dzenra_prod":
@@ -246,11 +238,9 @@ def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: 
         cur = conn.cursor()
         execute_query(cur, """
             UPDATE users 
-            SET balance = GREATEST(0, balance + %s),
-                ai_balance = GREATEST(0, ai_balance + %s),
-                daily_balance = GREATEST(0, daily_balance + %s)
+            SET balance = GREATEST(0, balance + %s)
             WHERE telegram_id = %s;
-        """, (balance_delta, ai_balance_delta, daily_balance_delta, telegram_id))
+        """, (balance_delta, telegram_id))
         conn.commit()
         cur.close()
     except Exception as e:
@@ -408,12 +398,10 @@ def extract_json_from_text(text: str) -> Optional[dict]:
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
     """
     Пытается получить масштабное, глубокое толкование у ИИ.
-    Промпт требует огромный, развернутый терапевтический и психологический ответ.
     """
     models = ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
     
-    # Сверхдетальный системный промпт без жестких ограничений по объему
     system_prompt = (
         "Ты — выдающийся психолог-аналитик, философ, духовный ментор и таролог с 30-летним стажем.\n"
         "Твоя задача — дать невероятно подробный, глубокий, обширный и всесторонний индивидуальный анализ на конкретный вопрос пользователя, опираясь на выпавшие в раскладе карты Таро.\n\n"
@@ -540,16 +528,12 @@ async def get_user_profile(authorization: str = Header(None)):
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
     )
     balance = 99999 if is_developer else user.get("balance", 0)
-    ai_balance = 99999 if is_developer else user.get("ai_balance", 0)
-    daily_balance = 99999 if is_developer else user.get("daily_balance", 0)
 
     return {
         "registered": True,
         "user_id": user_id,
         "name": user["first_name"],
-        "balance": balance,
-        "ai_balance": ai_balance,
-        "daily_balance": daily_balance
+        "balance": balance
     }
 
 @app.post("/api/user/use-reading")
@@ -569,11 +553,11 @@ async def use_reading(authorization: str = Header(None)):
     if is_developer:
         return {"success": True, "new_balance": 99999}
 
-    if user.get("balance", 0) < 1:
-        raise HTTPException(status_code=400, detail="Недостаточно обычных раскладов на балансе.")
+    if user.get("balance", 0) < 150:
+        raise HTTPException(status_code=400, detail="Недостаточно Энергии на балансе (требуется 150).")
         
-    update_user_balance(user_id, balance_delta=-1)
-    return {"success": True, "new_balance": user.get("balance", 1) - 1}
+    update_user_balance(user_id, balance_delta=-150)
+    return {"success": True, "new_balance": user.get("balance", 150) - 150}
 
 @app.post("/api/user/use-daily-reading")
 async def use_daily_reading(authorization: str = Header(None)):
@@ -590,13 +574,13 @@ async def use_daily_reading(authorization: str = Header(None)):
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
     )
     if is_developer:
-        return {"success": True, "new_daily_balance": 99999}
+        return {"success": True, "new_balance": 99999}
 
-    if user.get("daily_balance", 0) < 1:
-        raise HTTPException(status_code=400, detail="Недостаточно Карт Дня на балансе.")
+    if user.get("balance", 0) < 75:
+        raise HTTPException(status_code=400, detail="Недостаточно Энергии на балансе (требуется 75).")
         
-    update_user_balance(user_id, balance_delta=0, ai_balance_delta=0, daily_balance_delta=-1)
-    return {"success": True, "new_daily_balance": user.get("daily_balance", 1) - 1}
+    update_user_balance(user_id, balance_delta=-75)
+    return {"success": True, "new_balance": user.get("balance", 75) - 75}
 
 @app.post("/api/user/use-ai-reading")
 async def use_ai_reading(payload: dict, authorization: str = Header(None)):
@@ -617,8 +601,8 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
     )
 
-    if not is_developer and user.get("ai_balance", 0) < 1:
-        raise HTTPException(status_code=400, detail="Недостаточно энергии расклада. Пополните баланс.")
+    if not is_developer and user.get("balance", 0) < 750:
+        raise HTTPException(status_code=400, detail="Недостаточно Энергии на балансе (требуется 750).")
         
     deck = get_tarot_deck()
     pre_selected = random.sample(deck, 6)
@@ -634,16 +618,16 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     text_reading = result_data.get("reading", "")
     
     if not is_developer:
-        update_user_balance(user_id, balance_delta=0, ai_balance_delta=-1)
-        new_ai_balance = user.get("ai_balance", 1) - 1
+        update_user_balance(user_id, balance_delta=-750)
+        new_balance = user.get("balance", 750) - 750
     else:
-        new_ai_balance = 99999
+        new_balance = 99999
     
     return {
         "success": True,
         "cards": final_cards,
         "text": text_reading,
-        "new_ai_balance": new_ai_balance
+        "new_balance": new_balance
     }
 
 @app.post("/api/payment/stars-invoice")
@@ -658,25 +642,24 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     amount = 0
     payload_str = ""
     
-    # ИСПРАВЛЕНО: ТАРИФЫ В СООТВЕТСТВИИ С ЗАПРОСОМ (Карта дня: 75, Обычный: 150, 5 Обычных: 675, Разбор: 750)
     if pack == "1_daily":
-        title = "1 Карта Дня"
-        description = "Расклад на одну карту для быстрой сонастройки дня."
+        title = "+75 Энергии (Карта Дня)"
+        description = "Приобретение 75 единиц Энергии для открытия Карты Дня."
         amount = 75  
         payload_str = f"buy_1_daily_{user_id}_{random.randint(1000,9999)}"
     elif pack == "1_std":
-        title = "1 Обычный расклад"
-        description = "Расклад для быстрого прояснения ситуации или готового вопроса."
+        title = "+150 Энергии (Обычный расклад)"
+        description = "Приобретение 150 единиц Энергии для Готового вопроса."
         amount = 150  
         payload_str = f"buy_1_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "5_std":
-        title = "Пакет из 5 обычных раскладов"
-        description = "Выгодный пакет из 5 сеансов по готовым вопросам."
+        title = "+750 Энергии (Пакет Энергии)"
+        description = "Выгодный пакет: 750 единиц Энергии со скидкой 10%."
         amount = 675  
         payload_str = f"buy_5_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "1_ai":
-        title = "1 Индивидуальный разбор"
-        description = "Детальный, развернутый психологический и духовный анализ."
+        title = "+750 Энергии (Индивидуальный разбор)"
+        description = "Приобретение 750 единиц Энергии для Глубокого разбора."
         amount = 750  
         payload_str = f"buy_1_ai_{user_id}_{random.randint(1000,9999)}"
     else:
@@ -754,19 +737,18 @@ async def process_successful_payment(message: Message):
         pack_type = parts[2]
         user_id = int(parts[3])
         
-        # Начисление правильных балансов на основе успешных транзакций
         if "buy_1_daily" in payload:
-            update_user_balance(user_id, balance_delta=0, ai_balance_delta=0, daily_balance_delta=1)
-            await message.answer("🔮 Оплата успешна! Вам зачислена 1 Карта Дня. Нажмите кнопку меню, чтобы запустить её.")
+            update_user_balance(user_id, balance_delta=75)
+            await message.answer("🔮 Оплата успешна! Зачислено +75 Энергии.")
         elif "buy_1_std" in payload:
-            update_user_balance(user_id, balance_delta=1, ai_balance_delta=0, daily_balance_delta=0)
-            await message.answer("🔮 Оплата успешна! Вам зачислен 1 Обычный расклад.")
+            update_user_balance(user_id, balance_delta=150)
+            await message.answer("🔮 Оплата успешна! Зачислено +150 Энергии.")
         elif "buy_5_std" in payload:
-            update_user_balance(user_id, balance_delta=5, ai_balance_delta=0, daily_balance_delta=0)
-            await message.answer("🔮 Оплата успешна! Вам зачислено 5 Обычных раскладов.")
+            update_user_balance(user_id, balance_delta=750)
+            await message.answer("🔮 Оплата успешна! Зачислено +750 Энергии.")
         elif "buy_1_ai" in payload:
-            update_user_balance(user_id, balance_delta=0, ai_balance_delta=1, daily_balance_delta=0)
-            await message.answer("🔮 Оплата успешна! Вам зачислен 1 Индивидуальный разбор. Нажмите кнопку меню, чтобы запустить его.")
+            update_user_balance(user_id, balance_delta=750)
+            await message.answer("🔮 Оплата успешна! Зачислено +750 Энергии.")
 
 # =====================================================================
 # ТОЧКА ВХОДА ДЛЯ ВЕБХУКА TELEGRAM
