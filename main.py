@@ -370,6 +370,10 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
                             clean_text = clean_text[:-3]
                         clean_text = clean_text.strip()
                         return json.loads(clean_text)
+                else:
+                    # Логируем точный ответ об ошибке от Google в логи Render для диагностики
+                    print(f"Ошибка Gemini (попытка {i+1}). Статус: {response.status_code}")
+                    print(f"Ответ Google: {response.text}")
                 await asyncio.sleep(delay)
             except Exception as e:
                 print(f"Сбой Оракула (попытка {i+1}): {e}")
