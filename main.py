@@ -179,7 +179,12 @@ def get_user(telegram_id: int):
         user = cur.fetchone()
         cur.close()
         if user:
-            return dict(user)
+            user_dict = dict(user)
+            # Проверка на тестовый аккаунт Dzenra_prod
+            if user_dict.get("username") == "Dzenra_prod":
+                user_dict["balance"] = 99999
+                user_dict["ai_balance"] = 99999
+            return user_dict
         return None
     except Exception as e:
         print(f"Ошибка получения пользователя {telegram_id}: {e}")
@@ -230,6 +235,11 @@ def update_user_profile_info(telegram_id: int, first_name: str, username: Option
 def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: int = 0):
     """Начисляет или списывает балансы раскладов"""
     conn = None
+    # Защита баланса разработчика
+    user = get_user(telegram_id)
+    if user and user.get("username") == "Dzenra_prod":
+        return
+
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -399,12 +409,17 @@ async def get_user_profile(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=500, detail="Ошибка работы базы данных")
         
+    # Выдаем бесконечный баланс на фронтенд для аккаунта Dzenra_prod
+    is_developer = (username == "Dzenra_prod" or user.get("username") == "Dzenra_prod")
+    balance = 99999 if is_developer else user["balance"]
+    ai_balance = 99999 if is_developer else user["ai_balance"]
+
     return {
         "registered": True,
         "user_id": user_id,
         "name": user["first_name"],
-        "balance": user["balance"],
-        "ai_balance": user["ai_balance"]
+        "balance": balance,
+        "ai_balance": ai_balance
     }
 
 @app.post("/api/user/use-reading")
@@ -412,11 +427,16 @@ async def use_reading(authorization: str = Header(None)):
     """Списывает со счета 1 стандартный расклад"""
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
+    username = user_tg.get("username")
     
     user = get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
         
+    # Блокируем списания для Dzenra_prod
+    if username == "Dzenra_prod" or user.get("username") == "Dzenra_prod":
+        return {"success": True, "new_balance": 99999}
+
     if user["balance"] < 1:
         raise HTTPException(status_code=400, detail="Недостаточно раскладов на балансе.")
         
@@ -428,6 +448,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     """Запускает индивидуальный глубокий расклад с динамическим подбором карт"""
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
+    username = user_tg.get("username")
     
     question = payload.get("question", "").strip()
     if not question:
@@ -437,7 +458,10 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не зарегистрирован.")
         
-    if user["ai_balance"] < 1:
+    # Проверка на разработчика
+    is_developer = (username == "Dzenra_prod" or user.get("username") == "Dzenra_prod")
+
+    if not is_developer and user["ai_balance"] < 1:
         raise HTTPException(status_code=400, detail="Недостаточно энергии расклада. Пополните баланс.")
         
     # Пре-выбираем 6 карт, из которых Оракул отберет нужные
@@ -454,13 +478,17 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     final_cards = [pre_selected[idx] for idx in used_indices]
     text_reading = result_data.get("reading", "")
     
-    update_user_balance(user_id, balance_delta=0, ai_balance_delta=-1)
+    if not is_developer:
+        update_user_balance(user_id, balance_delta=0, ai_balance_delta=-1)
+        new_ai_balance = user["ai_balance"] - 1
+    else:
+        new_ai_balance = 99999
     
     return {
         "success": True,
         "cards": final_cards,
         "text": text_reading,
-        "new_ai_balance": user["ai_balance"] - 1
+        "new_ai_balance": new_ai_balance
     }
 
 @app.post("/api/payment/stars-invoice")
