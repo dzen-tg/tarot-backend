@@ -148,9 +148,19 @@ def init_db():
                 consent_given BOOLEAN DEFAULT FALSE,
                 balance INTEGER DEFAULT 0,
                 ai_balance INTEGER DEFAULT 0,
+                daily_balance INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # Безопасная фоновая миграция для добавления новой колонки daily_balance
+        try:
+            if not IS_SQLITE:
+                execute_query(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_balance INTEGER DEFAULT 1;")
+            else:
+                execute_query(cur, "ALTER TABLE users ADD COLUMN daily_balance INTEGER DEFAULT 1;")
+        except Exception as e_col:
+            print(f"ℹ️ Колонка daily_balance уже существует или успешно создана: {e_col}", flush=True)
+            
         conn.commit()
         cur.close()
         print("База данных успешно инициализирована.", flush=True)
@@ -178,6 +188,7 @@ def get_user(telegram_id: int):
             if user_dict.get("username") and user_dict.get("username").lower() == "dzenra_prod":
                 user_dict["balance"] = 99999
                 user_dict["ai_balance"] = 99999
+                user_dict["daily_balance"] = 99999
             return user_dict
         return None
     except Exception as e:
@@ -193,8 +204,8 @@ def create_user(telegram_id: int, username: Optional[str], first_name: str, emai
         conn = get_db_connection()
         cur = conn.cursor()
         execute_query(cur, """
-            INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, ai_balance)
-            VALUES (%s, %s, %s, %s, TRUE, 1, 0)
+            INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, ai_balance, daily_balance)
+            VALUES (%s, %s, %s, %s, TRUE, 1, 0, 1)
             ON CONFLICT (telegram_id) DO UPDATE 
             SET username = EXCLUDED.username, first_name = EXCLUDED.first_name;
         """, (telegram_id, username, first_name, email))
@@ -224,7 +235,7 @@ def update_user_profile_info(telegram_id: int, first_name: str, username: Option
         if conn:
             conn.close()
 
-def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: int = 0):
+def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: int = 0, daily_balance_delta: int = 0):
     conn = None
     user = get_user(telegram_id)
     if user and user.get("username") and user.get("username").lower() == "dzenra_prod":
@@ -236,9 +247,10 @@ def update_user_balance(telegram_id: int, balance_delta: int, ai_balance_delta: 
         execute_query(cur, """
             UPDATE users 
             SET balance = GREATEST(0, balance + %s),
-                ai_balance = GREATEST(0, ai_balance + %s)
+                ai_balance = GREATEST(0, ai_balance + %s),
+                daily_balance = GREATEST(0, daily_balance + %s)
             WHERE telegram_id = %s;
-        """, (balance_delta, ai_balance_delta, telegram_id))
+        """, (balance_delta, ai_balance_delta, daily_balance_delta, telegram_id))
         conn.commit()
         cur.close()
     except Exception as e:
@@ -285,14 +297,10 @@ def get_tarot_deck():
     return deck
 
 # =====================================================================
-# АЛГОРИТМ НЕПОТОПЛЯЕМОГО ОРАКУЛА (СВЕРХУМНЫЙ ДИНАМИЧЕСКИЙ РАСКЛАД)
+# АЛГОРИТМ НЕПОТОПЛЯЕМОГО ОРАКУЛА (ФОЛБЕК РАСКЛАД)
 # =====================================================================
 def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dict:
-    """
-    Генерирует невероятно глубокий, контекстный и неповторяющийся расклад локально.
-    Каждая карта толкования строится на её ранге, масти и контексте вопроса пользователя.
-    """
-    print("🔮 Активирован сверхдинамический локальный генератор", flush=True)
+    print("🔮 Активирован резервный генератор судеб «Вечный Оракул»", flush=True)
     
     used_cards = pre_selected_cards[:3]
     used_indices = [0, 1, 2]
@@ -313,7 +321,6 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
         card_type = card["type"]
         pos = positions[idx]
         
-        # Разбор ранга карты (для Младших Арканов)
         rank_desc = ""
         ranks = ["Туз", "Двойка", "Тройка", "Четверка", "Пятерка", "Шестерка", "Семерка", "Восьмерка", "Девятка", "Десятка", "Паж", "Рыцарь", "Королева", "Король"]
         for r in ranks:
@@ -348,7 +355,6 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
                     rank_desc = "символизирует авторитет, мастерство контроля, твердость духа и стабильность в ситуации."
                 break
 
-        # Специфика масти в контексте любого свободного вопроса
         suit_desc = ""
         if "Пентакли" in card_type or "Пентаклей" in name:
             suit_desc = "Этот земной символ напоминает о важности материальной основы, здоровья, практического расчёта и терпения."
@@ -359,11 +365,9 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
         elif "Жезлы" in card_type or "Жезлов" in name:
             suit_desc = "Этот огненный символ говорит о росте вашей личной энергии, харизме, творческой воле и страсти к своему делу."
         else:
-            # Старшие Арканы
             clean_name = name.replace("Старший Аркан: ", "")
             suit_desc = f"Этот фундаментальный Аркан ({clean_name}) указывает на то, что ситуация находится под покровительством высших космических сил и ведёт вас к важному духовному уроку."
 
-        # Сборка красивого толкования
         card_text = f"**{pos}** — Аркан **«{name}»**:\n"
         if rank_desc:
             card_text += f"{rank_desc} {suit_desc}\n"
@@ -387,10 +391,6 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
 # ВСПОМОГАТЕЛЬНЫЙ ЭКСТРАКТОР JSON ИЗ ЛЮБОГО ТЕКСТА GEMINI
 # =====================================================================
 def extract_json_from_text(text: str) -> Optional[dict]:
-    """
-    Абсолютно пуленепробиваемый экстрактор JSON.
-    Находит первую фигурную скобку { и последнюю скобку }, вырезает их и парсит.
-    """
     try:
         text_strip = text.strip()
         start_idx = text_strip.find("{")
@@ -403,30 +403,34 @@ def extract_json_from_text(text: str) -> Optional[dict]:
     return None
 
 # =====================================================================
-# ИИ-ТОЛКОВАНИЕ С САМОЛЕЧЕНИЕМ (GEMINI MULTI-TIER ENGINE)
+# РАБОТА С СЕТЬЮ GEMINI С БЕЗОТКАЗНЫМ МНОГОУРОВНЕВЫМ ФОЛБЕКОМ
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
     """
-    Пытается получить толкование у ИИ без жестких привязок к темам.
-    Отвечает строго на конкретный вопрос пользователя на основе карт Таро.
-    При любом сбое бесшовно переключается на чистый локальный генератор.
+    Пытается получить масштабное, глубокое толкование у ИИ.
+    Промпт требует огромный, развернутый терапевтический и психологический ответ.
     """
-    models = ["gemini-1.5-flash", "gemini-1.5-pro"]
+    models = ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
     
-    # Прямой системный промпт без навязывания блоков вроде "финансы" или "отношения"
+    # Сверхдетальный системный промпт без жестких ограничений по объему
     system_prompt = (
-        "Ты — профессиональный психолог-аналитик и таролог с 20-летним стажем. "
-        "Твоя задача — дать бережный, глубокий и индивидуальный ответ на конкретный вопрос пользователя, опираясь на выпавшие в раскладе карты Таро.\n\n"
+        "Ты — выдающийся психолог-аналитик, философ, духовный ментор и таролог с 30-летним стажем.\n"
+        "Твоя задача — дать невероятно подробный, глубокий, обширный и всесторонний индивидуальный анализ на конкретный вопрос пользователя, опираясь на выпавшие в раскладе карты Таро.\n\n"
+        "ПОЛЬЗОВАТЕЛЬ ТРЕБУЕТ МАКСИМАЛЬНО ДЕТАЛЬНОГО И ОБШИРНОГО ОТВЕТА! Пиши развернуто, глубоко и содержательно. Не ограничивайся картами. Напиши целое эссе/руководство.\n\n"
+        "СТРУКТУРА ТВОЕГО ОБШИРНОГО ОТВЕТА:\n"
+        "1. Введение и сонастройка: Глубокий философский и психологический анализ самого вопроса пользователя. Какую скрытую динамику, страхи или истинные стремления скрывает этот вопрос?\n"
+        "2. Индивидуальный разбор выпавших карт в их взаимном влиянии: Раскрой подробное значение каждой карты именно в контексте вопроса. Как эти энергии переплетаются между собой? Какие внутренние и внешние силы они представляют?\n"
+        "3. Психологический срез и подсознательные блоки: Что мешает человеку двигаться дальше? Какие паттерны поведения или страхи подсвечивают карты?\n"
+        "4. Стратегические практические рекомендации и пошаговые ориентиры: Конкретные, применимые в жизни шаги. Что делать прямо сейчас? На что направить фокус?\n"
+        "5. Духовное напутствие и вектор будущего: Мудрое, поддерживающее заключение, вселяющее уверенность и ясность.\n\n"
         "ПРАВИЛА:\n"
-        "1. НЕ ПРИВЯЗЫВАЙ ответ к заранее заданным жестким темам, если сам пользователь об этом не спросил. Отвечай точно на тот вопрос, который задан.\n"
-        "2. Говори прямо и доверительно: 'Карты показывают...', 'Тебе стоит...', 'Твоя ситуация требует...'. Избегай общих вступлений.\n"
-        "3. Тон должен быть мистическим, но приземленным, психологичным и поддерживающим.\n"
-        "4. Ответ должен быть на русском языке.\n\n"
-        "Ты ОБЯЗАН вернуть ответ строго в формате JSON:\n"
+        "- Ответ должен быть ОГРОМНЫМ, детальным и глубоким, написан живым, богатым, уважительным и терапевтическим русским языком.\n"
+        "- Избегай банальных и поверхностных фраз. Твой разбор должен заменить полноценный часовой сеанс с психотерапевтом.\n"
+        "- Строго следуй формату ответа JSON.\n"
         "{\n"
         "  \"cards_used_indices\": [индексы выбранных карт из списка (от 0 до 5)],\n"
-        "  \"reading\": \"текст твоего прямого индивидуального расклада и совета\"\n"
+        "  \"reading\": \"полный текст твоего глубокого индивидуального разбора\"\n"
         "}"
     )
     
@@ -436,7 +440,6 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
         "Выбери от 3 до 4 карт, наиболее подходящих ситуации, и сделай толкование."
     )
     
-    # Структурированный payload по стандарту Google
     structured_payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -461,51 +464,48 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
     async with httpx.AsyncClient() as client:
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            
             try:
-                print(f"Попытка 1: Запрос к {model} со строгой JSON-схемой...", flush=True)
-                response = await client.post(url, json=structured_payload, timeout=20.0)
+                print(f"Попытка со схемой на модели: {model}...", flush=True)
+                response = await client.post(url, json=structured_payload, timeout=25.0)
                 if response.status_code == 200:
                     data = response.json()
                     raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     parsed = extract_json_from_text(raw_text)
                     if parsed and "cards_used_indices" in parsed and "reading" in parsed:
-                        print("Успешный разбор через JSON-схему!", flush=True)
+                        print(f"✅ Успешный разбор через JSON-схему на {model}!", flush=True)
                         return parsed
                 else:
-                    print(f"🔴 Ошибка Gemini API ({model}). Код статуса: {response.status_code}", flush=True)
-                    print(f"🔴 Детальный ответ от Google: {response.text}", flush=True)
+                    print(f"⚠️ Ошибка {model} (схема). Код статуса: {response.status_code}", flush=True)
             except Exception as e:
-                print(f"Сбой метода со схемой на {model}: {e}", flush=True)
+                print(f"❌ Сбой метода схемы на {model}: {e}", flush=True)
                 
-            # Попытка 2: Запрос к Gemini в свободном текстовом режиме
             fallback_prompt = (
                 f"{system_prompt}\n\n"
                 f"Карты для выбора: {cards_str}.\n"
                 f"Вопрос искателя: {question}.\n"
                 "Выбери 3 карты и напиши красивое толкование.\n"
-                "Твой ответ должен содержать ТОЛЬКО сырой JSON по схеме выше. Не оборачивай в маркдаун блоки."
+                "Твой ответ должен содержать ТОЛЬКО чистый JSON по схеме выше. Без маркдаун кавычек."
             )
             unstructured_payload = {
                 "contents": [{"parts": [{"text": fallback_prompt}]}]
             }
             
             try:
-                print(f"Попытка 2: Запрос к {model} в свободном текстовом режиме...", flush=True)
+                print(f"Попытка в текстовом режиме на модели: {model}...", flush=True)
                 response = await client.post(url, json=unstructured_payload, timeout=25.0)
                 if response.status_code == 200:
                     data = response.json()
                     raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     parsed = extract_json_from_text(raw_text)
                     if parsed and "cards_used_indices" in parsed and "reading" in parsed:
-                        print("Успешный ручной разбор текста в JSON!", flush=True)
+                        print(f"✅ Успешный ручной разбор на {model}!", flush=True)
                         return parsed
                 else:
-                    print(f"🔴 Ошибка Gemini API ({model}, Текст). Код статуса: {response.status_code}", flush=True)
-                    print(f"🔴 Детальный ответ от Google (Текст): {response.text}", flush=True)
+                    print(f"⚠️ Ошибка {model} (текст). Код статуса: {response.status_code}", flush=True)
             except Exception as e_text:
-                print(f"Сбой текстового метода на {model}: {e_text}", flush=True)
+                print(f"❌ Сбой текстового метода на {model}: {e_text}", flush=True)
                 
-    # Если все попытки к ИИ провалились
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 # =====================================================================
@@ -539,15 +539,17 @@ async def get_user_profile(authorization: str = Header(None)):
         (username and username.lower() == "dzenra_prod") or 
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
     )
-    balance = 99999 if is_developer else user["balance"]
-    ai_balance = 99999 if is_developer else user["ai_balance"]
+    balance = 99999 if is_developer else user.get("balance", 0)
+    ai_balance = 99999 if is_developer else user.get("ai_balance", 0)
+    daily_balance = 99999 if is_developer else user.get("daily_balance", 0)
 
     return {
         "registered": True,
         "user_id": user_id,
         "name": user["first_name"],
         "balance": balance,
-        "ai_balance": ai_balance
+        "ai_balance": ai_balance,
+        "daily_balance": daily_balance
     }
 
 @app.post("/api/user/use-reading")
@@ -567,11 +569,34 @@ async def use_reading(authorization: str = Header(None)):
     if is_developer:
         return {"success": True, "new_balance": 99999}
 
-    if user["balance"] < 1:
-        raise HTTPException(status_code=400, detail="Недостаточно раскладов на балансе.")
+    if user.get("balance", 0) < 1:
+        raise HTTPException(status_code=400, detail="Недостаточно обычных раскладов на балансе.")
         
     update_user_balance(user_id, balance_delta=-1)
-    return {"success": True, "new_balance": user["balance"] - 1}
+    return {"success": True, "new_balance": user.get("balance", 1) - 1}
+
+@app.post("/api/user/use-daily-reading")
+async def use_daily_reading(authorization: str = Header(None)):
+    user_tg = verify_telegram_init_data(authorization)
+    user_id = user_tg.get("id")
+    username = user_tg.get("username")
+    
+    user = get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+        
+    is_developer = (
+        (username and username.lower() == "dzenra_prod") or 
+        (user.get("username") and user.get("username").lower() == "dzenra_prod")
+    )
+    if is_developer:
+        return {"success": True, "new_daily_balance": 99999}
+
+    if user.get("daily_balance", 0) < 1:
+        raise HTTPException(status_code=400, detail="Недостаточно Карт Дня на балансе.")
+        
+    update_user_balance(user_id, balance_delta=0, ai_balance_delta=0, daily_balance_delta=-1)
+    return {"success": True, "new_daily_balance": user.get("daily_balance", 1) - 1}
 
 @app.post("/api/user/use-ai-reading")
 async def use_ai_reading(payload: dict, authorization: str = Header(None)):
@@ -592,7 +617,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
         (user.get("username") and user.get("username").lower() == "dzenra_prod")
     )
 
-    if not is_developer and user["ai_balance"] < 1:
+    if not is_developer and user.get("ai_balance", 0) < 1:
         raise HTTPException(status_code=400, detail="Недостаточно энергии расклада. Пополните баланс.")
         
     deck = get_tarot_deck()
@@ -610,7 +635,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     
     if not is_developer:
         update_user_balance(user_id, balance_delta=0, ai_balance_delta=-1)
-        new_ai_balance = user["ai_balance"] - 1
+        new_ai_balance = user.get("ai_balance", 1) - 1
     else:
         new_ai_balance = 99999
     
@@ -633,20 +658,25 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     amount = 0
     payload_str = ""
     
-    # ВОССТАНОВЛЕНЫ ОФИЦИАЛЬНЫЕ КОММЕРЧЕСКИЕ ТАРИФЫ (150, 675 и 750 ЗВЕЗД)
-    if pack == "1_std":
-        title = "1 Стандартный расклад"
-        description = "Расклад на одну карту для быстрого прояснения ситуации."
+    # ИСПРАВЛЕНО: ТАРИФЫ В СООТВЕТСТВИИ С ЗАПРОСОМ (Карта дня: 75, Обычный: 150, 5 Обычных: 675, Разбор: 750)
+    if pack == "1_daily":
+        title = "1 Карта Дня"
+        description = "Расклад на одну карту для быстрой сонастройки дня."
+        amount = 75  
+        payload_str = f"buy_1_daily_{user_id}_{random.randint(1000,9999)}"
+    elif pack == "1_std":
+        title = "1 Обычный расклад"
+        description = "Расклад для быстрого прояснения ситуации или готового вопроса."
         amount = 150  
         payload_str = f"buy_1_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "5_std":
-        title = "Пакет из 5 раскладов"
-        description = "Выгодный пакет из 5 сеансов со скидкой 10%."
+        title = "Пакет из 5 обычных раскладов"
+        description = "Выгодный пакет из 5 сеансов по готовым вопросам."
         amount = 675  
         payload_str = f"buy_5_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "1_ai":
-        title = "1 Индивидуальный расклад"
-        description = "Глубокий разбор вашей ситуации с динамическим выбором карт."
+        title = "1 Индивидуальный разбор"
+        description = "Детальный, развернутый психологический и духовный анализ."
         amount = 750  
         payload_str = f"buy_1_ai_{user_id}_{random.randint(1000,9999)}"
     else:
@@ -724,13 +754,19 @@ async def process_successful_payment(message: Message):
         pack_type = parts[2]
         user_id = int(parts[3])
         
-        if pack_type == "std":
-            qty = 5 if "5_std" in payload else 1
-            update_user_balance(user_id, balance_delta=qty, ai_balance_delta=0)
-            await message.answer(f"🔮 Оплата успешна! Зачислено {qty} стандартных раскладов.")
-        elif pack_type == "ai":
-            update_user_balance(user_id, balance_delta=0, ai_balance_delta=1)
-            await message.answer("🔮 Оплата успешна! Вам зачислен 1 Индивидуальный расклад. Откройте приложение, чтобы запустить его.")
+        # Начисление правильных балансов на основе успешных транзакций
+        if "buy_1_daily" in payload:
+            update_user_balance(user_id, balance_delta=0, ai_balance_delta=0, daily_balance_delta=1)
+            await message.answer("🔮 Оплата успешна! Вам зачислена 1 Карта Дня. Нажмите кнопку меню, чтобы запустить её.")
+        elif "buy_1_std" in payload:
+            update_user_balance(user_id, balance_delta=1, ai_balance_delta=0, daily_balance_delta=0)
+            await message.answer("🔮 Оплата успешна! Вам зачислен 1 Обычный расклад.")
+        elif "buy_5_std" in payload:
+            update_user_balance(user_id, balance_delta=5, ai_balance_delta=0, daily_balance_delta=0)
+            await message.answer("🔮 Оплата успешна! Вам зачислено 5 Обычных раскладов.")
+        elif "buy_1_ai" in payload:
+            update_user_balance(user_id, balance_delta=0, ai_balance_delta=1, daily_balance_delta=0)
+            await message.answer("🔮 Оплата успешна! Вам зачислен 1 Индивидуальный разбор. Нажмите кнопку меню, чтобы запустить его.")
 
 # =====================================================================
 # ТОЧКА ВХОДА ДЛЯ ВЕБХУКА TELEGRAM
