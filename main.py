@@ -292,7 +292,7 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
     Генерирует невероятно глубокий, контекстный и неповторяющийся расклад локально.
     Каждая карта толкования строится на её ранге, масти и контексте вопроса пользователя.
     """
-    print("🔮 Активирован сверхдинамический генератор «Вечный Оракул»", flush=True)
+    print("🔮 Активирован сверхдинамический локальный генератор", flush=True)
     
     used_cards = pre_selected_cards[:3]
     used_indices = [0, 1, 2]
@@ -351,7 +351,7 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list) -> dic
         # Специфика масти в контексте любого свободного вопроса
         suit_desc = ""
         if "Пентакли" in card_type or "Пентаклей" in name:
-            suit_desc = "Этот земной символ напоминает о важности материальной опоры, здоровья, практического расчёта и терпения."
+            suit_desc = "Этот земной символ напоминает о важности материальной основы, здоровья, практического расчёта и терпения."
         elif "Кубки" in card_type or "Кубков" in name:
             suit_desc = "Этот водный символ направляет фокус на ваши истинные чувства, эмоциональное состояние, интуицию и искренность."
         elif "Мечи" in card_type or "Мечей" in name:
@@ -407,7 +407,7 @@ def extract_json_from_text(text: str) -> Optional[dict]:
 # =====================================================================
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
     """
-    Пытается получить толкование у ИИ без жёстких ограничений тем.
+    Пытается получить толкование у ИИ без жестких привязок к темам.
     Отвечает строго на конкретный вопрос пользователя на основе карт Таро.
     При любом сбое бесшовно переключается на чистый локальный генератор.
     """
@@ -633,21 +633,21 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     amount = 0
     payload_str = ""
     
-    # На время тестирования цены установлены в 1, 2 и 3 звезды (измените перед запуском)
+    # ВОССТАНОВЛЕНЫ ОФИЦИАЛЬНЫЕ КОММЕРЧЕСКИЕ ТАРИФЫ (150, 675 и 750 ЗВЕЗД)
     if pack == "1_std":
         title = "1 Стандартный расклад"
         description = "Расклад на одну карту для быстрого прояснения ситуации."
-        amount = 1  
+        amount = 150  
         payload_str = f"buy_1_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "5_std":
         title = "Пакет из 5 раскладов"
         description = "Выгодный пакет из 5 сеансов со скидкой 10%."
-        amount = 2  
+        amount = 675  
         payload_str = f"buy_5_std_{user_id}_{random.randint(1000,9999)}"
     elif pack == "1_ai":
         title = "1 Индивидуальный расклад"
         description = "Глубокий разбор вашей ситуации с динамическим выбором карт."
-        amount = 3  
+        amount = 750  
         payload_str = f"buy_1_ai_{user_id}_{random.randint(1000,9999)}"
     else:
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
@@ -655,7 +655,6 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     try:
         print(f"Попытка выставить счет на Telegram Stars: UserID {user_id}, Pack '{pack}', Amount {amount}", flush=True)
         
-        # start_parameter убран, так как в aiogram 3.x на Render он вызывает критическую ошибку
         invoice_link = await bot.create_invoice_link(
             title=title,
             description=description,
