@@ -192,7 +192,7 @@ def create_user(telegram_id: int, username: Optional[str], first_name: str, emai
         cur = conn.cursor()
         execute_query(cur, """
             INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, ai_balance, daily_balance)
-            VALUES (%s, %s, %s, %s, TRUE, 150, 0, 0)
+            VALUES (%s, %s, %s, %s, TRUE, 0, 0, 0)
             ON CONFLICT (telegram_id) DO UPDATE
             SET username = EXCLUDED.username, first_name = EXCLUDED.first_name;
         """, (telegram_id, username, first_name, email))
@@ -932,8 +932,9 @@ async def cmd_start(message: Message):
     welcome_text = (
         f"Приветствуем тебя, {message.from_user.first_name}!\n\n"
         "Я — древний Оракул Таро, соединенный с мудростью веков.\n"
-        "Здесь ты можешь получить глубокие индивидуальные ответы на любые вопросы.\n\n"
-        "🎁 Тебе доступен 1 бесплатный расклад прямо сейчас!"
+        "Здесь ты можешь получить глубокие ответы на любые вопросы.\n\n"
+        "🃏 Карта Дня — бесплатно каждые сутки.\n"
+        "🎴 Стандартный и Индивидуальный разборы доступны за Энергию."
     )
     await message.answer(welcome_text, reply_markup=keyboard)
 
