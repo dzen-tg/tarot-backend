@@ -423,6 +423,30 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list, readin
         "reading": "".join(parts)
     }
 
+# Строим regex-паттерны через chr() — в исходнике только ASCII, никаких скрытых Unicode-символов.
+_INVIS_CHARS = "".join(chr(c) for c in [
+    0x00AD,  # soft hyphen
+    0x200B,  # zero width space
+    0x200C,  # zero width non-joiner
+    0x200D,  # zero width joiner
+    0x200E,  # left-to-right mark
+    0x200F,  # right-to-left mark
+    0x202A,  # left-to-right embedding
+    0x202B,  # right-to-left embedding
+    0x202C,  # pop directional formatting
+    0x202D,  # left-to-right override
+    0x202E,  # right-to-left override
+    0x2060,  # word joiner
+    0x2061,  # function application (invisible)
+    0x2062,  # invisible times
+    0x2063,  # invisible separator
+    0x2064,  # invisible plus
+    0xFEFF,  # BOM / zero width no-break space
+])
+_INVIS_RE = re.compile("[" + re.escape(_INVIS_CHARS) + "]")
+_COMBINING_RE = re.compile("[" + chr(0x0300) + "-" + chr(0x036F) + "]")
+
+
 def clean_ai_text(text: str) -> str:
     """Убирает мусорные Unicode-символы из текста AI: диакритику, управляющие символы,
     невидимые разделители и прочие артефакты LLM."""
@@ -432,10 +456,10 @@ def clean_ai_text(text: str) -> str:
     text = unicodedata.normalize("NFC", text)
     # Убираем управляющие символы (кроме \n \r \t)
     text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-    # Убираем невидимые Unicode-символы (мягкий перенос, неразрывные пробелы нестандартные, нулевая ширина и т.д.)
-    text = re.sub(r'[­​-‏‪-‮⁠-⁤﻿]', '', text)
-    # Убираем одиночные комбинирующие диакритические знаки (U+0300–U+036F), которые "прилипают" к кириллице
-    text = re.sub(r'[̀-ͯ]', '', text)
+    # Убираем невидимые и двунаправленные символы
+    text = _INVIS_RE.sub("", text)
+    # Убираем одиночные комбинирующие диакритические знаки (U+0300-U+036F), которые "прилипают" к кириллице
+    text = _COMBINING_RE.sub("", text)
     return text
 
 
