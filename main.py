@@ -143,9 +143,15 @@ def init_db():
                 balance INTEGER DEFAULT 150,
                 ai_balance INTEGER DEFAULT 0,
                 daily_balance INTEGER DEFAULT 0,
+                last_daily_date VARCHAR(10) DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # Добавляем колонку если её нет (для существующих БД)
+        try:
+            execute_query(cur, "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_daily_date VARCHAR(10) DEFAULT NULL;")
+        except Exception:
+            pass
         conn.commit()
         cur.close()
     except Exception as e:
@@ -234,6 +240,41 @@ def update_user_balance(telegram_id: int, balance_delta: int):
         cur.close()
     except Exception as e:
         pass
+    finally:
+        if conn:
+            conn.close()
+
+def get_today_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def check_and_use_daily_card(telegram_id: int) -> bool:
+    """Проверяет, может ли пользователь получить карту дня сегодня (1 раз в сутки).
+    Если может — обновляет дату и возвращает True. Иначе False."""
+    global IS_SQLITE
+    today = get_today_str()
+    conn = None
+    try:
+        conn = get_db_connection()
+        if IS_SQLITE:
+            cur = conn.cursor()
+        else:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+        execute_query(cur, "SELECT last_daily_date FROM users WHERE telegram_id = %s", (telegram_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return False
+        last_date = dict(row).get("last_daily_date")
+        if last_date == today:
+            cur.close()
+            return False  # Уже использовал сегодня
+        execute_query(cur, "UPDATE users SET last_daily_date = %s WHERE telegram_id = %s", (today, telegram_id))
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        print(f"Ошибка проверки карты дня: {e}", flush=True)
+        return True  # При ошибке — разрешаем
     finally:
         if conn:
             conn.close()
@@ -499,29 +540,36 @@ async def call_ai(system_prompt: str, user_prompt: str) -> Optional[dict]:
 
 
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
-    """Индивидуальный разбор — глубокий, 600-800 слов."""
+    """Индивидуальный разбор — 6 до 12 карт, глубокий анализ на основе классических традиций таро."""
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
 
     system_prompt = (
-        "Ты — мастер таро с 30-летним опытом, глубинный психолог в традиции Карла Юнга. "
-        "У тебя живой, тёплый, поэтичный язык. Ты говоришь с человеком как с близким другом, которому доверяешь сокровенное. "
-        "Никогда не используй фразы 'как ИИ', 'согласно картам', 'в заключение'. Пиши только на Markdown — **жирный**, обычный текст. "
-        "Запрещено использовать HTML-теги. Запрещено использовать # или ## — только **жирный** для заголовков секций.\n\n"
-        "Твоя задача: выбрать ровно 3 карты и провести глубокий, личный, психологически точный разбор на 600-800 слов.\n\n"
-        "СТРУКТУРА:\n"
-        "1. Обращение к человеку — тёплое, ненавязчивое вступление, отзеркаль суть вопроса.\n"
-        "2. Три карты (прошлое, настоящее, будущее) — каждая карта разобрана как живой архетип, применительно именно к этому вопросу.\n"
-        "3. Интеграция — как три карты говорят вместе, что это означает для человека прямо сейчас.\n"
-        "4. Напутствие — вдохновляющее, но честное. Человек должен уйти наполненным, а не пустым.\n\n"
-        "ВАЖНО: пиши разнообразно. Каждый ответ — уникален. Не копируй шаблоны.\n\n"
-        "Формат ответа — строго JSON:\n"
-        "{\n"
-        "  \"cards_used_indices\": [индексы 3 выбранных карт],\n"
-        "  \"reading\": \"текст на Markdown\"\n"
-        "}"
+        "Ты — мастер таро с 30-летним опытом, практикующий в традициях Артура Эдварда Уэйта (Таро Уэйта-Смит), "
+        "Хайо Банцхафа и Карла Юнга. Ты глубоко знаешь архетипическую психологию и применяешь её к толкованию карт.\n\n"
+        "ЗАДАЧА: Провести глубокий индивидуальный расклад по вопросу человека.\n\n"
+        "КОЛИЧЕСТВО КАРТ — выбери сам от 6 до 12 в зависимости от сложности вопроса:\n"
+        "• 6 карт — вопрос конкретный и краткосрочный\n"
+        "• 8-9 карт — вопрос о ситуации, отношениях или решении\n"
+        "• 10-12 карт — глубокий экзистенциальный вопрос о жизненном пути, предназначении, трансформации\n\n"
+        "СТРУКТУРА РАСКЛАДА (пиши именно так, используй только **жирный** Markdown, никаких HTML-тегов):\n\n"
+        "Вступление — 2-3 предложения: почувствуй суть вопроса, обратись к человеку тепло и лично.\n\n"
+        "Для каждой карты — отдельный блок:\n"
+        "**[Название позиции] — [Имя карты]**\n"
+        "Толкование на 60-90 слов: классическое значение карты по Уэйту + применение к конкретному вопросу + "
+        "что это говорит о состоянии человека прямо сейчас. Используй образные метафоры.\n\n"
+        "ПОЗИЦИИ для 6 карт: Корни ситуации, Текущая энергия, Скрытое влияние, Совет карт, Ближайшее будущее, Итог\n"
+        "ПОЗИЦИИ для 8-9 карт: добавь Внутреннее состояние, Окружение, Чего бояться\n"
+        "ПОЗИЦИИ для 10-12 карт: используй Кельтский крест или собственную систему позиций\n\n"
+        "Интеграция (100-150 слов) — как карты говорят вместе: какой сквозной архетип прослеживается, "
+        "что хочет сказать коллективное бессознательное через этот расклад.\n\n"
+        "Напутствие (50-70 слов) — конкретное, вдохновляющее, честное. Человек должен уйти наполненным.\n\n"
+        "ВАЖНО: Пиши живым тёплым языком. Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм', 'в заключение'. "
+        "Каждый расклад уникален. Общий объём — 800-1200 слов.\n\n"
+        "Формат ответа — строго JSON (без markdown-блоков):\n"
+        "{\"cards_used_indices\": [список индексов выбранных карт], \"reading\": \"текст расклада\"}"
     )
 
-    user_prompt = f"Вопрос человека: '{question}'.\nДоступные карты: {cards_str}."
+    user_prompt = f"Вопрос человека: «{question}».\nДоступные карты для выбора: {cards_str}."
 
     result = await call_ai(system_prompt, user_prompt)
     if result:
@@ -532,55 +580,63 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
 
 
 async def generate_preset_reading(question: str, pre_selected_cards: list) -> dict:
-    """Расклад на готовый вопрос — живой, но более краткий (300-400 слов)."""
+    """Стандартный разбор — 3 карты, подробный и детальный (500-600 слов)."""
     cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
 
     system_prompt = (
-        "Ты — мастер таро, который умеет давать точные, живые ответы на классические жизненные вопросы. "
-        "Твой стиль: тёплый, конкретный, без воды. Ты отвечаешь как мудрый друг, который видит суть. "
-        "Пиши только на Markdown — **жирный** для выделений. Никаких HTML-тегов. Никаких # заголовков.\n\n"
-        "Задача: выбрать ровно 3 карты и дать живой, конкретный расклад на 300-400 слов.\n\n"
-        "СТРУКТУРА:\n"
-        "**Прошлое — [имя карты]:** как прошлое влияет на этот вопрос.\n"
-        "**Настоящее — [имя карты]:** что происходит прямо сейчас.\n"
-        "**Будущее — [имя карты]:** куда ведёт ситуация и главный совет.\n\n"
-        "Каждый раз давай свежий, уникальный ответ. Не повторяй одни и те же фразы.\n\n"
-        "Формат ответа — строго JSON:\n"
-        "{\n"
-        "  \"cards_used_indices\": [индексы 3 выбранных карт],\n"
-        "  \"reading\": \"текст на Markdown\"\n"
-        "}"
+        "Ты — опытный таролог, практикующий по системе Артура Уэйта. "
+        "Ты умеешь давать точные, живые, детальные ответы на классические жизненные вопросы.\n\n"
+        "ЗАДАЧА: выбери ровно 3 карты и проведи подробный расклад «Прошлое — Настоящее — Будущее».\n\n"
+        "СТРУКТУРА (пиши только Markdown **жирный**, никаких HTML-тегов):\n\n"
+        "Вступление (2-3 предложения) — почувствуй вопрос, обратись к человеку лично и тепло.\n\n"
+        "**Прошлое — [Имя карты]**\n"
+        "80-100 слов: как прошлый опыт, прошлые решения или давние события сформировали текущую ситуацию. "
+        "Раскрой классическое значение карты и покажи, как оно отражается в истории человека.\n\n"
+        "**Настоящее — [Имя карты]**\n"
+        "80-100 слов: что происходит в жизни человека прямо сейчас — какие силы действуют, "
+        "какие внутренние или внешние конфликты определяют момент. Будь конкретен и точен.\n\n"
+        "**Будущее — [Имя карты]**\n"
+        "80-100 слов: куда ведёт ситуация при текущем развитии событий, какой совет дают карты, "
+        "что нужно принять или изменить. Дай ясное и вдохновляющее направление.\n\n"
+        "**Совет Оракула** (70-90 слов) — итоговое напутствие: как три карты говорят вместе, "
+        "что сквозной смысл расклада говорит о пути человека. Заканчивай на тёплой, утвердительной ноте.\n\n"
+        "ВАЖНО: Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм'. "
+        "Пиши живо, поэтично, с метафорами. Каждый расклад уникален — не повторяй шаблоны. "
+        "Общий объём — 500-600 слов.\n\n"
+        "Формат ответа — строго JSON (без markdown-блоков):\n"
+        "{\"cards_used_indices\": [индекс1, индекс2, индекс3], \"reading\": \"текст расклада\"}"
     )
 
-    user_prompt = f"Вопрос: '{question}'.\nДоступные карты: {cards_str}."
+    user_prompt = f"Вопрос: «{question}».\nДоступные карты: {cards_str}."
 
     result = await call_ai(system_prompt, user_prompt)
     if result:
         return result
 
-    print("⚠️ Все AI недоступны для preset. Локальный оракул.", flush=True)
+    print("⚠️ Все AI недоступны для стандартного разбора. Локальный оракул.", flush=True)
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 
 async def generate_daily_reading(pre_selected_cards: list) -> dict:
-    """Карта дня — вдохновляющий совет на день."""
+    """Карта дня — живое, детальное толкование одной карты (250-300 слов)."""
     card = pre_selected_cards[0]
     card_str = f"[0] {card['name']} ({card['type']})"
 
     system_prompt = (
-        "Ты — мастер таро. Для Карты Дня дай живое, личное толкование одной карты на 200-250 слов. "
-        "Стиль: поэтичный, вдохновляющий, конкретный. Человек должен получить ясный совет и ощущение, "
-        "что Вселенная говорит именно с ним. Пиши только Markdown (**жирный**). Никаких HTML-тегов.\n\n"
-        "Структура:\n"
-        "**Карта Дня — [имя карты]**\n"
-        "[Живое толкование карты применительно к сегодняшнему дню]\n\n"
-        "**Совет на сегодня:** [конкретный, действенный совет]\n\n"
-        "Каждый раз пиши по-новому. Не копируй шаблоны.\n\n"
-        "Формат ответа — строго JSON:\n"
-        "{\n"
-        "  \"cards_used_indices\": [0],\n"
-        "  \"reading\": \"текст на Markdown\"\n"
-        "}"
+        "Ты — мастер таро, хранитель древних символов. Твой стиль — поэтичный, тёплый, живой.\n\n"
+        "ЗАДАЧА: дай глубокое толкование Карты Дня — одной карты, которая станет ориентиром на 24 часа.\n\n"
+        "СТРУКТУРА (только Markdown **жирный**, никаких HTML-тегов):\n\n"
+        "**Карта Дня — [Имя карты]**\n\n"
+        "Основное толкование (120-150 слов): раскрой архетип карты по традиции Уэйта — "
+        "её светлую и теневую сторону, символику, что она говорит о сегодняшнем дне. "
+        "Сделай это живо, с образами и метафорами.\n\n"
+        "**На что обратить внимание сегодня:** (50-60 слов) — конкретная область жизни или внутреннее состояние, "
+        "которое карта подсвечивает именно сегодня.\n\n"
+        "**Совет дня:** (40-50 слов) — одно чёткое, действенное напутствие. "
+        "Что сделать, о чём подумать, чего избежать.\n\n"
+        "ВАЖНО: Никаких слов 'нейросеть', 'ИИ'. Каждый день — уникальный текст. Тепло, лично, вдохновляюще.\n\n"
+        "Формат ответа — строго JSON (без markdown-блоков):\n"
+        "{\"cards_used_indices\": [0], \"reading\": \"текст\"}"
     )
 
     user_prompt = f"Карта дня: {card_str}."
@@ -720,8 +776,8 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
 
 @app.post("/api/user/use-daily-ai-reading")
 async def use_daily_ai_reading(authorization: str = Header(None)):
-    """Карта дня через Gemini AI — 75 энергии, уникальное толкование."""
-    await asyncio.sleep(1.0)
+    """Карта дня — бесплатно, 1 раз в сутки."""
+    await asyncio.sleep(0.8)
 
     user_tg = verify_telegram_init_data(authorization)
     user_id = user_tg.get("id")
@@ -731,11 +787,14 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не зарегистрирован.")
 
-    is_developer = ((username and username.lower() == "dzenra_prod") or
-                    (user.get("username") and user.get("username").lower() == "dzenra_prod"))
+    is_developer = (username and username.lower() == "dzenra_prod") or \
+                   (user.get("username") and user.get("username").lower() == "dzenra_prod")
 
-    if not is_developer and user.get("balance", 0) < 75:
-        raise HTTPException(status_code=400, detail="Недостаточно Энергии на балансе.")
+    # Проверяем лимит 1 раз в день (для разработчика — без ограничений)
+    if not is_developer:
+        allowed = check_and_use_daily_card(user_id)
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Карта дня уже получена сегодня. Возвращайтесь завтра.")
 
     deck = get_tarot_deck()
     pre_selected = random.sample(deck, 3)
@@ -745,17 +804,11 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
     final_card = pre_selected[0]
     text_reading = result_data.get("reading", "")
 
-    if not is_developer:
-        update_user_balance(user_id, balance_delta=-75)
-        new_balance = user.get("balance", 75) - 75
-    else:
-        new_balance = 99999
-
     return {
         "success": True,
         "cards": [final_card],
         "text": text_reading,
-        "new_balance": new_balance
+        "new_balance": 99999 if is_developer else user.get("balance", 0)
     }
 
 
@@ -783,16 +836,14 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
         raise HTTPException(status_code=400, detail="Недостаточно Энергии на балансе.")
 
     deck = get_tarot_deck()
-    pre_selected = random.sample(deck, 6)
+    pre_selected = random.sample(deck, 12)  # 12 карт — AI выберет 6-12
 
     result_data = await generate_dynamic_reading(question, pre_selected)
 
-    used_indices = result_data.get("cards_used_indices", [0, 1, 2])
+    used_indices = result_data.get("cards_used_indices", list(range(6)))
     used_indices = [idx for idx in used_indices if 0 <= idx < len(pre_selected)]
-    if len(used_indices) < 3:
-        used_indices = [0, 1, 2]
-    else:
-        used_indices = used_indices[:3]
+    if len(used_indices) < 6:
+        used_indices = list(range(min(6, len(pre_selected))))
 
     final_cards = [pre_selected[idx] for idx in used_indices]
     text_reading = result_data.get("reading", "")
@@ -822,26 +873,21 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     amount = 0
     payload_str = ""
 
-    if pack == "1_daily":
-        title = "+75 Энергии (Карта Дня)"
-        description = "Приобретение 75 единиц Энергии для открытия Карты Дня."
-        amount = 75
-        payload_str = f"buy_1_daily_{user_id}_{random.randint(1000,9999)}"
-    elif pack == "1_std":
-        title = "+150 Энергии (Обычный расклад)"
-        description = "Приобретение 150 единиц Энергии для Готового вопроса."
+    if pack == "pack_150":
+        title = "+150 Энергии"
+        description = "1 Стандартный разбор — расклад на 3 карты по вашему вопросу."
         amount = 150
-        payload_str = f"buy_1_std_{user_id}_{random.randint(1000,9999)}"
-    elif pack == "5_std":
-        title = "+750 Энергии (Пакет Энергии)"
-        description = "Выгодный пакет: 750 единиц Энергии со скидкой 10%."
-        amount = 675
-        payload_str = f"buy_5_std_{user_id}_{random.randint(1000,9999)}"
-    elif pack == "1_ai":
-        title = "+750 Энергии (Индивидуальный разбор)"
-        description = "Приобретение 750 единиц Энергии для Глубокого разбора."
+        payload_str = f"buy_150_{user_id}_{random.randint(1000,9999)}"
+    elif pack == "pack_450":
+        title = "+450 Энергии (скидка 15%)"
+        description = "3 Стандартных разбора по выгодной цене — скидка 15%."
+        amount = 383  # 450 * 0.85 = 382.5 → 383 звезды
+        payload_str = f"buy_450_{user_id}_{random.randint(1000,9999)}"
+    elif pack == "pack_750":
+        title = "+750 Энергии"
+        description = "1 Индивидуальный разбор — глубокий персональный анализ от 6 до 12 карт."
         amount = 750
-        payload_str = f"buy_1_ai_{user_id}_{random.randint(1000,9999)}"
+        payload_str = f"buy_750_{user_id}_{random.randint(1000,9999)}"
     else:
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
 
@@ -906,16 +952,13 @@ async def process_successful_payment(message: Message):
     if len(parts) >= 4:
         user_id = int(parts[3])
 
-        if "buy_1_daily" in payload:
-            update_user_balance(user_id, balance_delta=75)
-            await message.answer("🔮 Оплата успешна! Зачислено +75 Энергии.")
-        elif "buy_1_std" in payload:
+        if "buy_150" in payload:
             update_user_balance(user_id, balance_delta=150)
             await message.answer("🔮 Оплата успешна! Зачислено +150 Энергии.")
-        elif "buy_5_std" in payload:
-            update_user_balance(user_id, balance_delta=750)
-            await message.answer("🔮 Оплата успешна! Зачислено +750 Энергии.")
-        elif "buy_1_ai" in payload:
+        elif "buy_450" in payload:
+            update_user_balance(user_id, balance_delta=450)
+            await message.answer("🔮 Оплата успешна! Зачислено +450 Энергии.")
+        elif "buy_750" in payload:
             update_user_balance(user_id, balance_delta=750)
             await message.answer("🔮 Оплата успешна! Зачислено +750 Энергии.")
 
