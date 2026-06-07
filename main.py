@@ -5,6 +5,8 @@ import json
 import random
 import asyncio
 import socket
+import unicodedata
+import re
 from typing import Optional
 from datetime import datetime
 
@@ -421,6 +423,22 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list, readin
         "reading": "".join(parts)
     }
 
+def clean_ai_text(text: str) -> str:
+    """Убирает мусорные Unicode-символы из текста AI: диакритику, управляющие символы,
+    невидимые разделители и прочие артефакты LLM."""
+    if not text:
+        return text
+    # Нормализация NFC: разложенные символы → предсобранные (убирает комбинирующие символы, оставляя кириллицу чистой)
+    text = unicodedata.normalize("NFC", text)
+    # Убираем управляющие символы (кроме \n \r \t)
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    # Убираем невидимые Unicode-символы (мягкий перенос, неразрывные пробелы нестандартные, нулевая ширина и т.д.)
+    text = re.sub(r'[­​-‏‪-‮⁠-⁤﻿]', '', text)
+    # Убираем одиночные комбинирующие диакритические знаки (U+0300–U+036F), которые "прилипают" к кириллице
+    text = re.sub(r'[̀-ͯ]', '', text)
+    return text
+
+
 def extract_json_from_text(text: str) -> Optional[dict]:
     try:
         text_strip = text.strip()
@@ -475,7 +493,7 @@ async def call_groq(system_prompt: str, user_prompt: str) -> Optional[dict]:
                     clean = parsed["reading"]
                     for tag in ["<h3>","</h3>","<h4>","</h4>","<br>","<br/>"]:
                         clean = clean.replace(tag, "\n" if "br" in tag else "")
-                    parsed["reading"] = clean
+                    parsed["reading"] = clean_ai_text(clean)
                     print("✅ Groq ответил успешно", flush=True)
                     return parsed
             else:
@@ -518,6 +536,7 @@ async def call_gemini(system_prompt: str, user_prompt: str) -> Optional[dict]:
                     raw = r.json().get("candidates",[{}])[0].get("content",{}).get("parts",[{}])[0].get("text","")
                     parsed = extract_json_from_text(raw)
                     if parsed and "reading" in parsed:
+                        parsed["reading"] = clean_ai_text(parsed["reading"])
                         print(f"✅ Gemini ответил через {model}", flush=True)
                         return parsed
                 else:
