@@ -26,6 +26,7 @@ from aiogram.filters import Command
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tarot-frontend-wine.vercel.app")
 
 if not BOT_TOKEN:
@@ -392,22 +393,66 @@ def extract_json_from_text(text: str) -> Optional[dict]:
     return None
 
 # =====================================================================
-# ВЫЗОВ GEMINI AI
+# ВЫЗОВ AI — GROQ (основной) + GEMINI (запасной)
 # =====================================================================
 
-# СПИСОК МОДЕЛЕЙ ДЛЯ ПЕРЕБОРА (от лучшей к запасной)
-GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-]
+async def call_groq(system_prompt: str, user_prompt: str) -> Optional[dict]:
+    """Groq API (OpenAI-совместимый). Бесплатно, быстро, качественно."""
+    if not GROQ_API_KEY:
+        return None
 
-async def call_gemini(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Вызвать Gemini с автоматическим перебором моделей."""
+    # Просим ИИ вернуть строго JSON
+    full_system = system_prompt + "\n\nОТВЕЧАЙ ТОЛЬКО JSON без markdown-блоков (без ```json). Только чистый JSON."
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": full_system},
+            {"role": "user",   "content": user_prompt}
+        ],
+        "temperature": 0.85,
+        "max_tokens": 2000,
+        "response_format": {"type": "json_object"}
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=30.0
+            )
+            if r.status_code == 200:
+                raw = r.json()["choices"][0]["message"]["content"]
+                parsed = extract_json_from_text(raw)
+                if parsed and "reading" in parsed:
+                    # Убираем возможные HTML-теги
+                    clean = parsed["reading"]
+                    for tag in ["<h3>","</h3>","<h4>","</h4>","<br>","<br/>"]:
+                        clean = clean.replace(tag, "\n" if "br" in tag else "")
+                    parsed["reading"] = clean
+                    print("✅ Groq ответил успешно", flush=True)
+                    return parsed
+            else:
+                print(f"⚠️ Groq ошибка {r.status_code}: {r.text[:200]}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Groq исключение: {e}", flush=True)
+
+    return None
+
+
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
+
+async def call_gemini(system_prompt: str, user_prompt: str) -> Optional[dict]:
+    """Gemini — запасной вариант если Groq недоступен."""
     if not GEMINI_API_KEY:
         return None
 
-    structured_payload = {
+    payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {
@@ -415,13 +460,8 @@ async def call_gemini(system_prompt: str, user_prompt: str) -> Optional[str]:
             "responseSchema": {
                 "type": "OBJECT",
                 "properties": {
-                    "cards_used_indices": {
-                        "type": "ARRAY",
-                        "items": {"type": "INTEGER"}
-                    },
-                    "reading": {
-                        "type": "STRING"
-                    }
+                    "cards_used_indices": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    "reading": {"type": "STRING"}
                 },
                 "required": ["cards_used_indices", "reading"]
             }
@@ -429,35 +469,33 @@ async def call_gemini(system_prompt: str, user_prompt: str) -> Optional[str]:
     }
 
     async with httpx.AsyncClient() as client:
-        for model_name in GEMINI_MODELS:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-            for attempt in range(2):
-                try:
-                    response = await client.post(url, json=structured_payload, timeout=25.0)
-                    if response.status_code == 200:
-                        data = response.json()
-                        raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                        parsed = extract_json_from_text(raw_text)
-                        if parsed and "reading" in parsed:
-                            # Очищаем HTML-теги, которые ИИ мог вставить
-                            clean = parsed["reading"]
-                            clean = clean.replace("<h3>", "").replace("</h3>", "")
-                            clean = clean.replace("<h4>", "").replace("</h4>", "")
-                            clean = clean.replace("<br>", "\n").replace("<br/>", "\n")
-                            parsed["reading"] = clean
-                            print(f"✅ Gemini ответил через модель {model_name}", flush=True)
-                            return parsed
-                    elif response.status_code == 429:
-                        print(f"⚠️ Rate limit на {model_name}, пробуем следующую...", flush=True)
-                        break
-                    else:
-                        print(f"⚠️ Ошибка {response.status_code} на модели {model_name}", flush=True)
-                except Exception as e:
-                    print(f"⚠️ Исключение при вызове {model_name}: {e}", flush=True)
-                await asyncio.sleep(1.0)
+        for model in GEMINI_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            try:
+                r = await client.post(url, json=payload, timeout=25.0)
+                if r.status_code == 200:
+                    raw = r.json().get("candidates",[{}])[0].get("content",{}).get("parts",[{}])[0].get("text","")
+                    parsed = extract_json_from_text(raw)
+                    if parsed and "reading" in parsed:
+                        print(f"✅ Gemini ответил через {model}", flush=True)
+                        return parsed
+                else:
+                    print(f"⚠️ Gemini {model} ошибка {r.status_code}", flush=True)
+            except Exception as e:
+                print(f"⚠️ Gemini {model} исключение: {e}", flush=True)
+            await asyncio.sleep(0.5)
 
-    print("🚨 Все модели Gemini недоступны.", flush=True)
     return None
+
+
+async def call_ai(system_prompt: str, user_prompt: str) -> Optional[dict]:
+    """Единая точка вызова AI: сначала Groq, потом Gemini."""
+    result = await call_groq(system_prompt, user_prompt)
+    if result:
+        return result
+    print("⚠️ Groq недоступен, пробуем Gemini...", flush=True)
+    result = await call_gemini(system_prompt, user_prompt)
+    return result
 
 
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
@@ -485,11 +523,11 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
 
     user_prompt = f"Вопрос человека: '{question}'.\nДоступные карты: {cards_str}."
 
-    result = await call_gemini(system_prompt, user_prompt)
+    result = await call_ai(system_prompt, user_prompt)
     if result:
         return result
 
-    print("⚠️ Gemini недоступен. Переход на локальный оракул.", flush=True)
+    print("⚠️ Все AI недоступны. Переход на локальный оракул.", flush=True)
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 
@@ -516,11 +554,11 @@ async def generate_preset_reading(question: str, pre_selected_cards: list) -> di
 
     user_prompt = f"Вопрос: '{question}'.\nДоступные карты: {cards_str}."
 
-    result = await call_gemini(system_prompt, user_prompt)
+    result = await call_ai(system_prompt, user_prompt)
     if result:
         return result
 
-    print("⚠️ Gemini недоступен для preset. Локальный оракул.", flush=True)
+    print("⚠️ Все AI недоступны для preset. Локальный оракул.", flush=True)
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 
@@ -547,7 +585,7 @@ async def generate_daily_reading(pre_selected_cards: list) -> dict:
 
     user_prompt = f"Карта дня: {card_str}."
 
-    result = await call_gemini(system_prompt, user_prompt)
+    result = await call_ai(system_prompt, user_prompt)
     if result:
         return result
 
