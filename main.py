@@ -68,7 +68,7 @@ PACKS = {
     # id: (энергия, цена в Stars, цена для первой покупки, заголовок, описание)
     "pack_150": (150, 150, int(os.getenv("FIRST_PURCHASE_PRICE", "99")), "+150 Энергии", "1 Стандартный разбор — расклад на 3 карты по вашему вопросу."),
     "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", "3 Стандартных разбора по выгодной цене."),
-    "pack_750": (750, 750, 750, "+750 Энергии", "1 Индивидуальный разбор — глубокий анализ от 6 до 12 карт."),
+    "pack_750": (750, 750, 750, "+750 Энергии", "1 Индивидуальный разбор — глубокий анализ от 6 до 10 карт."),
 }
 
 if not BOT_TOKEN:
@@ -457,35 +457,28 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list, readin
         )
         return {"cards_used_indices": [0], "reading": text}
 
-    positions = ["прошлое", "настоящее", "будущее"]
-
-    parts = [
-        f"Оракул услышал ваш вопрос: **«{question}»**\n\n"
-        "Три карты открыты. Каждая говорит о своём пласте вашей ситуации.\n\n"
-    ]
-
-    position_titles = [
-        "⏳ Корни ситуации (Прошлое)",
-        "⚡ Вызов настоящего",
-        "🌟 Вектор будущего"
-    ]
-
+    n = 6 if reading_type == "dynamic" else 3
+    used_cards = pre_selected_cards[:n]
+    titles = (["⏳ Корни ситуации", "⚡ Текущая энергия", "🌙 Скрытое влияние",
+               "🧭 Совет карт", "🌱 Ближайшее будущее", "🌟 Итог"] if n == 6
+              else ["⏳ Прошлое", "⚡ Настоящее", "🌟 Будущее"])
+    parts = [f"Оракул услышал твой вопрос: **«{question}»**"]
     for idx, card in enumerate(used_cards):
-        name = card["name"]
-        pos = position_titles[idx]
-        meaning = get_rich_card_meaning(name, positions[idx])
-        parts.append(f"**{pos} — {name}**\n{meaning}\n\n")
-
+        name = card["name"].replace("Старший Аркан: ", "")
+        parts.append(f"**{titles[idx]} — {name}**\n{get_rich_card_meaning(card['name'], 'present')}")
+    majors = [c for c in used_cards if c["type"] == "Старший Аркан"]
+    last = used_cards[-1]["name"].replace("Старший Аркан: ", "")
     parts.append(
-        "**Итог Оракула:**\n"
-        "Карты не выносят окончательный приговор — они подсвечивают энергетические токи вашей жизни. "
-        "Интегрируйте этот опыт, доверяйте себе и действуйте из состояния любви и осознанности."
+        "**🔮 Общая картина**\n"
+        + ("В раскладе сильны Старшие Арканы — ситуация важнее, чем кажется, и связана с большими переменами. "
+           if majors else "В раскладе только Младшие Арканы — ситуация в твоих руках и решается повседневными шагами. ")
+        + f"Ключевая карта итога — {last}: она показывает, куда всё движется."
     )
-
-    return {
-        "cards_used_indices": used_indices,
-        "reading": "".join(parts)
-    }
+    parts.append("**✨ Ответ на твой вопрос**\nКарты не дают жёсткого «да» или «нет» — они показывают, что исход зависит от твоих действий в ближайшее время. Опирайся на совет и карту итога.")
+    parts.append("**🧭 Что делать**\n• Определи один конкретный шаг, который можешь сделать на этой неделе.\n"
+                 "• Обрати внимание на то, что подсвечивает карта настоящего — там главный ресурс.\n"
+                 "• Вернись к раскладу через несколько дней и сверь, что изменилось.")
+    return {"cards_used_indices": list(range(len(used_cards))), "reading": "\n\n".join(parts)}
 
 # Строим regex-паттерны через chr() — в исходнике только ASCII, никаких скрытых Unicode-символов.
 _INVIS_CHARS = "".join(chr(c) for c in [
@@ -516,6 +509,8 @@ def clean_ai_text(text: str) -> str:
     невидимые разделители и прочие артефакты LLM."""
     if not text:
         return text
+    # Модель иногда «дважды экранирует» переносы — в тексте оказываются буквальные \\n.
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", " ").replace('\\"', '"')
     # Нормализация NFC: разложенные символы → предсобранные (убирает комбинирующие символы, оставляя кириллицу чистой)
     text = unicodedata.normalize("NFC", text)
     # Убираем управляющие символы (кроме \n \r \t)
@@ -552,7 +547,11 @@ def _clean_reading(parsed: dict) -> dict:
     return parsed
 
 
-async def call_groq(system_prompt: str, user_prompt: str, max_tokens: int) -> Optional[dict]:
+# ---------------------------------------------------------------------
+# Низкоуровневые вызовы: возвращают сырой dict из JSON-ответа модели
+# (или None, если ответ оборван/не распарсился).
+# ---------------------------------------------------------------------
+async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int) -> Optional[dict]:
     if not GROQ_API_KEY:
         return None
     payload = {
@@ -561,7 +560,7 @@ async def call_groq(system_prompt: str, user_prompt: str, max_tokens: int) -> Op
             {"role": "system", "content": system_prompt + "\n\nОТВЕЧАЙ ТОЛЬКО JSON без markdown-блоков (без ```json). Только чистый JSON."},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.85,
+        "temperature": 0.8,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
@@ -570,38 +569,30 @@ async def call_groq(system_prompt: str, user_prompt: str, max_tokens: int) -> Op
         r = await http.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json=payload, timeout=45.0,
+            json=payload, timeout=60.0,
         )
-        if r.status_code == 200:
-            choice = r.json()["choices"][0]
-            parsed = extract_json_from_text(choice["message"]["content"])
-            if parsed and parsed.get("reading"):
-                log(f"✅ Groq {time.monotonic() - t0:.1f}s (finish={choice.get('finish_reason')})")
-                return _clean_reading(parsed)
-            log(f"⚠️ Groq вернул неполный JSON (finish={choice.get('finish_reason')})")
-        else:
+        if r.status_code != 200:
             log(f"⚠️ Groq ошибка {r.status_code}: {r.text[:200]}")
+            return None
+        choice = r.json()["choices"][0]
+        if choice.get("finish_reason") == "length":
+            log("⚠️ Groq: ответ оборван по лимиту токенов")
+            return None
+        parsed = extract_json_from_text(choice["message"]["content"])
+        log(f"Groq {time.monotonic() - t0:.1f}s, json={'ok' if parsed else 'fail'}")
+        return parsed
     except Exception as e:
         log(f"⚠️ Groq исключение: {type(e).__name__}: {e}")
-    return None
+        return None
 
 
-async def call_gemini(system_prompt: str, user_prompt: str, max_tokens: int) -> Optional[dict]:
+async def _gemini_json(system_prompt: str, user_prompt: str, max_tokens: int, schema: Optional[dict]) -> Optional[dict]:
     if not GEMINI_API_KEY:
         return None
     for model in GEMINI_MODELS:
-        gen_cfg = {
-            "responseMimeType": "application/json",
-            "maxOutputTokens": max_tokens + 500,
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "cards_used_indices": {"type": "ARRAY", "items": {"type": "INTEGER"}},
-                    "reading": {"type": "STRING"},
-                },
-                "required": ["cards_used_indices", "reading"],
-            },
-        }
+        gen_cfg = {"responseMimeType": "application/json", "maxOutputTokens": max_tokens + 1000}
+        if schema:
+            gen_cfg["responseSchema"] = schema
         if model.startswith("gemini-2.5"):
             gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}  # без «размышлений» — в разы быстрее
         payload = {
@@ -611,13 +602,17 @@ async def call_gemini(system_prompt: str, user_prompt: str, max_tokens: int) -> 
         }
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            r = await http.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=40.0)
+            r = await http.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=60.0)
             if r.status_code == 200:
-                raw = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                cand = r.json().get("candidates", [{}])[0]
+                if cand.get("finishReason") == "MAX_TOKENS":
+                    log(f"⚠️ Gemini {model}: ответ оборван по лимиту")
+                    continue
+                raw = cand.get("content", {}).get("parts", [{}])[0].get("text", "")
                 parsed = extract_json_from_text(raw)
-                if parsed and parsed.get("reading"):
+                if parsed:
                     log(f"✅ Gemini ответил через {model}")
-                    return _clean_reading(parsed)
+                    return parsed
             else:
                 log(f"⚠️ Gemini {model} ошибка {r.status_code}: {r.text[:150]}")
         except Exception as e:
@@ -625,89 +620,143 @@ async def call_gemini(system_prompt: str, user_prompt: str, max_tokens: int) -> 
     return None
 
 
-async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> Optional[dict]:
-    """Сначала Groq, потом Gemini. Если оба недоступны — None (сработает локальный оракул)."""
-    result = await call_groq(system_prompt, user_prompt, max_tokens)
-    if result:
-        return result
-    return await call_gemini(system_prompt, user_prompt, max_tokens)
+async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
+                  schema: Optional[dict] = None, validate=None) -> Optional[dict]:
+    """Groq → (повтор Groq) → Gemini. validate(dict) -> dict|None отбраковывает неполные ответы."""
+    attempts = [
+        lambda: _groq_json(system_prompt, user_prompt, max_tokens),
+        lambda: _groq_json(system_prompt, user_prompt, max_tokens),
+        lambda: _gemini_json(system_prompt, user_prompt, max_tokens, schema),
+    ]
+    for attempt in attempts:
+        parsed = await attempt()
+        if not parsed:
+            continue
+        result = validate(parsed) if validate else (parsed if parsed.get("reading") else None)
+        if result:
+            return result if validate else _clean_reading(result)
+        log("⚠️ Ответ AI неполный — пробуем ещё раз")
+    return None
+
+
+# ---------------------------------------------------------------------
+# Структурированный расклад: модель возвращает части по отдельности,
+# а текст собираем мы — так каждая карта и итог гарантированно на месте.
+# ---------------------------------------------------------------------
+STRUCTURED_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "intro": {"type": "STRING"},
+        "cards": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "index": {"type": "INTEGER"}, "position": {"type": "STRING"}, "meaning": {"type": "STRING"}},
+            "required": ["index", "position", "meaning"]}},
+        "synthesis": {"type": "STRING"},
+        "answer": {"type": "STRING"},
+        "advice": {"type": "ARRAY", "items": {"type": "STRING"}},
+    },
+    "required": ["intro", "cards", "synthesis", "answer", "advice"],
+}
+
+STRUCTURED_FORMAT = (
+    "ФОРМАТ ОТВЕТА — строго JSON (без markdown-блоков):\n"
+    "{\n"
+    '  "intro": "2-3 тёплых предложения — почувствуй суть вопроса",\n'
+    '  "cards": [{"index": <номер карты из списка>, "position": "<название позиции>", "meaning": "<толкование>"}, ...],\n'
+    '  "synthesis": "как карты говорят ВМЕСТЕ: общая картина, связи между картами, главный сквозной мотив",\n'
+    '  "answer": "ПРЯМОЙ ответ на вопрос человека простыми словами: да / скорее да / пока нет / зависит от… — и почему",\n'
+    '  "advice": ["конкретный шаг 1", "конкретный шаг 2", "конкретный шаг 3"]\n'
+    "}\n\n"
+    "ПРАВИЛА:\n"
+    "• Опиши КАЖДУЮ выбранную карту — массив cards содержит все выбранные карты, ни одну не пропускай.\n"
+    "• answer — главное: человек пришёл за ответом. Не уходи в общие слова, ответь именно на его вопрос.\n"
+    "• advice — 3-4 практичных действия (что сделать, что сказать, чего избегать, на что обратить внимание), не абстракции.\n"
+    "• Используй только **жирный** Markdown, никаких HTML-тегов и заголовков #.\n"
+    "• Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм', 'в заключение'.\n"
+    "• Пиши живым тёплым языком, обращайся на «ты»."
+)
+
+
+def _make_validator(pre_selected_cards: list, min_cards: int, max_cards: int):
+    def validate(parsed: dict) -> Optional[dict]:
+        raw_cards = parsed.get("cards")
+        if not isinstance(raw_cards, list):
+            return None
+        seen, cards = set(), []
+        for c in raw_cards:
+            if not isinstance(c, dict):
+                continue
+            try:
+                idx = int(c.get("index"))
+            except (TypeError, ValueError):
+                continue
+            meaning = clean_ai_text(str(c.get("meaning") or "")).strip()
+            if not (0 <= idx < len(pre_selected_cards)) or idx in seen or len(meaning) < 40:
+                continue
+            seen.add(idx)
+            cards.append((idx, clean_ai_text(str(c.get("position") or "")).strip(" —-:*"), meaning))
+        answer = clean_ai_text(str(parsed.get("answer") or "")).strip()
+        advice = [clean_ai_text(str(a)).strip() for a in (parsed.get("advice") or []) if str(a).strip()]
+        synthesis = clean_ai_text(str(parsed.get("synthesis") or "")).strip()
+        if len(cards) < min_cards or len(answer) < 30 or not advice or len(synthesis) < 40:
+            return None
+        cards = cards[:max_cards]
+
+        parts = []
+        intro = clean_ai_text(str(parsed.get("intro") or "")).strip()
+        if intro:
+            parts.append(intro)
+        for idx, position, meaning in cards:
+            name = pre_selected_cards[idx]["name"].replace("Старший Аркан: ", "")
+            title = f"**{position} — {name}**" if position else f"**{name}**"
+            parts.append(f"{title}\n{meaning}")
+        parts.append(f"**🔮 Общая картина**\n{synthesis}")
+        parts.append(f"**✨ Ответ на твой вопрос**\n{answer}")
+        parts.append("**🧭 Что делать**\n" + "\n".join(f"• {a}" for a in advice[:5]))
+        return {"cards_used_indices": [i for i, _, _ in cards], "reading": "\n\n".join(parts)}
+    return validate
 
 
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
-    """Индивидуальный разбор — 6 до 12 карт, глубокий анализ на основе классических традиций таро."""
-    cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
-
+    """Индивидуальный разбор — 6-12 карт + общая картина, прямой ответ и шаги."""
+    cards_str = ", ".join([f"[{i}] {c['name']}" for i, c in enumerate(pre_selected_cards)])
     system_prompt = (
-        "Ты — мастер таро с 30-летним опытом, практикующий в традициях Артура Эдварда Уэйта (Таро Уэйта-Смит), "
-        "Хайо Банцхафа и Карла Юнга. Ты глубоко знаешь архетипическую психологию и применяешь её к толкованию карт.\n\n"
-        "ЗАДАЧА: Провести глубокий индивидуальный расклад по вопросу человека.\n\n"
-        "КОЛИЧЕСТВО КАРТ — выбери сам от 6 до 12 в зависимости от сложности вопроса:\n"
-        "• 6 карт — вопрос конкретный и краткосрочный\n"
-        "• 8-9 карт — вопрос о ситуации, отношениях или решении\n"
-        "• 10-12 карт — глубокий экзистенциальный вопрос о жизненном пути, предназначении, трансформации\n\n"
-        "СТРУКТУРА РАСКЛАДА (пиши именно так, используй только **жирный** Markdown, никаких HTML-тегов):\n\n"
-        "Вступление — 2-3 предложения: почувствуй суть вопроса, обратись к человеку тепло и лично.\n\n"
-        "Для каждой карты — отдельный блок:\n"
-        "**[Название позиции] — [Имя карты]**\n"
-        "Толкование на 60-90 слов: классическое значение карты по Уэйту + применение к конкретному вопросу + "
-        "что это говорит о состоянии человека прямо сейчас. Используй образные метафоры.\n\n"
-        "ПОЗИЦИИ для 6 карт: Корни ситуации, Текущая энергия, Скрытое влияние, Совет карт, Ближайшее будущее, Итог\n"
-        "ПОЗИЦИИ для 8-9 карт: добавь Внутреннее состояние, Окружение, Чего бояться\n"
-        "ПОЗИЦИИ для 10-12 карт: используй Кельтский крест или собственную систему позиций\n\n"
-        "Интеграция (100-150 слов) — как карты говорят вместе: какой сквозной архетип прослеживается, "
-        "что хочет сказать коллективное бессознательное через этот расклад.\n\n"
-        "Напутствие (50-70 слов) — конкретное, вдохновляющее, честное. Человек должен уйти наполненным.\n\n"
-        "ВАЖНО: Пиши живым тёплым языком. Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм', 'в заключение'. "
-        "Каждый расклад уникален. Общий объём — 800-1200 слов.\n\n"
-        "Формат ответа — строго JSON (без markdown-блоков):\n"
-        "{\"cards_used_indices\": [список индексов выбранных карт], \"reading\": \"текст расклада\"}"
+        "Ты — мастер таро с 30-летним опытом, практикующий в традициях Уэйта-Смит, Хайо Банцхафа и Карла Юнга.\n\n"
+        "ЗАДАЧА: глубокий индивидуальный расклад по вопросу человека.\n\n"
+        "КОЛИЧЕСТВО КАРТ — выбери сам из списка от 6 до 10 в зависимости от сложности вопроса:\n"
+        "• 6 карт — конкретный краткосрочный вопрос\n"
+        "• 7-8 карт — ситуация, отношения, решение\n"
+        "• 9-10 карт — глубокий вопрос о жизненном пути, предназначении, переменах\n\n"
+        "ПОЗИЦИИ: Корни ситуации, Текущая энергия, Скрытое влияние, Внутреннее состояние, Окружение, "
+        "Чего опасаться, Совет карт, Ближайшее будущее, Итог (бери нужные под количество карт).\n\n"
+        "Толкование каждой карты — 45-70 слов: значение карты по Уэйту, применённое к вопросу.\n"
+        "synthesis — 80-120 слов. answer — 50-90 слов. advice — 3-4 пункта по 10-25 слов.\n\n"
+        + STRUCTURED_FORMAT
     )
-
-    user_prompt = f"Вопрос человека: «{question}».\nДоступные карты для выбора: {cards_str}."
-
-    result = await call_ai(system_prompt, user_prompt, max_tokens=4000)
+    user_prompt = f"Вопрос человека: «{question}».\nДоступные карты (выбирай по номеру в квадратных скобках): {cards_str}."
+    result = await call_ai(system_prompt, user_prompt, max_tokens=6000, schema=STRUCTURED_SCHEMA,
+                           validate=_make_validator(pre_selected_cards, 6, 10))
     if result:
         return result
-
-    print("⚠️ Все AI недоступны. Переход на локальный оракул.", flush=True)
-    return generate_local_tarot_reading(question, pre_selected_cards)
+    log("⚠️ Все AI недоступны. Переход на локальный оракул.")
+    return generate_local_tarot_reading(question, pre_selected_cards, reading_type="dynamic")
 
 
 async def generate_preset_reading(question: str, pre_selected_cards: list) -> dict:
-    """Стандартный разбор — 3 карты, подробный и детальный (500-600 слов)."""
-    cards_str = ", ".join([f"[{i}] {c['name']} ({c['type']})" for i, c in enumerate(pre_selected_cards)])
-
+    """Стандартный разбор — 3 карты (Прошлое/Настоящее/Будущее) + общая картина, ответ и шаги."""
+    cards_str = ", ".join([f"[{i}] {c['name']}" for i, c in enumerate(pre_selected_cards)])
     system_prompt = (
-        "Ты — опытный таролог, практикующий по системе Артура Уэйта. "
-        "Ты умеешь давать точные, живые, детальные ответы на классические жизненные вопросы.\n\n"
-        "ЗАДАЧА: выбери ровно 3 карты и проведи подробный расклад «Прошлое — Настоящее — Будущее».\n\n"
-        "СТРУКТУРА (пиши только Markdown **жирный**, никаких HTML-тегов):\n\n"
-        "Вступление (2-3 предложения) — почувствуй вопрос, обратись к человеку лично и тепло.\n\n"
-        "**Прошлое — [Имя карты]**\n"
-        "80-100 слов: как прошлый опыт, прошлые решения или давние события сформировали текущую ситуацию. "
-        "Раскрой классическое значение карты и покажи, как оно отражается в истории человека.\n\n"
-        "**Настоящее — [Имя карты]**\n"
-        "80-100 слов: что происходит в жизни человека прямо сейчас — какие силы действуют, "
-        "какие внутренние или внешние конфликты определяют момент. Будь конкретен и точен.\n\n"
-        "**Будущее — [Имя карты]**\n"
-        "80-100 слов: куда ведёт ситуация при текущем развитии событий, какой совет дают карты, "
-        "что нужно принять или изменить. Дай ясное и вдохновляющее направление.\n\n"
-        "**Совет Оракула** (70-90 слов) — итоговое напутствие: как три карты говорят вместе, "
-        "что сквозной смысл расклада говорит о пути человека. Заканчивай на тёплой, утвердительной ноте.\n\n"
-        "ВАЖНО: Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм'. "
-        "Пиши живо, поэтично, с метафорами. Каждый расклад уникален — не повторяй шаблоны. "
-        "Общий объём — 500-600 слов.\n\n"
-        "Формат ответа — строго JSON (без markdown-блоков):\n"
-        "{\"cards_used_indices\": [индекс1, индекс2, индекс3], \"reading\": \"текст расклада\"}"
+        "Ты — опытный таролог, практикующий по системе Уэйта. Даёшь точные, живые ответы на жизненные вопросы.\n\n"
+        "ЗАДАЧА: выбери из списка ровно 3 карты и сделай расклад с позициями «Прошлое», «Настоящее», «Будущее».\n"
+        "Толкование каждой карты — 60-90 слов: классическое значение + как оно проявляется в ситуации человека.\n"
+        "synthesis — 60-90 слов. answer — 40-80 слов. advice — 3 пункта по 10-25 слов.\n\n"
+        + STRUCTURED_FORMAT
     )
-
-    user_prompt = f"Вопрос: «{question}».\nДоступные карты: {cards_str}."
-
-    result = await call_ai(system_prompt, user_prompt, max_tokens=1800)
+    user_prompt = f"Вопрос: «{question}».\nДоступные карты (выбирай по номеру в квадратных скобках): {cards_str}."
+    result = await call_ai(system_prompt, user_prompt, max_tokens=3500, schema=STRUCTURED_SCHEMA,
+                           validate=_make_validator(pre_selected_cards, 3, 3))
     if result:
         return result
-
-    print("⚠️ Все AI недоступны для стандартного разбора. Локальный оракул.", flush=True)
+    log("⚠️ Все AI недоступны для стандартного разбора. Локальный оракул.")
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 
@@ -735,7 +784,7 @@ async def generate_daily_reading(pre_selected_cards: list) -> dict:
 
     user_prompt = f"Карта дня: {card_str}."
 
-    result = await call_ai(system_prompt, user_prompt, max_tokens=900)
+    result = await call_ai(system_prompt, user_prompt, max_tokens=1800)
     if result:
         return result
 
@@ -896,7 +945,7 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "user_id": user["telegram_id"],
         "name": user.get("first_name") or "Искатель",
         "balance": 99999 if admin else user.get("balance", 0),
-        "free_readings": user.get("free_readings") or 0,
+        "free_readings": 0 if admin else (user.get("free_readings") or 0),
         "daily_available": admin or user.get("last_daily_date") != get_today_str(),
         "ref_link": ref_link(user["telegram_id"]),
         "ref_count": user.get("ref_count") or 0,
