@@ -164,8 +164,30 @@ async def init_pool():
     if pool is None:
         log("❌ Не удалось подключиться к БД ни одним способом. Проверьте DATABASE_URL.")
         return
-    await init_schema()
+    try:
+        await init_schema()
+    except Exception as e:
+        log(f"❌ Ошибка создания таблиц: {e}")
+        await pool.close()
+        pool = None
+        return
     pool_ready.set()
+
+
+async def init_pool_forever():
+    """Если база недоступна (например, Supabase на паузе) — пробуем снова каждые 30 сек,
+    чтобы бот сам подключился, когда база проснётся, без ручного перезапуска."""
+    attempt = 0
+    while not pool_ready.is_set():
+        attempt += 1
+        try:
+            await init_pool()
+        except Exception as e:
+            log(f"init_pool: {type(e).__name__}: {e}")
+        if pool_ready.is_set():
+            return
+        log(f"⏳ БД недоступна (попытка {attempt}), повтор через 30 сек")
+        await asyncio.sleep(30)
 
 
 async def init_schema():
@@ -830,7 +852,7 @@ async def lifespan(_app: FastAPI):
     http = httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
     # Всё тяжёлое — в фоне: сервер начинает принимать запросы сразу
     tasks = [
-        asyncio.create_task(init_pool()),
+        asyncio.create_task(init_pool_forever()),
         asyncio.create_task(setup_bot()),
         asyncio.create_task(keepalive_loop()),
         asyncio.create_task(push_loop()),
