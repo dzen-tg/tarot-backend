@@ -51,7 +51,7 @@ GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tarot-frontend-wine.vercel.app")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Tarot_answer_question_bot")
 PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL") or "https://tarot-backend-136l.onrender.com").strip().rstrip("/")
-ADMIN_USERNAMES = {u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "dzenra_prod").split(",") if u.strip()}
+ADMIN_USERNAMES = {u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "").split(",") if u.strip()}
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DEV_MODE = os.getenv("DEV_MODE", "0") == "1"          # только для локальной отладки без Telegram
 KEEPALIVE = os.getenv("KEEPALIVE", "1") == "1"         # пинговать себя, чтобы Render не засыпал
