@@ -59,6 +59,7 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))  # Алматы UTC+5; 
 PUSH_HOUR = int(os.getenv("PUSH_HOUR", "11"))          # 11:00 Алматы = 09:00 МСК
 PUSH_WEEKDAY = int(os.getenv("PUSH_WEEKDAY", "0"))     # день недели рассылки: 0=Пн ... 6=Вс (раз в неделю)
 PUSH_ENABLED = os.getenv("PUSH_ENABLED", "1") == "1"
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/taro_rasklad_tg").strip()  # пусто — кнопка канала скрыта
 
 # Экономика
 COST_PRESET = 150
@@ -841,8 +842,11 @@ PUSH_TEXTS = [
 ]
 
 
-def webapp_kb(text: str = "🔮 Открыть Оракул") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=FRONTEND_URL))]])
+def webapp_kb(text: str = "🔮 Открыть Оракул", channel: bool = False) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=FRONTEND_URL))]]
+    if channel and CHANNEL_URL:
+        rows.append([InlineKeyboardButton(text="📢 Наш канал", url=CHANNEL_URL)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def send_daily_push() -> int:
@@ -869,7 +873,7 @@ async def send_daily_push() -> int:
                 text += "\n\n🎁 А ещё у тебя есть бесплатный расклад на 3 карты."
             await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, today)
             try:
-                await bot.send_message(uid, text, reply_markup=webapp_kb("🃏 Открыть Карту Дня"))
+                await bot.send_message(uid, text, reply_markup=webapp_kb("🃏 Открыть Карту Дня", channel=True))
                 sent += 1
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
@@ -1138,7 +1142,7 @@ async def cmd_start(message: Message, command: CommandObject):
     lines += ["🃏 Карта Дня — бесплатно каждый день.",
               "🎴 Стандартный и 🔮 Индивидуальный разборы — за Энергию.", "",
               "Жми кнопку ниже 👇"]
-    await message.answer("\n".join(lines), reply_markup=webapp_kb())
+    await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
     if referrer:
         asyncio.create_task(notify_referrer(referrer, u.first_name))
 
