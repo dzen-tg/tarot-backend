@@ -56,7 +56,8 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().
 DEV_MODE = os.getenv("DEV_MODE", "0") == "1"          # только для локальной отладки без Telegram
 KEEPALIVE = os.getenv("KEEPALIVE", "1") == "1"         # пинговать себя, чтобы Render не засыпал
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))  # Алматы UTC+5; граница «дня» для карты дня
-PUSH_HOUR = int(os.getenv("PUSH_HOUR", "10"))          # 10:00 Алматы = 08:00 МСК
+PUSH_HOUR = int(os.getenv("PUSH_HOUR", "11"))          # 11:00 Алматы = 09:00 МСК
+PUSH_WEEKDAY = int(os.getenv("PUSH_WEEKDAY", "0"))     # день недели рассылки: 0=Пн ... 6=Вс (раз в неделю)
 PUSH_ENABLED = os.getenv("PUSH_ENABLED", "1") == "1"
 
 # Экономика
@@ -812,7 +813,7 @@ async def setup_bot():
         await bot.set_my_commands([
             BotCommand(command="start", description="🔮 Открыть Оракула"),
             BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
-            BotCommand(command="stop", description="🔕 Отключить утреннюю карту дня"),
+            BotCommand(command="stop", description="🔕 Отключить напоминания"),
         ])
         await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🔮 Оракул", web_app=WebAppInfo(url=FRONTEND_URL)))
     except Exception as e:
@@ -886,10 +887,13 @@ async def push_loop():
     await pool_ready.wait()
     while True:
         try:
-            if local_now().hour >= PUSH_HOUR:
+            now = local_now()
+            # Рассылка раз в неделю: только в PUSH_WEEKDAY (по умолчанию понедельник) с PUSH_HOUR.
+            # last_push_date не даёт отправить повторно в тот же день.
+            if now.weekday() == PUSH_WEEKDAY and now.hour >= PUSH_HOUR:
                 n = await send_daily_push()
                 if n:
-                    log(f"📬 Утренний пуш отправлен: {n}")
+                    log(f"📬 Еженедельный пуш отправлен: {n}")
         except Exception as e:
             log(f"push_loop: {e}")
         await asyncio.sleep(120)
@@ -1158,14 +1162,14 @@ async def cmd_ref(message: Message):
 async def cmd_stop(message: Message):
     p = await db()
     await p.execute("UPDATE users SET notify = FALSE WHERE telegram_id = $1", message.from_user.id)
-    await message.answer("🔕 Утренние напоминания отключены. Включить снова: /notify")
+    await message.answer("🔕 Напоминания отключены. Включить снова: /notify")
 
 
 @dp.message(Command("notify"))
 async def cmd_notify(message: Message):
     p = await db()
     await p.execute("UPDATE users SET notify = TRUE WHERE telegram_id = $1", message.from_user.id)
-    await message.answer("🔔 Утренняя Карта Дня снова включена.")
+    await message.answer("🔔 Напоминания снова включены — пришлю Карту Дня в понедельник утром.")
 
 
 @dp.pre_checkout_query()
