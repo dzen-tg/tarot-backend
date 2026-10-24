@@ -14,6 +14,7 @@
 """
 import os
 import json
+import base64
 import hmac
 import hashlib
 import random
@@ -72,6 +73,44 @@ PACKS = {
     "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", "3 Стандартных разбора по выгодной цене."),
     "pack_750": (750, 750, 750, "+750 Энергии", "1 Индивидуальный разбор — глубокий анализ от 6 до 10 карт."),
 }
+
+# Оплата картой через Tribute (Shop API). Без TRIBUTE_API_KEY кнопка «Картой» скрыта.
+TRIBUTE_API_KEY = os.getenv("TRIBUTE_API_KEY", "").strip()
+TRIBUTE_SHOP_ID = os.getenv("TRIBUTE_SHOP_ID", "").strip()
+TRIBUTE_API = "https://tribute.tg/api/v1"
+TRIBUTE_CURRENCY = os.getenv("TRIBUTE_CURRENCY", "rub").lower()   # rub / usd / eur
+TRIBUTE_CURRENCY_SIGN = {"rub": "₽", "usd": "$", "eur": "€"}.get(TRIBUTE_CURRENCY, "")
+
+
+def _parse_prices(raw: str) -> dict:
+    out = {}
+    for part in raw.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            try:
+                out[k.strip()] = int(v.strip())
+            except ValueError:
+                pass
+    return out
+
+
+# Цены в целых рублях (или долларах/евро). Меняются переменными окружения без правки кода.
+CARD_PRICES = _parse_prices(os.getenv("TRIBUTE_PRICES", "pack_150:199,pack_450:499,pack_750:899"))
+CARD_FIRST_PRICE = int(os.getenv("TRIBUTE_FIRST_PRICE", "149"))  # первая покупка pack_150 картой
+# Курс рубля к доллару для подсказки «≈ в другой валюте»: сколько долларов стоит 1 рубль (например 0.0125).
+# Списание всё равно идёт в TRIBUTE_CURRENCY.
+RUB_USD_RATE = float(os.getenv("RUB_USD_RATE", "0.0125"))
+
+
+def alt_price(price: int) -> str:
+    """Примерная цена во второй валюте: рубли → «≈ $1.86», доллары → «≈ 149 ₽»."""
+    if RUB_USD_RATE <= 0:
+        return ""
+    if TRIBUTE_CURRENCY == "rub":
+        return f"≈ ${price * RUB_USD_RATE:.2f}"
+    if TRIBUTE_CURRENCY == "usd":
+        return f"≈ {round(price / RUB_USD_RATE)} ₽"
+    return ""
 
 if not BOT_TOKEN:
     raise RuntimeError("Переменная TELEGRAM_BOT_TOKEN не задана!")
@@ -228,6 +267,19 @@ async def init_schema():
                 stars INTEGER,
                 energy INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS tribute_orders (
+                uuid TEXT PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                pack VARCHAR(32) NOT NULL,
+                energy INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                currency VARCHAR(8) NOT NULL,
+                status VARCHAR(16) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP DEFAULT NULL
             );
         """)
 
@@ -982,7 +1034,18 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "ref_bonus": REF_BONUS,
         "first_purchase": (user.get("purchases") or 0) == 0,
         "prices": {k: (v[2] if (user.get("purchases") or 0) == 0 else v[1]) for k, v in PACKS.items()},
+        "card_enabled": bool(TRIBUTE_API_KEY),
+        "card_currency": TRIBUTE_CURRENCY_SIGN,
+        "card_prices": {k: card_price(k, user) for k in PACKS if k in CARD_PRICES},
+        "card_prices_alt": {k: alt_price(card_price(k, user)) for k in PACKS if k in CARD_PRICES},
     }
+
+
+def card_price(pack: str, user: dict) -> int:
+    price = CARD_PRICES[pack]
+    if pack == "pack_150" and (user.get("purchases") or 0) == 0 and 0 < CARD_FIRST_PRICE < price:
+        price = CARD_FIRST_PRICE
+    return price
 
 
 @app.get("/api/user/profile")
@@ -1107,6 +1170,129 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
     except Exception as e:
         log(f"Ошибка создания инвойса: {e}")
         raise HTTPException(status_code=500, detail="Не удалось создать счёт, попробуйте ещё раз.")
+
+
+@app.post("/api/payment/tribute-order")
+async def create_tribute_order(payload: dict, authorization: str = Header(None)):
+    """Создаёт заказ в Tribute и отдаёт ссылку на оплату картой."""
+    if not TRIBUTE_API_KEY:
+        raise HTTPException(status_code=400, detail="Оплата картой пока недоступна.")
+    user, _ = await auth_user(authorization)
+    pack = payload.get("pack")
+    if pack not in PACKS or pack not in CARD_PRICES:
+        raise HTTPException(status_code=400, detail="Неверный тип пакета")
+    uid = user["telegram_id"]
+    energy, _, _, title, description = PACKS[pack]
+    price = card_price(pack, user)
+    body = {
+        "amount": price * 100,  # в копейках / центах
+        "currency": TRIBUTE_CURRENCY,
+        "title": title[:100],
+        "description": description[:300],
+        "customerId": str(uid),
+        "comment": f"{pack}:{uid}",
+        "successUrl": f"https://t.me/{BOT_USERNAME}",
+        "failUrl": f"https://t.me/{BOT_USERNAME}",
+    }
+    if TRIBUTE_SHOP_ID.isdigit():
+        body["shopId"] = int(TRIBUTE_SHOP_ID)
+    try:
+        r = await http.post(f"{TRIBUTE_API}/shop/orders", json=body,
+                            headers={"Api-Key": TRIBUTE_API_KEY}, timeout=20)
+        data = r.json()
+    except Exception as e:
+        log(f"Tribute: ошибка запроса: {e}")
+        raise HTTPException(status_code=502, detail="Платёжный сервис не отвечает, попробуйте ещё раз.")
+    order = data.get("order") if isinstance(data.get("order"), dict) else data
+    order_uuid = order.get("uuid")
+    if r.status_code >= 300 or not order_uuid:
+        log(f"Tribute: не создан заказ {r.status_code}: {str(data)[:300]}")
+        raise HTTPException(status_code=502, detail="Не удалось создать счёт, попробуйте ещё раз.")
+    p = await db()
+    await p.execute("""
+        INSERT INTO tribute_orders (uuid, telegram_id, pack, energy, amount, currency)
+        VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (uuid) DO NOTHING
+    """, order_uuid, uid, pack, energy, body["amount"], TRIBUTE_CURRENCY)
+    return {
+        "order_id": order_uuid,
+        "webapp_url": order.get("webappPaymentUrl") or "",
+        "payment_url": order.get("paymentUrl") or "",
+    }
+
+
+def _tribute_signature_ok(raw: bytes, signature: str) -> bool:
+    if not (TRIBUTE_API_KEY and signature):
+        return False
+    digest = hmac.new(TRIBUTE_API_KEY.encode(), raw, hashlib.sha256).digest()
+    candidates = (digest.hex(), base64.b64encode(digest).decode())
+    sig = signature.strip()
+    if sig.lower().startswith("sha256="):
+        sig = sig[7:]
+    return hmac.compare_digest(sig.lower(), candidates[0]) or hmac.compare_digest(sig, candidates[1])
+
+
+def _event_key(name: str) -> str:
+    # shopOrderRefunded / shop_order_refunded → shoporderrefunded
+    return (name or "").replace("_", "").lower()
+
+
+@app.post("/tribute-webhook")
+async def tribute_webhook(request: Request):
+    raw = await request.body()
+    if not _tribute_signature_ok(raw, request.headers.get("trbt-signature", "")):
+        log("Tribute: неверная подпись вебхука")
+        raise HTTPException(status_code=401, detail="bad signature")
+    try:
+        data = json.loads(raw or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad json")
+    event = _event_key(data.get("name") or data.get("event") or "")
+    order = data.get("payload") if isinstance(data.get("payload"), dict) else data
+    order_uuid = order.get("uuid") or order.get("orderUuid") or order.get("order_uuid")
+    status = (order.get("status") or "").lower()
+    log(f"Tribute вебхук: {event} {order_uuid} {status}")
+    if not order_uuid:
+        return {"ok": True}
+
+    p = await db()
+    if event in ("shoporder", "shoporderpaymentreceived", "shoporderchargesuccess") and status in ("", "paid"):
+        async with p.acquire() as c:
+            async with c.transaction():
+                row = await c.fetchrow("""
+                    UPDATE tribute_orders SET status = 'paid', paid_at = NOW()
+                    WHERE uuid = $1 AND status <> 'paid' RETURNING telegram_id, pack, energy, amount
+                """, order_uuid)
+                if not row:
+                    return {"ok": True}  # неизвестный заказ или уже зачислен (повторная доставка)
+                await c.execute("""
+                    INSERT INTO payments (charge_id, telegram_id, pack, stars, energy)
+                    VALUES ($1, $2, $3, 0, $4) ON CONFLICT (charge_id) DO NOTHING
+                """, f"tribute:{order_uuid}", row["telegram_id"], row["pack"], row["energy"])
+                await c.execute("UPDATE users SET balance = balance + $2, purchases = purchases + 1 WHERE telegram_id = $1",
+                                row["telegram_id"], row["energy"])
+        try:
+            await bot.send_message(row["telegram_id"], f"💳 Оплата картой прошла! Зачислено +{row['energy']} Энергии ✨",
+                                   reply_markup=webapp_kb())
+        except Exception:
+            pass
+    elif event == "shoporderrefunded":
+        row = await p.fetchrow("""
+            UPDATE tribute_orders SET status = 'refunded' WHERE uuid = $1 AND status = 'paid'
+            RETURNING telegram_id, energy
+        """, order_uuid)
+        if row:
+            await add_balance(row["telegram_id"], -row["energy"])
+    return {"ok": True}
+
+
+@app.get("/api/user/payment-status")
+async def payment_status(order_id: str, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    p = await db()
+    status = await p.fetchval("SELECT status FROM tribute_orders WHERE uuid = $1 AND telegram_id = $2",
+                              order_id, user["telegram_id"])
+    fresh = await p.fetchrow("SELECT balance FROM users WHERE telegram_id = $1", user["telegram_id"])
+    return {"status": status or "unknown", "balance": fresh["balance"] if fresh else 0}
 
 
 @app.get("/api/system/setup-webhook")
