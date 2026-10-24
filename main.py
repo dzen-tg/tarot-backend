@@ -47,7 +47,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# llama-3.3-70b-versatile отключён Groq 16.08.2026 (404 model_not_found) — замена gpt-oss-120b
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tarot-frontend-wine.vercel.app")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Tarot_answer_question_bot")
@@ -618,6 +619,10 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int) -> O
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
+    if GROQ_MODEL.startswith("openai/gpt-oss"):
+        # gpt-oss «думает» перед ответом; low — быстрее и не съедает лимит токенов на рассуждения
+        payload["reasoning_effort"] = "low"
+        payload["include_reasoning"] = False
     t0 = time.monotonic()
     try:
         r = await http.post(
