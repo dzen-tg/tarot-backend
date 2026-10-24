@@ -849,6 +849,27 @@ def webapp_kb(text: str = "🔮 Открыть Оракул", channel: bool = Fa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def energy_reminder(balance: int) -> str:
+    """Строка о балансе для еженедельной рассылки — только если энергии хватает хотя бы на один разбор."""
+    if balance < COST_PRESET:
+        return ""
+    n = balance // COST_PRESET
+    std = f"{n} {_plural(n, 'Стандартный разбор', 'Стандартных разбора', 'Стандартных разборов')}"
+    if balance >= COST_AI:
+        what = f"на 🔮 Индивидуальный разбор или {std}"
+    else:
+        what = f"на {std}"
+    return f"\n\n✨ У тебя осталось {balance} Энергии — хватит {what}. Заходи, задай вопрос картам!"
+
+
 async def send_daily_push() -> int:
     """Отправляет утреннее напоминание всем, кто ещё не получил его сегодня. Возвращает число отправленных."""
     p = await db()
@@ -856,7 +877,7 @@ async def send_daily_push() -> int:
     sent = 0
     while True:
         rows = await p.fetch("""
-            SELECT telegram_id, first_name, free_readings FROM users
+            SELECT telegram_id, first_name, free_readings, balance FROM users
             WHERE notify AND NOT blocked
               AND (last_push_date IS DISTINCT FROM $1)
               AND (last_daily_date IS DISTINCT FROM $1)
@@ -871,6 +892,7 @@ async def send_daily_push() -> int:
             text = random.choice(PUSH_TEXTS).format(name=r["first_name"] or "Искатель")
             if (r["free_readings"] or 0) > 0:
                 text += "\n\n🎁 А ещё у тебя есть бесплатный расклад на 3 карты."
+            text += energy_reminder(r["balance"] or 0)
             await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, today)
             try:
                 await bot.send_message(uid, text, reply_markup=webapp_kb("🃏 Открыть Карту Дня", channel=True))
