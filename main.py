@@ -61,7 +61,7 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))  # Алматы UTC+5; 
 PUSH_HOUR = int(os.getenv("PUSH_HOUR", "11"))          # 11:00 Алматы = 09:00 МСК
 PUSH_WEEKDAY = int(os.getenv("PUSH_WEEKDAY", "0"))     # день недели рассылки: 0=Пн ... 6=Вс (раз в неделю)
 PUSH_ENABLED = os.getenv("PUSH_ENABLED", "1") == "1"
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/taro_rasklad_tg").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/poslanie_taro_tg").strip()
 # Контакт поддержки для /support и /paysupport (обязательные команды для ботов с оплатой Stars)
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@backoffice_media").strip()  # пусто — кнопка канала скрыта
 
@@ -282,6 +282,7 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_push_date VARCHAR(10) DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_notified BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS source VARCHAR(32) DEFAULT NULL",
         ]:
             await c.execute(ddl)
         await c.execute("""
@@ -326,6 +327,10 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
     first_name = (tg_user.get("first_name") or "Искатель")[:255]
     username = (tg_user.get("username") or None)
     referrer = None
+    # Метка источника из ссылки вида t.me/<бот>?start=src_youtube — сохраняется только для новых пользователей
+    source = None
+    if ref_param and ref_param.startswith("src_"):
+        source = re.sub(r"[^a-z0-9_]", "", ref_param[4:].lower())[:32] or None
     if ref_param and ref_param.startswith("ref_") and ref_param[4:].isdigit():
         referrer = int(ref_param[4:])
         if referrer == uid:
@@ -341,6 +346,9 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
             """, uid, username, first_name, FREE_READINGS_ON_START)
             created = row is not None
             credited_ref = None
+            if created and (source or referrer):
+                row = await c.fetchrow("UPDATE users SET source = $2 WHERE telegram_id = $1 RETURNING *",
+                                       uid, source or "ref")
             if created and referrer:
                 ok = await c.fetchval("""
                     UPDATE users SET balance = balance + $2, ref_count = ref_count + 1
@@ -1558,6 +1566,24 @@ async def cmd_moved_broadcast(message: Message):
         f"✅ Готово. Подарок +{MOVE_GIFT} начислен: {gifted}.\n"
         f"Сообщение доставлено: {sent}, не доставлено (заблокировали старого бота): {failed}."
     )
+
+
+@dp.message(Command("sources"))
+async def cmd_sources(message: Message):
+    """Только для админов: сколько пользователей пришло из каждого источника и сколько из них купили."""
+    user = await get_user(message.from_user.id) or {"telegram_id": message.from_user.id, "username": message.from_user.username}
+    if not is_admin(user):
+        return
+    p = await db()
+    rows = await p.fetch("""
+        SELECT COALESCE(source, 'без метки') AS src, COUNT(*) AS users,
+               COUNT(*) FILTER (WHERE purchases > 0) AS buyers
+        FROM users GROUP BY 1 ORDER BY 2 DESC
+    """)
+    lines = ["📊 Откуда пришли пользователи:", ""]
+    for r in rows:
+        lines.append(f"{r['src']}: {r['users']} (купили: {r['buyers']})")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("support"))
