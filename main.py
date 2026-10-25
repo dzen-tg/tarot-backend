@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Таро Оракул — backend v2 (@Tarot_answer_question_bot)
+Послание Таро — backend v2 (@Poslanie_tarobot, ранее @Tarot_answer_question_bot)
 
 Что изменилось по сравнению с v1:
 - Пул соединений asyncpg вместо нового подключения на каждый запрос (было до 15 сек на запрос).
@@ -37,7 +37,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, Teleg
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Update, LabeledPrice, PreCheckoutQuery, Message, BotCommand,
-    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, MenuButtonWebApp, LinkPreviewOptions,
+    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, MenuButtonWebApp, MenuButtonDefault, LinkPreviewOptions,
 )
 
 # =====================================================================
@@ -61,7 +61,9 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))  # Алматы UTC+5; 
 PUSH_HOUR = int(os.getenv("PUSH_HOUR", "11"))          # 11:00 Алматы = 09:00 МСК
 PUSH_WEEKDAY = int(os.getenv("PUSH_WEEKDAY", "0"))     # день недели рассылки: 0=Пн ... 6=Вс (раз в неделю)
 PUSH_ENABLED = os.getenv("PUSH_ENABLED", "1") == "1"
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/taro_rasklad_tg").strip()  # пусто — кнопка канала скрыта
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/taro_rasklad_tg").strip()
+# Контакт поддержки для /support и /paysupport (обязательные команды для ботов с оплатой Stars)
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@backoffice_media").strip()  # пусто — кнопка канала скрыта
 
 # Экономика
 COST_PRESET = 150
@@ -124,6 +126,27 @@ WEBHOOK_PATH = "/telegram-webhook"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Старый бот после переезда: отвечает «мы переехали» и делает рассылку о переезде.
+# Задайте OLD_BOT_TOKEN в Render — без него этот режим выключен.
+OLD_BOT_TOKEN = os.getenv("OLD_BOT_TOKEN", "").strip()
+old_bot: Optional[Bot] = Bot(token=OLD_BOT_TOKEN) if OLD_BOT_TOKEN else None
+OLD_WEBHOOK_PATH = "/old-bot-webhook"
+OLD_WEBHOOK_SECRET = hashlib.sha256(("wh-old:" + OLD_BOT_TOKEN).encode()).hexdigest()[:48] if OLD_BOT_TOKEN else ""
+MOVED_TEXT = (
+    "🔮 Послание Таро переехало в нового бота: @{u}\n\n"
+    "Ваш баланс Энергии и бесплатные расклады перенесены — откройте нового бота и нажмите «Запустить»."
+)
+
+
+def moved_kb(start_param: Optional[str] = None) -> InlineKeyboardMarkup:
+    """Кнопка на нового бота. start_param (например ref_123) пробрасывается, чтобы старые реферальные ссылки работали."""
+    url = f"https://t.me/{BOT_USERNAME}"
+    if start_param and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", start_param):
+        url += f"?start={start_param}"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔮 Перейти в новый бот", url=url)
+    ]])
 http: Optional[httpx.AsyncClient] = None
 
 
@@ -258,6 +281,7 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_push_date VARCHAR(10) DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_notified BOOLEAN DEFAULT FALSE",
         ]:
             await c.execute(ddl)
         await c.execute("""
@@ -290,7 +314,7 @@ async def db() -> asyncpg.Pool:
         try:
             await asyncio.wait_for(pool_ready.wait(), timeout=25)
         except asyncio.TimeoutError:
-            raise HTTPException(status_code=503, detail="Оракул просыпается, попробуйте через минуту.")
+            raise HTTPException(status_code=503, detail="Сервис просыпается, попробуйте через минуту.")
     return pool
 
 
@@ -381,7 +405,7 @@ def verify_telegram_init_data(init_data: Optional[str]) -> dict:
     if not init_data:
         if DEV_MODE:
             return {"user": {"id": 123456789, "first_name": "Искатель", "username": "test_user"}, "start_param": None}
-        raise HTTPException(status_code=401, detail="Откройте Оракула через Telegram.")
+        raise HTTPException(status_code=401, detail="Откройте Послание Таро через Telegram.")
     try:
         pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
     except ValueError:
@@ -394,7 +418,7 @@ def verify_telegram_init_data(init_data: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail="Подпись Telegram не прошла проверку.")
     try:
         if time.time() - int(data.get("auth_date", "0")) > INIT_DATA_MAX_AGE:
-            raise HTTPException(status_code=401, detail="Сессия устарела, перезапустите Оракула.")
+            raise HTTPException(status_code=401, detail="Сессия устарела, перезапустите приложение.")
     except ValueError:
         raise HTTPException(status_code=401, detail="Неверные данные авторизации.")
     try:
@@ -517,7 +541,7 @@ def generate_local_tarot_reading(question: str, pre_selected_cards: list, readin
     titles = (["⏳ Корни ситуации", "⚡ Текущая энергия", "🌙 Скрытое влияние",
                "🧭 Совет карт", "🌱 Ближайшее будущее", "🌟 Итог"] if n == 6
               else ["⏳ Прошлое", "⚡ Настоящее", "🌟 Будущее"])
-    parts = [f"Оракул услышал твой вопрос: **«{question}»**"]
+    parts = [f"Твой вопрос: **«{question}»**"]
     for idx, card in enumerate(used_cards):
         name = card["name"].replace("Старший Аркан: ", "")
         parts.append(f"**{titles[idx]} — {name}**\n{get_rich_card_meaning(card['name'], 'present')}")
@@ -818,7 +842,7 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
                            validate=_make_validator(pre_selected_cards, 6, 10))
     if result:
         return result
-    log("⚠️ Все AI недоступны. Переход на локальный оракул.")
+    log("⚠️ Все AI недоступны. Переход на локальные толкования.")
     return generate_local_tarot_reading(question, pre_selected_cards, reading_type="dynamic")
 
 
@@ -837,7 +861,7 @@ async def generate_preset_reading(question: str, pre_selected_cards: list) -> di
                            validate=_make_validator(pre_selected_cards, 3, 3))
     if result:
         return result
-    log("⚠️ Все AI недоступны для стандартного разбора. Локальный оракул.")
+    log("⚠️ Все AI недоступны для стандартного разбора. Локальные толкования.")
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 
@@ -912,13 +936,29 @@ async def setup_bot():
         log(f"⚠️ Не удалось установить вебхук: {e}")
     try:
         await bot.set_my_commands([
-            BotCommand(command="start", description="🔮 Открыть Оракула"),
+            BotCommand(command="start", description="🔮 Открыть Послание Таро"),
             BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
             BotCommand(command="stop", description="🔕 Отключить напоминания"),
+            BotCommand(command="support", description="💬 Поддержка"),
+            BotCommand(command="paysupport", description="💳 Вопросы по оплате"),
+            BotCommand(command="terms", description="📜 Условия использования"),
         ])
-        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🔮 Оракул", web_app=WebAppInfo(url=FRONTEND_URL)))
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🔮 Таро", web_app=WebAppInfo(url=FRONTEND_URL)))
     except Exception as e:
         log(f"⚠️ Команды/меню: {e}")
+    if old_bot:
+        try:
+            await old_bot.set_webhook(
+                url=f"{PUBLIC_URL}{OLD_WEBHOOK_PATH}",
+                secret_token=OLD_WEBHOOK_SECRET,
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=False,
+            )
+            await old_bot.set_my_commands([BotCommand(command="start", description="🔮 Перейти в новый бот")])
+            await old_bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+            log(f"Старый бот: режим «переехали», вебхук {PUBLIC_URL}{OLD_WEBHOOK_PATH}")
+        except Exception as e:
+            log(f"⚠️ Старый бот: {e}")
 
 
 async def keepalive_loop():
@@ -936,13 +976,13 @@ async def keepalive_loop():
 
 PUSH_TEXTS = [
     "🃏 {name}, твоя Карта Дня уже ждёт. Узнай, что приготовил этот день ✨",
-    "🌙 Доброе утро, {name}! Оракул вытянул для тебя карту на сегодня. Открой её 🔮",
+    "🌙 Доброе утро, {name}! Карта на сегодня уже вытянута для тебя. Открой её 🔮",
     "✨ {name}, вселенная оставила тебе послание на сегодня. Карта Дня — бесплатно.",
     "🔮 {name}, прежде чем день закрутится — загляни в свою Карту Дня.",
 ]
 
 
-def webapp_kb(text: str = "🔮 Открыть Оракул", channel: bool = False) -> InlineKeyboardMarkup:
+def webapp_kb(text: str = "🔮 Открыть расклады", channel: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=FRONTEND_URL))]]
     if channel and CHANNEL_URL:
         rows.append([InlineKeyboardButton(text="📢 Наш канал", url=CHANNEL_URL)])
@@ -1126,7 +1166,7 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
     except Exception as e:
         log(f"preset error: {e}")
         await refund(uid, mode, COST_PRESET)
-        raise HTTPException(status_code=500, detail="Оракул не смог провести расклад. Энергия возвращена.")
+        raise HTTPException(status_code=500, detail="Не получилось сделать расклад. Энергия возвращена.")
 
     used = [i for i in result_data.get("cards_used_indices", []) if isinstance(i, int) and 0 <= i < len(pre_selected)]
     used = list(dict.fromkeys(used))[:3]
@@ -1182,7 +1222,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     except Exception as e:
         log(f"ai reading error: {e}")
         await refund(uid, mode, COST_AI)
-        raise HTTPException(status_code=500, detail="Оракул не смог провести расклад. Энергия возвращена.")
+        raise HTTPException(status_code=500, detail="Не получилось сделать расклад. Энергия возвращена.")
 
     used = [i for i in result_data.get("cards_used_indices", []) if isinstance(i, int) and 0 <= i < len(pre_selected)]
     used = list(dict.fromkeys(used))[:12]
@@ -1363,6 +1403,77 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
+@app.post(OLD_WEBHOOK_PATH)
+async def old_bot_webhook(request: Request):
+    """Старый бот: на любое сообщение отвечает ссылкой на нового бота."""
+    if not old_bot or request.headers.get("X-Telegram-Bot-Api-Secret-Token") != OLD_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    raw = await request.json()
+    try:
+        msg = raw.get("message") or (raw.get("callback_query") or {}).get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        # Старая реферальная ссылка t.me/<старый_бот>?start=ref_123 приходит как «/start ref_123» —
+        # передаём параметр в кнопку, чтобы пригласивший получил бонус уже в новом боте.
+        text = (raw.get("message") or {}).get("text") or ""
+        start_param = text.split(maxsplit=1)[1].strip() if text.startswith("/start ") else None
+        if chat_id:
+            await old_bot.send_message(chat_id, MOVED_TEXT.format(u=BOT_USERNAME), reply_markup=moved_kb(start_param))
+    except Exception as e:
+        log(f"Старый бот, ответ: {e}")
+    return {"ok": True}
+
+
+MOVE_GIFT = int(os.getenv("MOVE_GIFT", "150"))  # подарок в честь переезда каждому, кто уже есть в базе
+
+
+def moved_broadcast_text(old_balance: int, new_balance: int) -> str:
+    head = f"🔮 Послание Таро переехало в нового бота: @{BOT_USERNAME}\n\n"
+    if old_balance > 0:
+        body = (f"Ваш баланс {old_balance} Энергии перенесён в новый бот, "
+                f"а в честь переезда дарим ещё +{MOVE_GIFT} ✨\n"
+                f"Теперь у вас {new_balance} Энергии.")
+    else:
+        body = (f"В честь переезда дарим вам +{MOVE_GIFT} Энергии ✨ "
+                f"Этого хватит на Стандартный разбор на 3 карты.")
+    return head + body + "\n\nОткройте нового бота и нажмите «Запустить», чтобы забрать подарок."
+
+
+async def send_moved_broadcast() -> tuple:
+    """Рассылка о переезде через старого бота + подарок MOVE_GIFT каждому, кто уже есть в базе.
+    Каждому — один раз (флаг moved_notified). Возвращает (отправлено, не доставлено, подарков)."""
+    p = await db()
+    sent = failed = gifted = 0
+    while True:
+        rows = await p.fetch("SELECT telegram_id FROM users WHERE NOT moved_notified LIMIT 200")
+        if not rows:
+            break
+        for r in rows:
+            uid = r["telegram_id"]
+            # Атомарно: начисляем подарок и ставим флаг. Повторный запуск подарок не задублирует.
+            row = await p.fetchrow("""
+                UPDATE users SET balance = balance + $2, moved_notified = TRUE
+                WHERE telegram_id = $1 AND NOT moved_notified
+                RETURNING balance
+            """, uid, MOVE_GIFT)
+            if not row:
+                continue
+            gifted += 1
+            new_balance = row["balance"]
+            text = moved_broadcast_text(new_balance - MOVE_GIFT, new_balance)
+            for attempt in range(2):
+                try:
+                    await old_bot.send_message(uid, text, reply_markup=moved_kb())
+                    sent += 1
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except Exception:
+                    failed += 1  # заблокировал старого бота — подарок всё равно ждёт его в новом
+                    break
+            await asyncio.sleep(0.05)
+    return sent, failed, gifted
+
+
 # =====================================================================
 # БОТ: команды и платежи
 # =====================================================================
@@ -1388,7 +1499,7 @@ async def cmd_start(message: Message, command: CommandObject):
         user, created, referrer = {}, False, None
 
     lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
-             "Я — Оракул Таро. Задай вопрос — и карты ответят.", ""]
+             "Это Послание Таро. Задай вопрос — и карты ответят.", ""]
     if created:
         lines.append("🎁 Твой первый расклад на 3 карты — в подарок.")
         if referrer:
@@ -1409,7 +1520,7 @@ async def cmd_ref(message: Message):
     user = await get_user(uid)
     count = (user or {}).get("ref_count") or 0
     link = ref_link(uid)
-    share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Оракул Таро в Telegram — первый расклад бесплатно, Карта Дня каждый день"})
+    share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Послание Таро в Telegram — первый расклад бесплатно, Карта Дня каждый день"})
     await message.answer(
         f"🎁 Приглашай друзей — за каждого вы оба получите +{REF_BONUS} Энергии.\n\n"
         f"Твоя ссылка:\n{link}\n\nУже пришло по ссылке: {count}",
@@ -1430,6 +1541,63 @@ async def cmd_notify(message: Message):
     p = await db()
     await p.execute("UPDATE users SET notify = TRUE WHERE telegram_id = $1", message.from_user.id)
     await message.answer("🔔 Напоминания снова включены — пришлю Карту Дня в понедельник утром.")
+
+
+@dp.message(Command("moved_broadcast"))
+async def cmd_moved_broadcast(message: Message):
+    """Только для админов: разослать всем пользователям старого бота сообщение о переезде."""
+    user = await get_user(message.from_user.id) or {"telegram_id": message.from_user.id, "username": message.from_user.username}
+    if not is_admin(user):
+        return
+    if not old_bot:
+        await message.answer("OLD_BOT_TOKEN не задан в Render — рассылать не через что.")
+        return
+    await message.answer("📨 Начинаю рассылку о переезде через старого бота…")
+    sent, failed, gifted = await send_moved_broadcast()
+    await message.answer(
+        f"✅ Готово. Подарок +{MOVE_GIFT} начислен: {gifted}.\n"
+        f"Сообщение доставлено: {sent}, не доставлено (заблокировали старого бота): {failed}."
+    )
+
+
+@dp.message(Command("support"))
+async def cmd_support(message: Message):
+    await message.answer(
+        "💬 Поддержка Послания Таро\n\n"
+        f"Если что-то работает не так или есть вопрос по раскладам, напишите {SUPPORT_CONTACT}. "
+        "Отвечаем обычно в течение дня.\n\n"
+        "Вопросы по оплате: /paysupport\n"
+        "Условия использования: /terms"
+    )
+
+
+@dp.message(Command("paysupport"))
+async def cmd_paysupport(message: Message):
+    await message.answer(
+        "💳 Вопросы по оплате\n\n"
+        "Если звёзды списались, а Энергия не пришла, или оплата не открывается, "
+        f"напишите {SUPPORT_CONTACT} и укажите:\n"
+        "• дату и время оплаты;\n"
+        "• какой пакет покупали;\n"
+        f"• ваш ID: {message.from_user.id}\n\n"
+        "Мы проверим платёж и зачислим Энергию или вернём звёзды.\n\n"
+        "Если оплата не открывается на компьютере, попробуйте с телефона."
+    )
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message):
+    await message.answer(
+        "📜 Условия использования\n\n"
+        "1. Послание Таро — развлекательный сервис. Расклады не являются советом в медицинских, "
+        "юридических или финансовых вопросах и не заменяют обращения к специалисту.\n\n"
+        "2. Энергия покупается за Telegram Stars и тратится на расклады внутри бота. "
+        "Энергия не обменивается обратно на звёзды или деньги.\n\n"
+        "3. Если из-за технической ошибки Энергия списалась, а расклад не пришёл, "
+        "или Энергия не зачислилась после оплаты, напишите в /paysupport — исправим или вернём звёзды.\n\n"
+        "4. Пользуясь ботом, вы соглашаетесь с этими условиями и с правилами Telegram.\n\n"
+        f"Связь: {SUPPORT_CONTACT}"
+    )
 
 
 @dp.pre_checkout_query()
