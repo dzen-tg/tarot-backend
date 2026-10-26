@@ -1447,37 +1447,37 @@ def moved_broadcast_text(old_balance: int, new_balance: int) -> str:
 
 
 async def send_moved_broadcast() -> tuple:
-    """Рассылка о переезде через старого бота + подарок MOVE_GIFT каждому, кто уже есть в базе.
+    """Рассылка о переезде через старого бота. Подарок MOVE_GIFT начисляется ТОЛЬКО тем, кому сообщение дошло:
+    - новые пользователи, которые никогда не были в старом боте, подарок не получат (старый бот не может им написать);
+    - кто заблокировал старого бота — тоже без подарка.
     Каждому — один раз (флаг moved_notified). Возвращает (отправлено, не доставлено, подарков)."""
     p = await db()
     sent = failed = gifted = 0
     while True:
-        rows = await p.fetch("SELECT telegram_id FROM users WHERE NOT moved_notified LIMIT 200")
+        rows = await p.fetch("SELECT telegram_id, balance FROM users WHERE NOT moved_notified LIMIT 200")
         if not rows:
             break
         for r in rows:
-            uid = r["telegram_id"]
-            # Атомарно: начисляем подарок и ставим флаг. Повторный запуск подарок не задублирует.
-            row = await p.fetchrow("""
-                UPDATE users SET balance = balance + $2, moved_notified = TRUE
-                WHERE telegram_id = $1 AND NOT moved_notified
-                RETURNING balance
-            """, uid, MOVE_GIFT)
-            if not row:
-                continue
-            gifted += 1
-            new_balance = row["balance"]
-            text = moved_broadcast_text(new_balance - MOVE_GIFT, new_balance)
+            uid, balance = r["telegram_id"], r["balance"] or 0
+            # Сначала ставим флаг, чтобы повторный запуск никого не задел дважды
+            await p.execute("UPDATE users SET moved_notified = TRUE WHERE telegram_id = $1", uid)
+            text = moved_broadcast_text(balance, balance + MOVE_GIFT)
+            delivered = False
             for attempt in range(2):
                 try:
                     await old_bot.send_message(uid, text, reply_markup=moved_kb())
-                    sent += 1
+                    delivered = True
                     break
                 except TelegramRetryAfter as e:
                     await asyncio.sleep(e.retry_after + 1)
                 except Exception:
-                    failed += 1  # заблокировал старого бота — подарок всё равно ждёт его в новом
-                    break
+                    break  # не был в старом боте или заблокировал его
+            if delivered:
+                await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, MOVE_GIFT)
+                sent += 1
+                gifted += 1
+            else:
+                failed += 1
             await asyncio.sleep(0.05)
     return sent, failed, gifted
 
@@ -1563,8 +1563,8 @@ async def cmd_moved_broadcast(message: Message):
     await message.answer("📨 Начинаю рассылку о переезде через старого бота…")
     sent, failed, gifted = await send_moved_broadcast()
     await message.answer(
-        f"✅ Готово. Подарок +{MOVE_GIFT} начислен: {gifted}.\n"
-        f"Сообщение доставлено: {sent}, не доставлено (заблокировали старого бота): {failed}."
+        f"✅ Готово. Сообщение и подарок +{MOVE_GIFT} получили: {gifted}.\n"
+        f"Не доставлено (новые пользователи или заблокировали старого бота): {failed}."
     )
 
 
