@@ -1609,7 +1609,33 @@ def _tribute_signature_ok(raw: bytes, signature: str) -> bool:
 
 def _event_key(name: str) -> str:
     # shopOrderRefunded / shop_order_refunded → shoporderrefunded
-    return (name or "").replace("_", "").lower()
+    return (name or "").replace("_", "").replace(".", "").replace("-", "").lower()
+
+
+def _find_key(obj, names: tuple, depth: int = 0):
+    """Ищет первое непустое значение по любому из имён ключей, в том числе во вложенных объектах."""
+    if depth > 4:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if _event_key(k) in names and isinstance(v, (str, int)) and str(v):
+                return str(v)
+        for v in obj.values():
+            r = _find_key(v, names, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, names, depth + 1)
+            if r:
+                return r
+    return None
+
+
+@app.get("/tribute-webhook")
+async def tribute_webhook_check():
+    """Проверка адреса из браузера или из кабинета Tribute (раньше отдавала 405)."""
+    return {"ok": True}
 
 
 @app.post("/tribute-webhook")
@@ -1622,16 +1648,24 @@ async def tribute_webhook(request: Request):
         data = json.loads(raw or b"{}")
     except ValueError:
         raise HTTPException(status_code=400, detail="bad json")
-    event = _event_key(data.get("name") or data.get("event") or "")
-    order = data.get("payload") if isinstance(data.get("payload"), dict) else data
-    order_uuid = order.get("uuid") or order.get("orderUuid") or order.get("order_uuid")
-    status = (order.get("status") or "").lower()
-    log(f"Tribute вебхук: {event} {order_uuid} {status}")
+    event = _event_key(_find_key(data, ("name", "event", "type", "eventtype", "eventname")) or "")
+    order_uuid = _find_key(data, ("uuid", "orderuuid", "orderid"))
+    status = (_find_key(data, ("status", "orderstatus")) or "").lower()
+    log(f"Tribute вебхук: event={event or '-'} order={order_uuid or '-'} status={status or '-'}")
+    # Сырое тело — чтобы видеть точный формат Tribute (секретов в нём нет)
+    log(f"Tribute тело: {raw[:1500].decode('utf-8', 'replace')}")
     if not order_uuid:
         return {"ok": True}
 
+    refund = "refund" in event or status in ("refunded", "refund")
+    paid = not refund and (
+        event in ("shoporderpaymentreceived", "shoporderchargesuccess", "shoporderpaid",
+                  "orderpaid", "paymentsucceeded", "paymentsuccess")
+        or status in ("paid", "success", "succeeded", "completed")
+    ) and status not in ("pending", "failed", "canceled", "cancelled", "expired")
+
     p = await db()
-    if event in ("shoporder", "shoporderpaymentreceived", "shoporderchargesuccess") and status in ("", "paid"):
+    if paid:
         async with p.acquire() as c:
             async with c.transaction():
                 row = await c.fetchrow("""
@@ -1651,7 +1685,7 @@ async def tribute_webhook(request: Request):
                                    reply_markup=webapp_kb())
         except Exception:
             pass
-    elif event == "shoporderrefunded":
+    elif refund:
         row = await p.fetchrow("""
             UPDATE tribute_orders SET status = 'refunded' WHERE uuid = $1 AND status = 'paid'
             RETURNING telegram_id, energy
