@@ -9,7 +9,7 @@
 - Вебхук ставится без drop_pending_updates — /start, который будит сервер, больше не теряется.
 - Keep-alive, чтобы бесплатный Render не засыпал; /health для UptimeRobot.
 - Атомарные списания баланса, идемпотентные платежи (таблица payments).
-- Рост: бесплатный первый расклад, рефералка, ежедневный пуш «карта дня», скидка на первую покупку,
+- Рост: бесплатный первый Быстрый ответ, рефералка, ежедневный пуш «карта дня», скидка на первую покупку,
   кнопка-меню мини-аппа, команды /ref и /stop.
 """
 import os
@@ -68,7 +68,7 @@ SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@backoffice_media").strip()  # �
 # Экономика
 COST_PRESET = 150
 COST_AI = 750
-COST_QUICK = int(os.getenv("COST_QUICK", "75"))  # Быстрый ответ: 1 карта (+1–2 уточняющие при необходимости)
+COST_QUICK = int(os.getenv("COST_QUICK", "75"))  # Быстрый ответ: ровно 1 карта
 REF_BONUS = int(os.getenv("REF_BONUS", "150"))
 FREE_READINGS_ON_START = 1
 PACKS = {
@@ -748,7 +748,8 @@ HUMANIZE_TIMEOUT = float(os.getenv("HUMANIZE_TIMEOUT", "25"))
 HUMANIZER_PROMPT = (
     "Ты — литературный редактор. Тебе дают части готового расклада Таро в JSON. Перепиши каждую часть так, "
     "чтобы она звучала как живой таролог в переписке, а не как машинный текст. Смысл, предсказания, имена, "
-    "сроки и вердикт (да / скорее да / нет / пока нет) сохраняй точно. Ничего нового не придумывай.\n\n"
+    "сроки и вердикт (скорее да / скорее нет / зависит от…) сохраняй точно. Ничего нового не придумывай. "
+    "Не превращай осторожный ответ в категоричное «Да» или «Нет» и не добавляй «точно», «обязательно».\n\n"
     "УБЕРИ ПРИМЕТЫ МАШИННОГО ТЕКСТА:\n"
     "1. «Не X, а Y», «это не просто X, это Y», «дело не в X» — скажи прямо, что есть.\n"
     "2. Финальные фразы, которые повторяют уже сказанное («И это главное.», «Помни об этом.») — удали.\n"
@@ -863,8 +864,11 @@ ANGLES_RULE = (
 # Ответ должен быть тем, за чем человек пришёл.
 ANSWER_RULE = (
     "ОТВЕТ, КОТОРОГО ЖДЁТ ЧЕЛОВЕК:\n"
-    "• Вопрос «да/нет» (будет ли, позвонит ли, стоит ли) — первым словом: «Да», «Скорее да», «Пока нет», «Нет», "
-    "затем почему.\n"
+    "• Вопрос «да/нет» (будет ли, позвонит ли, стоит ли) — НЕ давай категоричного «Да» или «Нет». "
+    "Начни с осторожной формулировки: «Скорее всего, да», «Скорее да», «Скорее всего, нет», «Скорее нет», "
+    "«Пока скорее нет», а дальше объясни, что показывает карта и от чего зависит исход.\n"
+    "• Никогда не пиши голое «Да.» или «Нет.» и не обещай исход наверняка («точно», «обязательно», «100%», "
+    "«никогда»). Карты показывают тенденцию, а не приговор.\n"
     "• Вопрос «когда» — назови ориентир по времени (дни, неделя, месяц, до весны) и от чего он зависит.\n"
     "• Вопрос «что он(а) чувствует / думает / как относится» — прямо опиши чувства, мысли и намерения этого человека.\n"
     "• Вопрос «что делать / как поступить» — одно конкретное действие.\n"
@@ -877,7 +881,7 @@ STRUCTURED_FORMAT = (
     '  "intro": "2-3 тёплых предложения — почувствуй суть вопроса",\n'
     '  "cards": [{"index": <номер карты из списка>, "position": "<название позиции>", "meaning": "<толкование>"}, ...],\n'
     '  "synthesis": "как карты говорят ВМЕСТЕ: общая картина, связи между картами, главный сквозной мотив",\n'
-    '  "answer": "ПРЯМОЙ ответ на вопрос человека простыми словами: да / скорее да / пока нет / зависит от… — и почему",\n'
+    '  "answer": "ответ на вопрос простыми словами: скорее всего да / скорее всего нет / зависит от… — и почему",\n'
     '  "advice": ["конкретный шаг 1", "конкретный шаг 2", "конкретный шаг 3"]\n'
     "}\n\n"
     "ПРАВИЛА:\n"
@@ -1069,34 +1073,29 @@ def _build_quick(norm: dict, pre_selected_cards: list) -> dict:
 
 
 async def generate_quick_reading(question: str, pre_selected_cards: list) -> dict:
-    """Быстрый ответ — короткий ответ по одной карте, 2–3 карты только если первая неоднозначна."""
-    cards_str = ", ".join([f"[{i}] {c['name']}" for i, c in enumerate(pre_selected_cards)])
+    """Быстрый ответ — короткий ответ по одной карте."""
+    pre_selected_cards = pre_selected_cards[:1]
+    cards_str = f"[0] {pre_selected_cards[0]['name']} ({pre_selected_cards[0]['type']})"
     system_prompt = (
         "Ты — опытный таролог, практикующий по системе Уэйта. Отвечаешь на вопрос быстро, коротко и по делу, "
         "как в живой переписке.\n\n"
-        "КАРТЫ ВЫТЯНУТЫ ПО ПОРЯДКУ:\n"
-        "• [0] — главная карта, она отвечает на вопрос. Используй её всегда.\n"
-        "• У каждой карты свой ракурс на ВСЮ ситуацию: [0] — суть и ответ; [1] — то, чего человек не видит "
-        "(скрытые мотивы, чувства другого человека, препятствие); [2] — к чему всё ведёт и что сделать.\n"
-        "• [1] и [2] — уточняющие. Бери [1] только если главная карта неоднозначна для этого вопроса "
-        "(например, вопрос «да/нет», а карта не даёт ясного ответа) или вопрос двусоставный. "
-        "[2] — только если и после [1] ответ неясен. В большинстве случаев хватает одной карты.\n"
-        "• Уточняющие карты добавляй строго по порядку: нельзя взять [2] без [1].\n\n"
-        "ДЛИНА:\n"
-        "• answer — прямой ответ на вопрос: 25–50 слов, без воды. Если в вопросе есть имена — обращайся к человеку по имени и называй того, о ком спрашивают.\n"
-        "• Если указана дата рождения — учти знак зодиака одной короткой фразой в answer, без отдельного гороскопа.\n"
-        "• meaning главной карты — 35–60 слов: что карта говорит именно про этот вопрос.\n"
-        "• meaning уточняющей карты — 20–40 слов: что она добавляет к ответу.\n\n"
+        "ЗАДАЧА: ответ по ОДНОЙ вытянутой карте. Других карт нет и не добавляй их.\n"
+        "• meaning — 45–75 слов: значение этой карты по Уэйту и что именно она говорит про ситуацию человека. "
+        "Рассмотри ситуацию целиком: что происходит, что чувствуют участники, к чему идёт.\n"
+        "• answer — ответ на вопрос: 30–55 слов, без воды, и он вытекает из значения карты. "
+        "Если в вопросе есть имена — обращайся к человеку по имени и называй того, о ком спрашивают.\n"
+        "• Если указана дата рождения — учти знак зодиака одной короткой фразой в answer, без отдельного гороскопа.\n\n"
         "ДЕЛИКАТНЫЕ ВОПРОСЫ: не предсказывай смерть, сроки жизни, болезни и диагнозы, беременность, "
         "исход суда. На такой вопрос мягко скажи, что карты не отвечают на него, и ответь на то, что они "
         "могут показать: состояние человека, отношения, что важно сейчас.\n\n"
         "ФОРМАТ — строго JSON (без markdown-блоков):\n"
         '{"cards": [{"index": 0, "meaning": "..."}], "answer": "..."}\n\n'
         "• Только **жирный** Markdown, без HTML и заголовков #. Не повторяй название карты в начале meaning.\n"
+        "• answer и meaning не пересказывают друг друга: meaning объясняет карту, answer отвечает на вопрос.\n"
         "• Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм'. Обращайся на «ты», тепло и живо.\n\n"
-        + ANGLES_RULE + "\n\n" + ANSWER_RULE + "\n\n" + HUMAN_STYLE
+        + ANSWER_RULE + "\n\n" + HUMAN_STYLE
     )
-    user_prompt = f"Вопрос: «{question}».\nКарты по порядку вытягивания: {cards_str}."
+    user_prompt = f"Вопрос: «{question}».\nВытянутая карта: {cards_str}."
     norm = await call_ai(system_prompt, user_prompt, max_tokens=1500, schema=QUICK_SCHEMA,
                          validate=_quick_validator(pre_selected_cards))
     if norm:
@@ -1104,7 +1103,7 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
         labels = {"answer": "Ответ на вопрос"}
         for n, (i, meaning) in enumerate(norm["cards"]):
             fields[f"card_{n}"] = meaning
-            labels[f"card_{n}"] = ("Главная карта — " if i == 0 else "Уточняющая карта — ") + _card_name(pre_selected_cards[i])
+            labels[f"card_{n}"] = "Значение карты — " + _card_name(pre_selected_cards[i])
         new = await humanize_fields(fields, labels, question)
         norm = {"answer": new["answer"],
                 "cards": [(i, new[f"card_{n}"]) for n, (i, _) in enumerate(norm["cards"])]}
@@ -1112,7 +1111,7 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
     log("⚠️ Все AI недоступны для быстрого ответа. Локальное толкование.")
     card = pre_selected_cards[0]
     name = card["name"].replace("Старший Аркан: ", "")
-    text = (f"**✨ Ответ карт**\nКарта не даёт жёсткого «да» или «нет»: исход зависит от твоих шагов "
+    text = (f"**✨ Ответ карт**\nКарта не даёт однозначного ответа: исход зависит от твоих шагов "
             f"в ближайшее время. Прислушайся к её совету.\n\n"
             f"**🃏 {name}**\n{get_rich_card_meaning(card['name'], 'present')}")
     return {"cards_used_indices": [0], "reading": text}
@@ -1291,7 +1290,7 @@ async def send_daily_push() -> int:
             uid = r["telegram_id"]
             text = random.choice(PUSH_TEXTS).format(name=r["first_name"] or "Искатель")
             if (r["free_readings"] or 0) > 0:
-                text += "\n\n🎁 А ещё у тебя есть бесплатный расклад на 3 карты."
+                text += "\n\n🎁 А ещё у тебя есть бесплатный Быстрый ответ: задай картам свой вопрос."
             text += energy_reminder(r["balance"] or 0)
             await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, today)
             try:
@@ -1415,11 +1414,11 @@ def _question(payload: dict) -> str:
 
 @app.post("/api/user/use-preset-ai-reading")
 async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)):
-    """Стандартный разбор (3 карты): первый — бесплатно, далее 150 энергии."""
+    """Стандартный разбор (3 карты) — 150 энергии. Бесплатный подарок теперь идёт на Быстрый ответ."""
     user, admin = await auth_user(authorization)
     question = _question(payload)
     uid = user["telegram_id"]
-    mode = "admin" if admin else await charge(uid, COST_PRESET, allow_free=True)
+    mode = "admin" if admin else await charge(uid, COST_PRESET, allow_free=False)
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 6)
@@ -1446,28 +1445,29 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
 
 @app.post("/api/user/use-quick-reading")
 async def use_quick_reading(payload: dict, authorization: str = Header(None)):
-    """Быстрый ответ — COST_QUICK энергии (по умолчанию 50): 1 карта, при необходимости 2–3."""
+    """Быстрый ответ — COST_QUICK энергии (по умолчанию 75): ровно 1 карта."""
     user, admin = await auth_user(authorization)
     question = _question(payload)
     uid = user["telegram_id"]
-    mode = "admin" if admin else await charge(uid, COST_QUICK, allow_free=False)
+    mode = "admin" if admin else await charge(uid, COST_QUICK, allow_free=True)  # подарок — первый Быстрый ответ
 
     try:
-        pre_selected = random.sample(get_tarot_deck(), 3)
+        pre_selected = random.sample(get_tarot_deck(), 1)
         result_data = await generate_quick_reading(question, pre_selected)
     except Exception as e:
         log(f"quick error: {e}")
         await refund(uid, mode, COST_QUICK)
         raise HTTPException(status_code=500, detail="Не получилось сделать расклад. Энергия возвращена.")
 
-    used = [i for i in result_data.get("cards_used_indices", []) if isinstance(i, int) and 0 <= i < 3]
-    used = list(dict.fromkeys(used)) or [0]
+    used = [0]
     fresh = await get_user(uid)
     return {
         "success": True,
         "cards": [pre_selected[i] for i in used],
         "text": result_data.get("reading", ""),
         "new_balance": 99999 if admin else fresh["balance"],
+        "free_readings": fresh.get("free_readings") or 0,
+        "used_free": mode == "free",
     }
 
 
@@ -1575,15 +1575,22 @@ async def create_tribute_order(payload: dict, authorization: str = Header(None))
     try:
         r = await http.post(f"{TRIBUTE_API}/shop/orders", json=body,
                             headers={"Api-Key": TRIBUTE_API_KEY}, timeout=20)
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            data = {"error": r.text[:300]}
     except Exception as e:
         log(f"Tribute: ошибка запроса: {e}")
         raise HTTPException(status_code=502, detail="Платёжный сервис не отвечает, попробуйте ещё раз.")
     order = data.get("order") if isinstance(data.get("order"), dict) else data
     order_uuid = order.get("uuid")
     if r.status_code >= 300 or not order_uuid:
-        log(f"Tribute: не создан заказ {r.status_code}: {str(data)[:300]}")
-        raise HTTPException(status_code=502, detail="Не удалось создать счёт, попробуйте ещё раз.")
+        log(f"Tribute: не создан заказ {r.status_code}: {str(data)[:500]}")
+        reason = ""
+        if isinstance(data, dict):
+            reason = str(data.get("message") or data.get("error") or data.get("detail") or "")[:120]
+        raise HTTPException(status_code=502, detail=f"Не удалось создать счёт (Tribute {r.status_code}"
+                                                    + (f": {reason}" if reason else "") + "). Попробуйте ещё раз.")
     p = await db()
     await p.execute("""
         INSERT INTO tribute_orders (uuid, telegram_id, pack, energy, amount, currency)
@@ -1823,13 +1830,13 @@ async def cmd_start(message: Message, command: CommandObject):
     lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
              "Это Послание Таро. Задай вопрос — и карты ответят.", ""]
     if created:
-        lines.append("🎁 Твой первый расклад на 3 карты — в подарок.")
+        lines.append("🎁 Первый Быстрый ответ — в подарок.")
         if referrer:
             lines.append(f"✨ Ты пришёл(а) по приглашению — тебе начислено +{REF_BONUS} Энергии.")
     elif (user.get("free_readings") or 0) > 0:
-        lines.append("🎁 У тебя есть бесплатный расклад на 3 карты.")
+        lines.append("🎁 У тебя есть бесплатный Быстрый ответ.")
     lines += ["🃏 Карта Дня — бесплатно каждый день.",
-              f"⚡ Быстрый ответ на любой вопрос — {COST_QUICK} Энергии.",
+              f"⚡ Быстрый ответ одной картой на любой вопрос — {COST_QUICK} Энергии.",
               "🎴 Стандартный и 🔮 Индивидуальный разборы — за Энергию.", "",
               "Жми кнопку ниже 👇"]
     await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
@@ -1843,7 +1850,7 @@ async def cmd_ref(message: Message):
     user = await get_user(uid)
     count = (user or {}).get("ref_count") or 0
     link = ref_link(uid)
-    share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Послание Таро в Telegram — первый расклад бесплатно, Карта Дня каждый день"})
+    share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Послание Таро в Telegram — первый ответ карт бесплатно, Карта Дня каждый день"})
     await message.answer(
         f"🎁 Приглашай друзей — за каждого вы оба получите +{REF_BONUS} Энергии.\n\n"
         f"Твоя ссылка:\n{link}\n\nУже пришло по ссылке: {count}",
