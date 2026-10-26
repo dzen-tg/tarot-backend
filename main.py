@@ -738,6 +738,84 @@ async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
 
 
 # ---------------------------------------------------------------------
+# ГУМАНИЗАТОР: второй проход редактора по каждому ответу.
+# Правила — сжатая версия гайда «Signs of AI writing» (скилл humanizer).
+# Каждое поле правится отдельно; если правка не прошла проверку — остаётся исходный текст.
+# ---------------------------------------------------------------------
+HUMANIZE_ENABLED = os.getenv("HUMANIZE", "1") == "1"
+HUMANIZE_TIMEOUT = float(os.getenv("HUMANIZE_TIMEOUT", "25"))
+
+HUMANIZER_PROMPT = (
+    "Ты — литературный редактор. Тебе дают части готового расклада Таро в JSON. Перепиши каждую часть так, "
+    "чтобы она звучала как живой таролог в переписке, а не как машинный текст. Смысл, предсказания, имена, "
+    "сроки и вердикт (да / скорее да / нет / пока нет) сохраняй точно. Ничего нового не придумывай.\n\n"
+    "УБЕРИ ПРИМЕТЫ МАШИННОГО ТЕКСТА:\n"
+    "1. «Не X, а Y», «это не просто X, это Y», «дело не в X» — скажи прямо, что есть.\n"
+    "2. Финальные фразы, которые повторяют уже сказанное («И это главное.», «Помни об этом.») — удали.\n"
+    "3. Псевдоглубокие афоризмы: «язык Вселенной», «ключ к…», «суть кроется в…», «истинная сила в…» — "
+    "замени конкретной мыслью.\n"
+    "4. Разгоны перед мыслью: «Давай разберёмся», «Важно понимать», «Стоит отметить», «Итак», «Честно?» — удали.\n"
+    "5. Спор с тем, чего никто не говорил: «Это не значит, что…», «Не пойми неправильно» — удали.\n"
+    "6. Перечисления тройками по привычке — оставь столько пунктов, сколько есть по смыслу.\n"
+    "7. Несколько предложений подряд с одинаковым началом — перестрой.\n"
+    "8. Тире вместо запятой, двоеточия или точки — замени. Длинных тире в тексте почти не должно быть.\n"
+    "9. Нагромождение оговорок («возможно, вероятно, может быть») — оставь одну, если она нужна.\n"
+    "10. Штампы: «ключевой», «играет важную роль», «является», «данный», «уникальный», «невероятный», "
+    "«гармония» и «энергия» в каждом абзаце, «путь», «трансформация», «потенциал» без конкретики.\n"
+    "11. Раздувание значимости: «поворотный момент», «новая глава», «судьбоносный» — оставь факт без пафоса.\n"
+    "12. Жирный шрифт на отдельных словах внутри текста — убери.\n"
+    "13. Вопросы и предложения в конце («Хочешь узнать больше?»), «Надеюсь, это поможет» — удали.\n\n"
+    "РАЗНООБРАЗИЕ: если толкования разных карт повторяют друг друга мыслью, словами или построением фраз, "
+    "перепиши так, чтобы каждая карта звучала по-своему и добавляла новое к общей картине. "
+    "Начала частей не должны быть одинаковыми.\n\n"
+    "ЖИВОЙ РИТМ: чередуй короткие и длинные предложения. Обращение на «ты», тепло и по-человечески. "
+    "Длина каждой части — примерно как у исходной.\n\n"
+    "ФОРМАТ: верни строго JSON с ТЕМИ ЖЕ ключами, значения — переписанный текст. Без markdown-блоков."
+)
+
+
+async def humanize_fields(fields: dict, labels: dict, question: str, keep_bold: bool = False) -> dict:
+    """Возвращает dict с теми же ключами. При любой ошибке или сомнительной правке — исходный текст поля."""
+    if not HUMANIZE_ENABLED or not fields:
+        return dict(fields)
+    payload = {k: v for k, v in fields.items() if v}
+    if not payload:
+        return dict(fields)
+    guide = "\n".join(f"• {k}: {labels.get(k, k)}" for k in payload)
+    extra = ("\nСтроки-заголовки, выделенные **жирным**, оставь дословно как есть, на своих местах."
+             if keep_bold else "")
+    user_prompt = (
+        (f"Вопрос человека: «{question}».\n" if question else "")
+        + f"Что есть что:\n{guide}{extra}\n\nТЕКСТ (JSON):\n" + json.dumps(payload, ensure_ascii=False)
+    )
+    total = sum(len(v) for v in payload.values())
+    max_tokens = min(6000, total // 2 + 800)
+
+    def validate(parsed: dict) -> Optional[dict]:
+        out = {}
+        for k, old in payload.items():
+            new = clean_ai_text(str(parsed.get(k) or "")).strip()
+            ok = 0.5 * len(old) <= len(new) <= 1.6 * len(old) and len(new) >= 15
+            if ok and keep_bold:
+                ok = old.count("**") == new.count("**")
+            out[k] = new if ok else old
+        return out if any(out[k] != payload[k] for k in payload) else None
+
+    t0 = time.monotonic()
+    try:
+        res = await asyncio.wait_for(call_ai(HUMANIZER_PROMPT, user_prompt, max_tokens=max_tokens, validate=validate),
+                                     timeout=HUMANIZE_TIMEOUT)
+    except Exception as e:
+        log(f"⚠️ Гуманизатор: {type(e).__name__}: {e}")
+        res = None
+    log(f"Гуманизатор {time.monotonic() - t0:.1f}s, {'ok' if res else 'исходный текст'}")
+    out = dict(fields)
+    if res:
+        out.update(res)
+    return out
+
+
+# ---------------------------------------------------------------------
 # Структурированный расклад: модель возвращает части по отдельности,
 # а текст собираем мы — так каждая карта и итог гарантированно на месте.
 # ---------------------------------------------------------------------
@@ -771,6 +849,28 @@ HUMAN_STYLE = (
     "• Без вопросов и предложений в конце («Хочешь узнать больше?»), без «Надеюсь, это поможет»."
 )
 
+# Каждая карта смотрит на всю ситуацию, но со своей стороны — чтобы толкования не повторяли друг друга.
+ANGLES_RULE = (
+    "РАЗНЫЕ РАКУРСЫ:\n"
+    "• Каждая карта рассматривает ситуацию ЦЕЛИКОМ, но со своей стороны, которую задаёт её позиция "
+    "(что привело, что происходит сейчас, чувства и мотивы других людей, скрытое, к чему всё ведёт, совет).\n"
+    "• Толкования не повторяют друг друга ни мыслью, ни словами, ни построением фраз. Если мысль уже прозвучала "
+    "у одной карты, другая её не пересказывает, а добавляет новое.\n"
+    "• Начинай каждое толкование по-разному: не «Эта карта…», не «Карта говорит…» у всех подряд.\n"
+    "• Опирайся на конкретную символику и значение именно этой карты, чтобы разные карты звучали по-разному."
+)
+
+# Ответ должен быть тем, за чем человек пришёл.
+ANSWER_RULE = (
+    "ОТВЕТ, КОТОРОГО ЖДЁТ ЧЕЛОВЕК:\n"
+    "• Вопрос «да/нет» (будет ли, позвонит ли, стоит ли) — первым словом: «Да», «Скорее да», «Пока нет», «Нет», "
+    "затем почему.\n"
+    "• Вопрос «когда» — назови ориентир по времени (дни, неделя, месяц, до весны) и от чего он зависит.\n"
+    "• Вопрос «что он(а) чувствует / думает / как относится» — прямо опиши чувства, мысли и намерения этого человека.\n"
+    "• Вопрос «что делать / как поступить» — одно конкретное действие.\n"
+    "• Не подменяй ответ общими словами вроде «всё зависит от тебя» или «доверься потоку»."
+)
+
 STRUCTURED_FORMAT = (
     "ФОРМАТ ОТВЕТА — строго JSON (без markdown-блоков):\n"
     "{\n"
@@ -787,7 +887,7 @@ STRUCTURED_FORMAT = (
     "• Используй только **жирный** Markdown, никаких HTML-тегов и заголовков #.\n"
     "• Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм', 'в заключение'.\n"
     "• Пиши живым тёплым языком, обращайся на «ты».\n\n"
-    + HUMAN_STYLE
+    + ANGLES_RULE + "\n\n" + ANSWER_RULE + "\n\n" + HUMAN_STYLE
 )
 
 
@@ -814,21 +914,53 @@ def _make_validator(pre_selected_cards: list, min_cards: int, max_cards: int):
         synthesis = clean_ai_text(str(parsed.get("synthesis") or "")).strip()
         if len(cards) < min_cards or len(answer) < 30 or not advice or len(synthesis) < 40:
             return None
-        cards = cards[:max_cards]
-
-        parts = []
-        intro = clean_ai_text(str(parsed.get("intro") or "")).strip()
-        if intro:
-            parts.append(intro)
-        for idx, position, meaning in cards:
-            name = pre_selected_cards[idx]["name"].replace("Старший Аркан: ", "")
-            title = f"**{position} — {name}**" if position else f"**{name}**"
-            parts.append(f"{title}\n{meaning}")
-        parts.append(f"**🔮 Общая картина**\n{synthesis}")
-        parts.append(f"**✨ Ответ на твой вопрос**\n{answer}")
-        parts.append("**🧭 Что делать**\n" + "\n".join(f"• {a}" for a in advice[:5]))
-        return {"cards_used_indices": [i for i, _, _ in cards], "reading": "\n\n".join(parts)}
+        return {
+            "intro": clean_ai_text(str(parsed.get("intro") or "")).strip(),
+            "cards": cards[:max_cards],
+            "synthesis": synthesis,
+            "answer": answer,
+            "advice": advice[:5],
+        }
     return validate
+
+
+def _card_name(card: dict) -> str:
+    return card["name"].replace("Старший Аркан: ", "")
+
+
+def _build_structured(norm: dict, pre_selected_cards: list) -> dict:
+    parts = []
+    if norm.get("intro"):
+        parts.append(norm["intro"])
+    for idx, position, meaning in norm["cards"]:
+        name = _card_name(pre_selected_cards[idx])
+        title = f"**{position} — {name}**" if position else f"**{name}**"
+        parts.append(f"{title}\n{meaning}")
+    parts.append(f"**🔮 Общая картина**\n{norm['synthesis']}")
+    parts.append(f"**✨ Ответ на твой вопрос**\n{norm['answer']}")
+    parts.append("**🧭 Что делать**\n" + "\n".join(f"• {a}" for a in norm["advice"]))
+    return {"cards_used_indices": [i for i, _, _ in norm["cards"]], "reading": "\n\n".join(parts)}
+
+
+async def _humanize_structured(norm: dict, question: str, pre_selected_cards: list) -> dict:
+    """Гуманизатор для Стандартного и Индивидуального разборов: правит каждое поле отдельно."""
+    fields, labels = {}, {}
+    if norm.get("intro"):
+        fields["intro"], labels["intro"] = norm["intro"], "Вступление"
+    for n, (idx, position, meaning) in enumerate(norm["cards"]):
+        k = f"card_{n}"
+        fields[k], labels[k] = meaning, f"Карта: {position or 'позиция'} — {_card_name(pre_selected_cards[idx])}"
+    fields["synthesis"], labels["synthesis"] = norm["synthesis"], "Общая картина"
+    fields["answer"], labels["answer"] = norm["answer"], "Ответ на вопрос"
+    for n, a in enumerate(norm["advice"]):
+        fields[f"advice_{n}"], labels[f"advice_{n}"] = a, f"Совет {n + 1}"
+    new = await humanize_fields(fields, labels, question)
+    out = dict(norm)
+    out["intro"] = new.get("intro", norm.get("intro", ""))
+    out["cards"] = [(idx, pos, new[f"card_{n}"]) for n, (idx, pos, _) in enumerate(norm["cards"])]
+    out["synthesis"], out["answer"] = new["synthesis"], new["answer"]
+    out["advice"] = [new[f"advice_{n}"] for n in range(len(norm["advice"]))]
+    return out
 
 
 async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
@@ -843,15 +975,18 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
         "• 9-10 карт — глубокий вопрос о жизненном пути, предназначении, переменах\n\n"
         "ПОЗИЦИИ: Корни ситуации, Текущая энергия, Скрытое влияние, Внутреннее состояние, Окружение, "
         "Чего опасаться, Совет карт, Ближайшее будущее, Итог (бери нужные под количество карт).\n\n"
-        "Толкование каждой карты — 45-70 слов: значение карты по Уэйту, применённое к вопросу.\n"
+        "Толкование каждой карты — 45-70 слов: значение карты по Уэйту, применённое к вопросу, "
+        "строго с ракурса своей позиции (Корни — причины, Скрытое влияние — то, чего человек не видит, "
+        "Окружение — другие люди и их мотивы, Чего опасаться — риск, Совет — действие, Итог — исход).\n"
         "synthesis — 80-120 слов. answer — 50-90 слов. advice — 3-4 пункта по 10-25 слов.\n\n"
         + STRUCTURED_FORMAT
     )
     user_prompt = f"Вопрос человека: «{question}».\nДоступные карты (выбирай по номеру в квадратных скобках): {cards_str}."
-    result = await call_ai(system_prompt, user_prompt, max_tokens=6000, schema=STRUCTURED_SCHEMA,
-                           validate=_make_validator(pre_selected_cards, 6, 10))
-    if result:
-        return result
+    norm = await call_ai(system_prompt, user_prompt, max_tokens=6000, schema=STRUCTURED_SCHEMA,
+                         validate=_make_validator(pre_selected_cards, 6, 10))
+    if norm:
+        norm = await _humanize_structured(norm, question, pre_selected_cards)
+        return _build_structured(norm, pre_selected_cards)
     log("⚠️ Все AI недоступны. Переход на локальные толкования.")
     return generate_local_tarot_reading(question, pre_selected_cards, reading_type="dynamic")
 
@@ -863,14 +998,18 @@ async def generate_preset_reading(question: str, pre_selected_cards: list) -> di
         "Ты — опытный таролог, практикующий по системе Уэйта. Даёшь точные, живые ответы на жизненные вопросы.\n\n"
         "ЗАДАЧА: выбери из списка ровно 3 карты и сделай расклад с позициями «Прошлое», «Настоящее», «Будущее».\n"
         "Толкование каждой карты — 60-90 слов: классическое значение + как оно проявляется в ситуации человека.\n"
+        "Ракурсы позиций: «Прошлое» — что привело к ситуации и что из этого до сих пор влияет; "
+        "«Настоящее» — что происходит сейчас, что чувствуют и делают участники; "
+        "«Будущее» — к чему всё идёт, если ничего не менять.\n"
         "synthesis — 60-90 слов. answer — 40-80 слов. advice — 3 пункта по 10-25 слов.\n\n"
         + STRUCTURED_FORMAT
     )
     user_prompt = f"Вопрос: «{question}».\nДоступные карты (выбирай по номеру в квадратных скобках): {cards_str}."
-    result = await call_ai(system_prompt, user_prompt, max_tokens=3500, schema=STRUCTURED_SCHEMA,
-                           validate=_make_validator(pre_selected_cards, 3, 3))
-    if result:
-        return result
+    norm = await call_ai(system_prompt, user_prompt, max_tokens=3500, schema=STRUCTURED_SCHEMA,
+                         validate=_make_validator(pre_selected_cards, 3, 3))
+    if norm:
+        norm = await _humanize_structured(norm, question, pre_selected_cards)
+        return _build_structured(norm, pre_selected_cards)
     log("⚠️ Все AI недоступны для стандартного разбора. Локальные толкования.")
     return generate_local_tarot_reading(question, pre_selected_cards)
 
@@ -916,13 +1055,17 @@ def _quick_validator(pre_selected_cards: list):
         answer = clean_ai_text(str(parsed.get("answer") or "")).strip()
         if not used or len(answer) < 20:
             return None
-        parts = [f"**✨ Ответ карт**\n{answer}"]
-        for i in used:
-            name = pre_selected_cards[i]["name"].replace("Старший Аркан: ", "")
-            title = f"**🃏 {name}**" if i == 0 else f"**🔎 Уточнение — {name}**"
-            parts.append(f"{title}\n{by_idx[i]}")
-        return {"cards_used_indices": used, "reading": "\n\n".join(parts)}
+        return {"answer": answer, "cards": [(i, by_idx[i]) for i in used]}
     return validate
+
+
+def _build_quick(norm: dict, pre_selected_cards: list) -> dict:
+    parts = [f"**✨ Ответ карт**\n{norm['answer']}"]
+    for i, meaning in norm["cards"]:
+        name = _card_name(pre_selected_cards[i])
+        title = f"**🃏 {name}**" if i == 0 else f"**🔎 Уточнение — {name}**"
+        parts.append(f"{title}\n{meaning}")
+    return {"cards_used_indices": [i for i, _ in norm["cards"]], "reading": "\n\n".join(parts)}
 
 
 async def generate_quick_reading(question: str, pre_selected_cards: list) -> dict:
@@ -933,13 +1076,14 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
         "как в живой переписке.\n\n"
         "КАРТЫ ВЫТЯНУТЫ ПО ПОРЯДКУ:\n"
         "• [0] — главная карта, она отвечает на вопрос. Используй её всегда.\n"
+        "• У каждой карты свой ракурс на ВСЮ ситуацию: [0] — суть и ответ; [1] — то, чего человек не видит "
+        "(скрытые мотивы, чувства другого человека, препятствие); [2] — к чему всё ведёт и что сделать.\n"
         "• [1] и [2] — уточняющие. Бери [1] только если главная карта неоднозначна для этого вопроса "
         "(например, вопрос «да/нет», а карта не даёт ясного ответа) или вопрос двусоставный. "
         "[2] — только если и после [1] ответ неясен. В большинстве случаев хватает одной карты.\n"
         "• Уточняющие карты добавляй строго по порядку: нельзя взять [2] без [1].\n\n"
         "ДЛИНА:\n"
-        "• answer — прямой ответ на вопрос: 25–50 слов. Да / скорее да / пока нет / зависит от… — и почему, "
-        "без воды. Если в вопросе есть имена — обращайся к человеку по имени и называй того, о ком спрашивают.\n"
+        "• answer — прямой ответ на вопрос: 25–50 слов, без воды. Если в вопросе есть имена — обращайся к человеку по имени и называй того, о ком спрашивают.\n"
         "• Если указана дата рождения — учти знак зодиака одной короткой фразой в answer, без отдельного гороскопа.\n"
         "• meaning главной карты — 35–60 слов: что карта говорит именно про этот вопрос.\n"
         "• meaning уточняющей карты — 20–40 слов: что она добавляет к ответу.\n\n"
@@ -950,13 +1094,21 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
         '{"cards": [{"index": 0, "meaning": "..."}], "answer": "..."}\n\n'
         "• Только **жирный** Markdown, без HTML и заголовков #. Не повторяй название карты в начале meaning.\n"
         "• Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм'. Обращайся на «ты», тепло и живо.\n\n"
-        + HUMAN_STYLE
+        + ANGLES_RULE + "\n\n" + ANSWER_RULE + "\n\n" + HUMAN_STYLE
     )
     user_prompt = f"Вопрос: «{question}».\nКарты по порядку вытягивания: {cards_str}."
-    result = await call_ai(system_prompt, user_prompt, max_tokens=1500, schema=QUICK_SCHEMA,
-                           validate=_quick_validator(pre_selected_cards))
-    if result:
-        return result
+    norm = await call_ai(system_prompt, user_prompt, max_tokens=1500, schema=QUICK_SCHEMA,
+                         validate=_quick_validator(pre_selected_cards))
+    if norm:
+        fields = {"answer": norm["answer"]}
+        labels = {"answer": "Ответ на вопрос"}
+        for n, (i, meaning) in enumerate(norm["cards"]):
+            fields[f"card_{n}"] = meaning
+            labels[f"card_{n}"] = ("Главная карта — " if i == 0 else "Уточняющая карта — ") + _card_name(pre_selected_cards[i])
+        new = await humanize_fields(fields, labels, question)
+        norm = {"answer": new["answer"],
+                "cards": [(i, new[f"card_{n}"]) for n, (i, _) in enumerate(norm["cards"])]}
+        return _build_quick(norm, pre_selected_cards)
     log("⚠️ Все AI недоступны для быстрого ответа. Локальное толкование.")
     card = pre_selected_cards[0]
     name = card["name"].replace("Старший Аркан: ", "")
@@ -1012,7 +1164,10 @@ async def generate_daily_reading(pre_selected_cards: list) -> dict:
 
     result = await call_ai(system_prompt, user_prompt, max_tokens=1800)
     if result:
-        result["reading"] = _clean_daily_text(result.get("reading", ""))
+        text = _clean_daily_text(result.get("reading", ""))
+        new = await humanize_fields({"reading": text}, {"reading": "Толкование Карты Дня"}, "",
+                                    keep_bold=True)
+        result["reading"] = new["reading"]
         return result
 
     return generate_local_tarot_reading("", pre_selected_cards, reading_type="daily")
