@@ -68,13 +68,15 @@ SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@backoffice_media").strip()  # �
 # Экономика
 COST_PRESET = 150
 COST_AI = 750
+COST_QUICK = int(os.getenv("COST_QUICK", "50"))  # Быстрый ответ: 1 карта (+1–2 уточняющие при необходимости)
 REF_BONUS = int(os.getenv("REF_BONUS", "150"))
 FREE_READINGS_ON_START = 1
 PACKS = {
     # id: (энергия, цена в Stars, цена для первой покупки, заголовок, описание)
-    "pack_150": (150, 150, int(os.getenv("FIRST_PURCHASE_PRICE", "99")), "+150 Энергии", "1 Стандартный разбор — расклад на 3 карты по вашему вопросу."),
-    "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", "3 Стандартных разбора по выгодной цене."),
-    "pack_750": (750, 750, 750, "+750 Энергии", "1 Индивидуальный разбор — глубокий анализ от 6 до 10 карт."),
+    "pack_50": (50, 50, 50, "+50 Энергии", "1 Быстрый ответ — короткий ответ карт на ваш вопрос."),
+    "pack_150": (150, 150, int(os.getenv("FIRST_PURCHASE_PRICE", "99")), "+150 Энергии", "1 Стандартный разбор (3 карты) или 3 Быстрых ответа."),
+    "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", "3 Стандартных разбора или 9 Быстрых ответов по выгодной цене."),
+    "pack_750": (750, 750, 750, "+750 Энергии", "1 Индивидуальный разбор (6–10 карт) или 15 Быстрых ответов."),
 }
 
 # Оплата картой через Tribute (Shop API). Без TRIBUTE_API_KEY кнопка «Картой» скрыта.
@@ -873,6 +875,96 @@ async def generate_preset_reading(question: str, pre_selected_cards: list) -> di
     return generate_local_tarot_reading(question, pre_selected_cards)
 
 
+# ---------------------------------------------------------------------
+# Быстрый ответ: одна карта, при необходимости 1–2 уточняющие.
+# Карты тянутся по порядку: [0] — главная, [1] и [2] — уточнения.
+# ---------------------------------------------------------------------
+QUICK_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "cards": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "index": {"type": "INTEGER"}, "meaning": {"type": "STRING"}},
+            "required": ["index", "meaning"]}},
+        "answer": {"type": "STRING"},
+    },
+    "required": ["cards", "answer"],
+}
+
+
+def _quick_validator(pre_selected_cards: list):
+    def validate(parsed: dict) -> Optional[dict]:
+        raw_cards = parsed.get("cards")
+        if not isinstance(raw_cards, list):
+            return None
+        by_idx = {}
+        for c in raw_cards:
+            if not isinstance(c, dict):
+                continue
+            try:
+                idx = int(c.get("index"))
+            except (TypeError, ValueError):
+                continue
+            meaning = clean_ai_text(str(c.get("meaning") or "")).strip()
+            if 0 <= idx < len(pre_selected_cards) and idx not in by_idx and len(meaning) >= 25:
+                by_idx[idx] = meaning
+        # карты идут строго по порядку вытягивания: 0, затем 1, затем 2
+        used = []
+        for i in range(min(3, len(pre_selected_cards))):
+            if i not in by_idx:
+                break
+            used.append(i)
+        answer = clean_ai_text(str(parsed.get("answer") or "")).strip()
+        if not used or len(answer) < 20:
+            return None
+        parts = [f"**✨ Ответ карт**\n{answer}"]
+        for i in used:
+            name = pre_selected_cards[i]["name"].replace("Старший Аркан: ", "")
+            title = f"**🃏 {name}**" if i == 0 else f"**🔎 Уточнение — {name}**"
+            parts.append(f"{title}\n{by_idx[i]}")
+        return {"cards_used_indices": used, "reading": "\n\n".join(parts)}
+    return validate
+
+
+async def generate_quick_reading(question: str, pre_selected_cards: list) -> dict:
+    """Быстрый ответ — короткий ответ по одной карте, 2–3 карты только если первая неоднозначна."""
+    cards_str = ", ".join([f"[{i}] {c['name']}" for i, c in enumerate(pre_selected_cards)])
+    system_prompt = (
+        "Ты — опытный таролог, практикующий по системе Уэйта. Отвечаешь на вопрос быстро, коротко и по делу, "
+        "как в живой переписке.\n\n"
+        "КАРТЫ ВЫТЯНУТЫ ПО ПОРЯДКУ:\n"
+        "• [0] — главная карта, она отвечает на вопрос. Используй её всегда.\n"
+        "• [1] и [2] — уточняющие. Бери [1] только если главная карта неоднозначна для этого вопроса "
+        "(например, вопрос «да/нет», а карта не даёт ясного ответа) или вопрос двусоставный. "
+        "[2] — только если и после [1] ответ неясен. В большинстве случаев хватает одной карты.\n"
+        "• Уточняющие карты добавляй строго по порядку: нельзя взять [2] без [1].\n\n"
+        "ДЛИНА:\n"
+        "• answer — прямой ответ на вопрос: 25–50 слов. Да / скорее да / пока нет / зависит от… — и почему, "
+        "без воды. Если в вопросе есть имена — обращайся к человеку по имени и называй того, о ком спрашивают.\n"
+        "• meaning главной карты — 35–60 слов: что карта говорит именно про этот вопрос.\n"
+        "• meaning уточняющей карты — 20–40 слов: что она добавляет к ответу.\n\n"
+        "ДЕЛИКАТНЫЕ ВОПРОСЫ: не предсказывай смерть, сроки жизни, болезни и диагнозы, беременность, "
+        "исход суда. На такой вопрос мягко скажи, что карты не отвечают на него, и ответь на то, что они "
+        "могут показать: состояние человека, отношения, что важно сейчас.\n\n"
+        "ФОРМАТ — строго JSON (без markdown-блоков):\n"
+        '{"cards": [{"index": 0, "meaning": "..."}], "answer": "..."}\n\n'
+        "• Только **жирный** Markdown, без HTML и заголовков #. Не повторяй название карты в начале meaning.\n"
+        "• Никогда не используй слова 'нейросеть', 'ИИ', 'алгоритм'. Обращайся на «ты», тепло и живо.\n\n"
+        + HUMAN_STYLE
+    )
+    user_prompt = f"Вопрос: «{question}».\nКарты по порядку вытягивания: {cards_str}."
+    result = await call_ai(system_prompt, user_prompt, max_tokens=1500, schema=QUICK_SCHEMA,
+                           validate=_quick_validator(pre_selected_cards))
+    if result:
+        return result
+    log("⚠️ Все AI недоступны для быстрого ответа. Локальное толкование.")
+    card = pre_selected_cards[0]
+    name = card["name"].replace("Старший Аркан: ", "")
+    text = (f"**✨ Ответ карт**\nКарта не даёт жёсткого «да» или «нет»: исход зависит от твоих шагов "
+            f"в ближайшее время. Прислушайся к её совету.\n\n"
+            f"**🃏 {name}**\n{get_rich_card_meaning(card['name'], 'present')}")
+    return {"cards_used_indices": [0], "reading": text}
+
+
 _DAILY_LABEL_RE = re.compile(r"^[ \t]*\**[ \t]*Основное толкование[ \t]*\**[ \t]*:?[ \t]*\**[ \t]*", re.IGNORECASE | re.MULTILINE)
 
 
@@ -1007,8 +1099,12 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
 
 def energy_reminder(balance: int) -> str:
     """Строка о балансе для еженедельной рассылки — только если энергии хватает хотя бы на один разбор."""
-    if balance < COST_PRESET:
+    if balance < COST_QUICK:
         return ""
+    if balance < COST_PRESET:
+        q = balance // COST_QUICK
+        return (f"\n\n✨ У тебя осталось {balance} Энергии — хватит на {q} "
+                f"{_plural(q, 'Быстрый ответ', 'Быстрых ответа', 'Быстрых ответов')}. Задай вопрос картам!")
     n = balance // COST_PRESET
     std = f"{n} {_plural(n, 'Стандартный разбор', 'Стандартных разбора', 'Стандартных разборов')}"
     if balance >= COST_AI:
@@ -1129,6 +1225,7 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "ref_count": user.get("ref_count") or 0,
         "ref_bonus": REF_BONUS,
         "first_purchase": (user.get("purchases") or 0) == 0,
+        "costs": {"quick": COST_QUICK, "preset": COST_PRESET, "ai": COST_AI},
         "prices": {k: (v[2] if (user.get("purchases") or 0) == 0 else v[1]) for k, v in PACKS.items()},
         "card_enabled": bool(TRIBUTE_API_KEY),
         "card_currency": TRIBUTE_CURRENCY_SIGN,
@@ -1188,6 +1285,33 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
         "new_balance": 99999 if admin else fresh["balance"],
         "free_readings": fresh.get("free_readings") or 0,
         "used_free": mode == "free",
+    }
+
+
+@app.post("/api/user/use-quick-reading")
+async def use_quick_reading(payload: dict, authorization: str = Header(None)):
+    """Быстрый ответ — COST_QUICK энергии (по умолчанию 50): 1 карта, при необходимости 2–3."""
+    user, admin = await auth_user(authorization)
+    question = _question(payload)
+    uid = user["telegram_id"]
+    mode = "admin" if admin else await charge(uid, COST_QUICK, allow_free=False)
+
+    try:
+        pre_selected = random.sample(get_tarot_deck(), 3)
+        result_data = await generate_quick_reading(question, pre_selected)
+    except Exception as e:
+        log(f"quick error: {e}")
+        await refund(uid, mode, COST_QUICK)
+        raise HTTPException(status_code=500, detail="Не получилось сделать расклад. Энергия возвращена.")
+
+    used = [i for i in result_data.get("cards_used_indices", []) if isinstance(i, int) and 0 <= i < 3]
+    used = list(dict.fromkeys(used)) or [0]
+    fresh = await get_user(uid)
+    return {
+        "success": True,
+        "cards": [pre_selected[i] for i in used],
+        "text": result_data.get("reading", ""),
+        "new_balance": 99999 if admin else fresh["balance"],
     }
 
 
@@ -1515,6 +1639,7 @@ async def cmd_start(message: Message, command: CommandObject):
     elif (user.get("free_readings") or 0) > 0:
         lines.append("🎁 У тебя есть бесплатный расклад на 3 карты.")
     lines += ["🃏 Карта Дня — бесплатно каждый день.",
+              f"⚡ Быстрый ответ на любой вопрос — {COST_QUICK} Энергии.",
               "🎴 Стандартный и 🔮 Индивидуальный разборы — за Энергию.", "",
               "Жми кнопку ниже 👇"]
     await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
