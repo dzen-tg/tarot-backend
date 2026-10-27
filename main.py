@@ -65,6 +65,10 @@ PUSH_ENABLED = os.getenv("PUSH_ENABLED", "1") == "1"
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/poslanie_taro_tg").strip()
 # Контакт поддержки для /support и /paysupport (обязательные команды для ботов с оплатой Stars)
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@backoffice_media").strip()  # пусто — кнопка канала скрыта
+# Куда пересылать отзывы: ID чата/группы. Пусто — всем из ADMIN_IDS.
+FEEDBACK_CHAT_ID = os.getenv("FEEDBACK_CHAT_ID", "").strip()
+FEEDBACK_KINDS = {"review": "⭐ Отзыв", "idea": "💡 Идея", "bug": "🛠 Что-то не работает"}
+FEEDBACK_LIMIT_PER_HOUR = 3
 
 # Экономика
 COST_PRESET = 150
@@ -335,6 +339,7 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_push_date VARCHAR(10) DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_news VARCHAR(32) DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_notified BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_reminded_at TIMESTAMP DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS move_gift_state VARCHAR(10) DEFAULT NULL",  # got / pending / given
@@ -362,6 +367,33 @@ async def init_schema():
                 status VARCHAR(16) DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 paid_at TIMESTAMP DEFAULT NULL
+            );
+        """)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);
+        """)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS reading_ratings (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                kind VARCHAR(16) NOT NULL,
+                value SMALLINT NOT NULL,
+                question TEXT,
+                cards TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                username VARCHAR(255),
+                kind VARCHAR(16) NOT NULL,
+                rating SMALLINT,
+                text TEXT NOT NULL,
+                source VARCHAR(16) DEFAULT 'app',
+                replied BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
@@ -1256,6 +1288,7 @@ async def setup_bot():
             BotCommand(command="start", description="🔮 Открыть Послание Таро"),
             BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
             BotCommand(command="stop", description="🔕 Отключить напоминания"),
+            BotCommand(command="feedback", description="✍️ Отзыв или идея"),
             BotCommand(command="support", description="💬 Поддержка"),
             BotCommand(command="paysupport", description="💳 Вопросы по оплате"),
             BotCommand(command="terms", description="📜 Условия использования"),
@@ -1397,6 +1430,7 @@ async def lifespan(_app: FastAPI):
         asyncio.create_task(keepalive_loop()),
         asyncio.create_task(push_loop()),
         asyncio.create_task(load_tribute_products()),
+        asyncio.create_task(news_scheduler()),
     ]
     yield
     for t in tasks:
@@ -1405,6 +1439,45 @@ async def lifespan(_app: FastAPI):
     if pool:
         await pool.close()
     await bot.session.close()
+
+
+# ── Отзывы и предложения ──────────────────────────────────────────────────
+def feedback_recipients() -> list:
+    if FEEDBACK_CHAT_ID.lstrip("-").isdigit():
+        return [int(FEEDBACK_CHAT_ID)]
+    return sorted(ADMIN_IDS)
+
+
+async def save_feedback(uid: int, username: Optional[str], kind: str, rating: Optional[int],
+                        text: str, source: str) -> int:
+    """Сохраняет отзыв и пересылает его админам. Пользователь видит только «Спасибо»."""
+    text = (text or "").strip()[:2000]
+    if kind not in FEEDBACK_KINDS:
+        kind = "idea"
+    if not (isinstance(rating, int) and 1 <= rating <= 5) or kind != "review":
+        rating = None
+    p = await db()
+    recent = await p.fetchval(
+        "SELECT COUNT(*) FROM feedback WHERE telegram_id = $1 AND created_at > NOW() - INTERVAL '1 hour'", uid)
+    if recent >= FEEDBACK_LIMIT_PER_HOUR:
+        raise HTTPException(status_code=429, detail="Вы уже отправили несколько сообщений. Попробуйте чуть позже 🙏")
+    fb_id = await p.fetchval("""
+        INSERT INTO feedback (telegram_id, username, kind, rating, text, source)
+        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+    """, uid, username, kind, rating, text, source)
+    u = await p.fetchrow("SELECT balance, purchases FROM users WHERE telegram_id = $1", uid)
+    who = f"@{username}" if username else f"id {uid}"
+    stats = f"баланс {u['balance']}, покупок {u['purchases'] or 0}" if u else "нет в базе"
+    stars = f" {'★' * rating}{'☆' * (5 - rating)}" if rating else ""
+    msg = (f"{FEEDBACK_KINDS[kind]}{stars} #fb{fb_id}\n"
+           f"От: {who} ({stats})\n\n{text}\n\n"
+           "↩️ Ответьте реплаем на это сообщение — бот перешлёт ответ пользователю.")
+    for chat in feedback_recipients():
+        try:
+            await bot.send_message(chat, msg)
+        except Exception as e:
+            log(f"Отзыв #{fb_id}: не удалось отправить в {chat}: {e}")
+    return fb_id
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1456,6 +1529,42 @@ def profile_payload(user: dict, admin: bool) -> dict:
 def card_price(pack: str, user: dict) -> int:
     """Картой — всегда полная цена, скидка первой покупки только для Stars."""
     return CARD_PRICES[pack]
+
+
+READING_KINDS = {"daily": "🃏 Карта дня", "quick": "⚡ Быстрый ответ", "preset": "🎴 Стандартный", "ai": "🔮 Индивидуальный"}
+
+
+@app.post("/api/reading-rating")
+async def api_reading_rating(payload: dict, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    kind = str(payload.get("kind") or "")
+    value = 1 if str(payload.get("value")) == "1" else -1
+    if kind not in READING_KINDS:
+        raise HTTPException(status_code=400, detail="bad kind")
+    p = await db()
+    # не больше 30 оценок в час от одного человека
+    recent = await p.fetchval("SELECT COUNT(*) FROM reading_ratings WHERE telegram_id = $1 "
+                              "AND created_at > NOW() - INTERVAL '1 hour'", user["telegram_id"])
+    if recent < 30:
+        await p.execute("""
+            INSERT INTO reading_ratings (telegram_id, kind, value, question, cards)
+            VALUES ($1, $2, $3, $4, $5)
+        """, user["telegram_id"], kind, value,
+            str(payload.get("question") or "")[:500], str(payload.get("cards") or "")[:300])
+    return {"ok": True}
+
+
+@app.post("/api/feedback")
+async def api_feedback(payload: dict, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    text = str(payload.get("text") or "").strip()
+    if len(text) < 3:
+        raise HTTPException(status_code=400, detail="Напишите хотя бы пару слов 🙂")
+    rating = payload.get("rating")
+    rating = int(rating) if str(rating).isdigit() else None
+    await save_feedback(user["telegram_id"], user.get("username"), str(payload.get("kind") or "idea"),
+                        rating, text, "app")
+    return {"ok": True}
 
 
 @app.get("/api/user/profile")
@@ -1976,6 +2085,7 @@ async def notify_referrer(referrer_id: int, friend_name: Optional[str]):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
+    feedback_waiting.pop(message.from_user.id, None)
     u = message.from_user
     tg_user = {"id": u.id, "first_name": u.first_name, "username": u.username}
     try:
@@ -2199,3 +2309,253 @@ async def process_successful_payment(message: Message):
                 return  # повторная доставка того же платежа — уже зачислено
             await c.execute("UPDATE users SET balance = balance + $2, purchases = purchases + 1 WHERE telegram_id = $1", uid, energy)
     await message.answer(f"🔮 Оплата успешна! Зачислено +{energy} Энергии.", reply_markup=webapp_kb())
+
+
+# ── Отзывы через бота: /feedback ──────────────────────────────────────────
+feedback_waiting: dict = {}  # telegram_id → до какого времени ждём текст отзыва
+
+
+def _is_admin_msg(message: Message) -> bool:
+    u = message.from_user
+    return bool(u) and (u.id in ADMIN_IDS or (u.username or "").lower() in ADMIN_USERNAMES)
+
+
+@dp.message(Command("feedback"))
+async def cmd_feedback(message: Message, command: CommandObject):
+    u = message.from_user
+    if command.args and len(command.args.strip()) >= 3:
+        try:
+            await save_feedback(u.id, u.username, "idea", None, command.args, "bot")
+            await message.answer("🙏 Спасибо! Ваше сообщение получено, мы обязательно его прочитаем.")
+        except HTTPException as e:
+            await message.answer(e.detail)
+        return
+    feedback_waiting[u.id] = time.time() + 600
+    await message.answer(
+        "✍️ Напишите одним сообщением отзыв, идею или что работает не так — мы прочитаем всё.\n\n"
+        "Передумали? Просто отправьте /start.")
+
+
+@dp.message(F.reply_to_message & F.text, _is_admin_msg)
+async def admin_feedback_reply(message: Message):
+    """Админ отвечает реплаем на пересланный отзыв — ответ уходит пользователю."""
+    found = re.search(r"#fb(\d+)", message.reply_to_message.text or "")
+    if not found:
+        return
+    fb_id = int(found.group(1))
+    p = await db()
+    uid = await p.fetchval("SELECT telegram_id FROM feedback WHERE id = $1", fb_id)
+    if not uid:
+        await message.reply("Отзыв не найден.")
+        return
+    try:
+        await bot.send_message(uid, f"💬 Ответ на ваше сообщение:\n\n{message.text}", reply_markup=webapp_kb())
+        await p.execute("UPDATE feedback SET replied = TRUE WHERE id = $1", fb_id)
+        await message.reply("✅ Ответ отправлен.")
+    except Exception as e:
+        await message.reply(f"Не удалось отправить: {e}")
+
+
+@dp.message(F.text & ~F.text.startswith("/"), lambda m: feedback_waiting.get(m.from_user.id, 0) > time.time())
+async def feedback_text(message: Message):
+    u = message.from_user
+    feedback_waiting.pop(u.id, None)
+    try:
+        await save_feedback(u.id, u.username, "idea", None, message.text, "bot")
+        await message.answer("🙏 Спасибо! Ваше сообщение получено, мы обязательно его прочитаем.",
+                             reply_markup=webapp_kb())
+    except HTTPException as e:
+        await message.answer(e.detail)
+
+
+# ── Статистика оценок раскладов: /ratings [дней] (только для админов) ─────
+@dp.message(Command("ratings"))
+async def cmd_ratings(message: Message, command: CommandObject):
+    if not _is_admin_msg(message):
+        return
+    days = int(command.args) if command.args and command.args.strip().isdigit() else 7
+    p = await db()
+    rows = await p.fetch("""
+        SELECT kind, COUNT(*) FILTER (WHERE value > 0) AS up, COUNT(*) FILTER (WHERE value < 0) AS down
+        FROM reading_ratings WHERE created_at > NOW() - make_interval(days => $1)
+        GROUP BY kind
+    """, days)
+    lines = [f"📊 Оценки раскладов за {days} дн.\n"]
+    tu = td = 0
+    for kind, title in READING_KINDS.items():
+        r = next((x for x in rows if x["kind"] == kind), None)
+        up, down = (r["up"], r["down"]) if r else (0, 0)
+        tu += up; td += down
+        share = f"{round(up * 100 / (up + down))}%" if up + down else "—"
+        lines.append(f"{title}: 👍 {up} · 👎 {down} · нравится {share}")
+    total = f"{round(tu * 100 / (tu + td))}%" if tu + td else "—"
+    lines.append(f"\nВсего: 👍 {tu} · 👎 {td} · нравится {total}")
+    bad = await p.fetch("""
+        SELECT kind, question, cards, created_at FROM reading_ratings
+        WHERE value < 0 AND created_at > NOW() - make_interval(days => $1)
+        ORDER BY created_at DESC LIMIT 5
+    """, days)
+    if bad:
+        lines.append("\nПоследние 👎:")
+        for b in bad:
+            q = (b["question"] or "без вопроса")[:120]
+            lines.append(f"• {READING_KINDS.get(b['kind'], b['kind'])} {b['created_at']:%d.%m %H:%M} — «{q}» ({b['cards'] or '—'})")
+    lines.append("\nДругой период: /ratings 30")
+    await message.answer("\n".join(lines))
+
+
+# ── Рассылка новостей: /news (превью себе) и /news go (всем) ──────────────
+NEWS_ID = "2026-10-28-card-feedback"   # поменяй для следующей рассылки, чтобы она ушла заново
+news_running = False
+
+
+def news_text(name: str, balance: int, free_readings: int) -> str:
+    text = (
+        f"✨ {name}, у Послания Таро обновления!\n\n"
+        "💳 Энергию теперь можно купить не только за звёзды, но и картой. "
+        "Выбирай способ оплаты в магазине.\n\n"
+        "💬 Появилась кнопка «Отзыв или идея». Напиши, что нравится, чего не хватает "
+        "или что работает не так. Мы читаем каждое сообщение.\n\n"
+        "👍 После расклада можно отметить, откликнулся ли он. Так ответы карт будут становиться точнее."
+    )
+    if balance >= COST_QUICK:
+        if balance >= COST_PRESET:
+            n = balance // COST_PRESET
+            what = f"{n} {_plural(n, 'Стандартный разбор', 'Стандартных разбора', 'Стандартных разборов')}"
+            if balance >= COST_AI:
+                what = f"🔮 Индивидуальный разбор или {what}"
+        else:
+            q = balance // COST_QUICK
+            what = f"{q} {_plural(q, 'Быстрый ответ', 'Быстрых ответа', 'Быстрых ответов')}"
+        text += (f"\n\n🔮 У тебя на балансе {balance} Энергии, этого хватит на {what}. "
+                 "Заходи и задай картам свой вопрос!")
+    elif free_readings > 0:
+        text += "\n\n🎁 А ещё тебя ждёт бесплатный Быстрый ответ. Заходи и задай картам свой вопрос!"
+    else:
+        text += "\n\n🃏 Заходи за бесплатной Картой дня, она уже ждёт тебя."
+    return text
+
+
+async def run_news_broadcast(admin_chat: int):
+    global news_running
+    news_running = True
+    p = await db()
+    sent = failed = 0
+    today = get_today_str()
+    try:
+        while True:
+            rows = await p.fetch("""
+                SELECT telegram_id, first_name, balance, free_readings FROM users
+                WHERE notify AND NOT blocked AND last_news IS DISTINCT FROM $1
+                LIMIT 200
+            """, NEWS_ID)
+            if not rows:
+                break
+            for r in rows:
+                uid = r["telegram_id"]
+                # отмечаем сразу: при перезапуске второй раз не отправим. Ежедневный пуш сегодня тоже не нужен.
+                await p.execute("UPDATE users SET last_news = $2, last_push_date = $3 WHERE telegram_id = $1",
+                                uid, NEWS_ID, today)
+                text = news_text(r["first_name"] or "Искатель", r["balance"] or 0, r["free_readings"] or 0)
+                for attempt in range(2):
+                    try:
+                        await bot.send_message(uid, text, reply_markup=webapp_kb("🔮 Открыть Послание Таро"))
+                        sent += 1
+                        break
+                    except TelegramRetryAfter as e:
+                        await asyncio.sleep(e.retry_after + 1)
+                    except (TelegramForbiddenError, TelegramBadRequest):
+                        await p.execute("UPDATE users SET blocked = TRUE WHERE telegram_id = $1", uid)
+                        failed += 1
+                        break
+                    except Exception as e:
+                        log(f"news {uid}: {e}")
+                        failed += 1
+                        break
+                await asyncio.sleep(0.05)
+    finally:
+        news_running = False
+    await bot.send_message(admin_chat, f"✅ Рассылка завершена. Доставлено: {sent}. Не доставлено: {failed}.")
+
+
+# Время для /news at — по Алматы (UTC+5). Для Москвы поставь NEWS_UTC_OFFSET=3 в Render.
+NEWS_TZ = timezone(timedelta(hours=int(os.getenv("NEWS_UTC_OFFSET", "5"))))
+
+
+async def news_scheduler():
+    """Раз в 30 сек проверяет, не пора ли запустить запланированную рассылку.
+    План хранится в базе, поэтому переживает перезапуск Render."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            if not pool_ready.is_set() or news_running:
+                continue
+            p = await db()
+            row = await p.fetchrow("SELECT value FROM bot_settings WHERE key = 'news_at'")
+            if not row:
+                continue
+            at_iso, chat = row["value"].split("|")
+            if datetime.now(timezone.utc) >= datetime.fromisoformat(at_iso):
+                await p.execute("DELETE FROM bot_settings WHERE key = 'news_at'")
+                log("📨 Запускаю запланированную рассылку")
+                try:
+                    await bot.send_message(int(chat), "📨 Время пришло, начинаю рассылку.")
+                except Exception:
+                    pass
+                asyncio.create_task(run_news_broadcast(int(chat)))
+        except Exception as e:
+            log(f"news_scheduler: {e}")
+
+
+@dp.message(Command("news"))
+async def cmd_news(message: Message, command: CommandObject):
+    """/news — превью и статус; /news go — сейчас; /news at 13:00 — по расписанию; /news cancel — отменить план."""
+    if not _is_admin_msg(message):
+        return
+    p = await db()
+    arg = (command.args or "").strip().lower()
+    if arg == "go":
+        if news_running:
+            await message.answer("Рассылка уже идёт.")
+            return
+        await message.answer("📨 Начинаю рассылку. Пришлю итог, когда закончу.")
+        asyncio.create_task(run_news_broadcast(message.chat.id))
+        return
+    if arg.startswith("at"):
+        t = re.match(r"at\s+(\d{1,2})[:.](\d{2})$", arg)
+        if not t or int(t.group(1)) > 23 or int(t.group(2)) > 59:
+            await message.answer("Формат: /news at 13:00")
+            return
+        now = datetime.now(NEWS_TZ)
+        at = now.replace(hour=int(t.group(1)), minute=int(t.group(2)), second=0, microsecond=0)
+        if at <= now:
+            at += timedelta(days=1)
+        await p.execute("""
+            INSERT INTO bot_settings (key, value) VALUES ('news_at', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, f"{at.astimezone(timezone.utc).isoformat()}|{message.chat.id}")
+        day = "сегодня" if at.date() == now.date() else "завтра"
+        await message.answer(f"⏰ Рассылка запланирована на {day}, {at:%d.%m} в {at:%H:%M} "
+                             f"(UTC+{int(NEWS_TZ.utcoffset(None).total_seconds() // 3600)}).\n"
+                             "Отменить: /news cancel")
+        return
+    if arg == "cancel":
+        await p.execute("DELETE FROM bot_settings WHERE key = 'news_at'")
+        await message.answer("❌ Запланированная рассылка отменена.")
+        return
+    me = await p.fetchrow("SELECT first_name FROM users WHERE telegram_id = $1", message.from_user.id)
+    left = await p.fetchval("SELECT COUNT(*) FROM users WHERE notify AND NOT blocked "
+                            "AND last_news IS DISTINCT FROM $1", NEWS_ID)
+    plan = await p.fetchval("SELECT value FROM bot_settings WHERE key = 'news_at'")
+    name = (me and me["first_name"]) or "Искатель"
+    await message.answer("👀 Превью (с балансом 300):\n\n" + news_text(name, 300, 0),
+                         reply_markup=webapp_kb("🔮 Открыть Послание Таро"))
+    await message.answer("👀 Превью (баланс 0, есть подарок):\n\n" + news_text(name, 0, 1))
+    await message.answer("👀 Превью (баланс 0):\n\n" + news_text(name, 0, 0))
+    status = "не запланирована"
+    if plan:
+        at = datetime.fromisoformat(plan.split("|")[0]).astimezone(NEWS_TZ)
+        status = f"запланирована на {at:%d.%m %H:%M}"
+    await message.answer(f"Получателей: {left}. Рассылка {status}.\n\n"
+                         "/news at 13:00 — запланировать\n/news go — отправить сейчас\n/news cancel — отменить план")
+
