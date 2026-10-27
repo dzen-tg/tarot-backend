@@ -396,6 +396,10 @@ async def init_schema():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        for ddl in ["ALTER TABLE feedback ADD COLUMN IF NOT EXISTS reading_kind VARCHAR(16)",
+                    "ALTER TABLE feedback ADD COLUMN IF NOT EXISTS question TEXT",
+                    "ALTER TABLE feedback ADD COLUMN IF NOT EXISTS cards TEXT"]:
+            await c.execute(ddl)
 
 
 async def db() -> asyncpg.Pool:
@@ -1449,7 +1453,7 @@ def feedback_recipients() -> list:
 
 
 async def save_feedback(uid: int, username: Optional[str], kind: str, rating: Optional[int],
-                        text: str, source: str) -> int:
+                        text: str, source: str, reading: Optional[dict] = None) -> int:
     """Сохраняет отзыв и пересылает его админам. Пользователь видит только «Спасибо»."""
     text = (text or "").strip()[:2000]
     if kind not in FEEDBACK_KINDS:
@@ -1461,16 +1465,37 @@ async def save_feedback(uid: int, username: Optional[str], kind: str, rating: Op
         "SELECT COUNT(*) FROM feedback WHERE telegram_id = $1 AND created_at > NOW() - INTERVAL '1 hour'", uid)
     if recent >= FEEDBACK_LIMIT_PER_HOUR:
         raise HTTPException(status_code=429, detail="Вы уже отправили несколько сообщений. Попробуйте чуть позже 🙏")
+    # тот же текст от того же человека за 2 минуты — дубль (двойное нажатие), не пересылаем
+    dup = await p.fetchval("""
+        SELECT id FROM feedback WHERE telegram_id = $1 AND text = $2
+          AND created_at > NOW() - INTERVAL '2 minutes' LIMIT 1
+    """, uid, text)
+    if dup:
+        return dup
+    r_kind = r_q = r_cards = None
+    if isinstance(reading, dict) and reading.get("kind") in READING_KINDS:
+        r_kind = reading["kind"]
+        r_q = str(reading.get("question") or "")[:500] or None
+        r_cards = str(reading.get("cards") or "")[:300] or None
     fb_id = await p.fetchval("""
-        INSERT INTO feedback (telegram_id, username, kind, rating, text, source)
-        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
-    """, uid, username, kind, rating, text, source)
+        INSERT INTO feedback (telegram_id, username, kind, rating, text, source, reading_kind, question, cards)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id
+    """, uid, username, kind, rating, text, source, r_kind, r_q, r_cards)
     u = await p.fetchrow("SELECT balance, purchases FROM users WHERE telegram_id = $1", uid)
     who = f"@{username}" if username else f"id {uid}"
     stats = f"баланс {u['balance']}, покупок {u['purchases'] or 0}" if u else "нет в базе"
     stars = f" {'★' * rating}{'☆' * (5 - rating)}" if rating else ""
+    about = "🧭 Откуда: общая кнопка «Отзыв или идея»"
+    if r_kind:
+        about = f"🧭 После 👎 на расклад: {READING_KINDS[r_kind]}"
+        if r_q:
+            about += f"\n❓ Вопрос: «{r_q}»"
+        if r_cards:
+            about += f"\n🃏 Карты: {r_cards}"
+    elif source == "bot":
+        about = "🧭 Откуда: команда /feedback в боте"
     msg = (f"{FEEDBACK_KINDS[kind]}{stars} #fb{fb_id}\n"
-           f"От: {who} ({stats})\n\n{text}\n\n"
+           f"От: {who} ({stats})\n{about}\n\n💬 {text}\n\n"
            "↩️ Ответьте реплаем на это сообщение — бот перешлёт ответ пользователю.")
     for chat in feedback_recipients():
         try:
@@ -1563,7 +1588,7 @@ async def api_feedback(payload: dict, authorization: str = Header(None)):
     rating = payload.get("rating")
     rating = int(rating) if str(rating).isdigit() else None
     await save_feedback(user["telegram_id"], user.get("username"), str(payload.get("kind") or "idea"),
-                        rating, text, "app")
+                        rating, text, "app", payload.get("reading"))
     return {"ok": True}
 
 
