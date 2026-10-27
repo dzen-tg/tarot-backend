@@ -284,6 +284,8 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_push_date VARCHAR(10) DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_notified BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_reminded_at TIMESTAMP DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS move_gift_state VARCHAR(10) DEFAULT NULL",  # got / pending / given
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS source VARCHAR(32) DEFAULT NULL",
         ]:
             await c.execute(ddl)
@@ -362,12 +364,20 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
                         WHERE telegram_id = $1 RETURNING *
                     """, uid, referrer, REF_BONUS)
                     credited_ref = referrer
+            move_gift = False
             if not created:
+                # Подарок за переезд, который не дошёл через старого бота, — начисляем при первом заходе в нового
+                move_gift = bool(await c.fetchval(
+                    "SELECT move_gift_state = 'pending' FROM users WHERE telegram_id = $1 FOR UPDATE", uid))
                 row = await c.fetchrow("""
-                    UPDATE users SET username = $2, first_name = $3, last_seen = NOW(), blocked = FALSE
+                    UPDATE users SET username = $2, first_name = $3, last_seen = NOW(), blocked = FALSE,
+                        balance = balance + $4,
+                        move_gift_state = CASE WHEN $5 THEN 'given' ELSE move_gift_state END
                     WHERE telegram_id = $1 RETURNING *
-                """, uid, username, first_name)
-    return dict(row), created, credited_ref
+                """, uid, username, first_name, MOVE_GIFT if move_gift else 0, move_gift)
+    result = dict(row)
+    result["_move_gift"] = move_gift
+    return result, created, credited_ref
 
 
 async def get_user(uid: int) -> Optional[dict]:
@@ -1803,6 +1813,118 @@ async def send_moved_broadcast() -> tuple:
     return sent, failed, gifted
 
 
+def moved_reminder_text(balance: int) -> str:
+    text = (f"🔮 Напоминаем: Послание Таро теперь живёт в новом боте — @{BOT_USERNAME}\n\n"
+            "Здесь, в старом боте, разборы больше не работают.")
+    if balance > 0:
+        text += f"\n\nВас уже ждут {balance} Энергии — подарок за переезд на месте."
+    return text + "\n\nНажмите кнопку ниже, а в новом боте — «Запустить»."
+
+
+async def moved_reminder_targets(cutoff: datetime) -> list:
+    """Кому напоминать: получили первое сообщение о переезде, но с даты cutoff так и не открыли нового бота
+    (last_seen обновляется только при /start в новом боте и при входе в мини-апп) и не получали напоминание последние сутки."""
+    p = await db()
+    return await p.fetch("""
+        SELECT telegram_id, balance FROM users
+        WHERE moved_notified
+          AND (last_seen IS NULL OR last_seen < $1)
+          AND (moved_reminded_at IS NULL OR moved_reminded_at < NOW() - INTERVAL '1 day')
+    """, cutoff)
+
+
+async def send_moved_reminder(cutoff: datetime) -> tuple:
+    """Повторное напоминание о переезде через старого бота. Без подарка. Возвращает (отправлено, не доставлено)."""
+    p = await db()
+    sent = failed = 0
+    for r in await moved_reminder_targets(cutoff):
+        uid = r["telegram_id"]
+        await p.execute("UPDATE users SET moved_reminded_at = NOW() WHERE telegram_id = $1", uid)
+        delivered = False
+        for attempt in range(2):
+            try:
+                await old_bot.send_message(uid, moved_reminder_text(r["balance"] or 0), reply_markup=moved_kb())
+                delivered = True
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                break  # заблокировал старого бота или никогда в нём не был
+        if delivered:
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return sent, failed
+
+
+async def missed_gift_candidates(cutoff: datetime) -> list:
+    """Пользователи старого бота (зарегистрированы до cutoff), по которым ещё не решено, дошёл ли подарок за переезд."""
+    p = await db()
+    return await p.fetch("""
+        SELECT telegram_id FROM users
+        WHERE moved_notified AND created_at < $1 AND move_gift_state IS NULL
+    """, cutoff)
+
+
+async def old_bot_reachable(uid: int) -> Optional[bool]:
+    """Может ли старый бот написать человеку. Если может — первое сообщение с подарком до него дошло.
+    None — непонятно (сбой сети), такого пропускаем и проверим при следующем запуске."""
+    for attempt in range(2):
+        try:
+            await old_bot.send_chat_action(uid, "typing")
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            return False
+        except Exception:
+            return None
+    return None
+
+
+async def send_missed_gifts(cutoff: datetime) -> tuple:
+    """Доначисляет подарок MOVE_GIFT тем, кому не дошла первая рассылка.
+    Пишем через НОВОГО бота; кто его ещё не запускал — получит подарок автоматически при первом /start.
+    Возвращает (уже получали, подарено сейчас, подарок ждёт /start, пропущено)."""
+    p = await db()
+    had = given = pending = skipped = 0
+    for r in await missed_gift_candidates(cutoff):
+        uid = r["telegram_id"]
+        reachable = await old_bot_reachable(uid)
+        if reachable is None:
+            skipped += 1
+            continue
+        if reachable:
+            await p.execute("UPDATE users SET move_gift_state = 'got' WHERE telegram_id = $1", uid)
+            had += 1
+            await asyncio.sleep(0.05)
+            continue
+        # Помечаем «ждёт», чтобы подарок не начислился дважды, а потом пробуем вручить через нового бота
+        balance = await p.fetchval("""
+            UPDATE users SET move_gift_state = 'pending' WHERE telegram_id = $1 AND move_gift_state IS NULL
+            RETURNING balance
+        """, uid)
+        if balance is None:
+            continue
+        text = (f"🔮 Послание Таро переехало в этот бот, и в честь переезда мы дарим вам +{MOVE_GIFT} Энергии ✨\n"
+                f"Теперь на балансе {balance + MOVE_GIFT} — хватит на Стандартный разбор на 3 карты.")
+        try:
+            await bot.send_message(uid, text, reply_markup=webapp_kb())
+            await p.execute("""
+                UPDATE users SET balance = balance + $2, move_gift_state = 'given'
+                WHERE telegram_id = $1 AND move_gift_state = 'pending'
+            """, uid, MOVE_GIFT)
+            given += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            pending += 1  # подарок не потеряется: начислится при /start
+        except Exception:
+            pending += 1  # нового бота ещё не запускал — подарок начислится при /start
+        await asyncio.sleep(0.05)
+    return had, given, pending, skipped
+
+
 # =====================================================================
 # БОТ: команды и платежи
 # =====================================================================
@@ -1829,6 +1951,9 @@ async def cmd_start(message: Message, command: CommandObject):
 
     lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
              "Это Послание Таро. Задай вопрос — и карты ответят.", ""]
+    if user.get("_move_gift"):
+        lines.append(f"🎁 В честь переезда в новый бот мы начислили вам +{MOVE_GIFT} Энергии ✨ "
+                     f"Теперь на балансе {user.get('balance', 0)}.")
     if created:
         lines.append("🎁 Первый Быстрый ответ — в подарок.")
         if referrer:
@@ -1888,6 +2013,70 @@ async def cmd_moved_broadcast(message: Message):
         f"✅ Готово. Сообщение и подарок +{MOVE_GIFT} получили: {gifted}.\n"
         f"Не доставлено (новые пользователи или заблокировали старого бота): {failed}."
     )
+
+
+@dp.message(Command("moved_remind"))
+async def cmd_moved_remind(message: Message, command: CommandObject):
+    """Только для админов. /moved_remind 2026-10-26 — показать, скольким уйдёт напоминание;
+    /moved_remind 2026-10-26 go — разослать. Дата — день первой рассылки о переезде:
+    кто открывал нового бота с этой даты, напоминание не получит."""
+    user = await get_user(message.from_user.id) or {"telegram_id": message.from_user.id, "username": message.from_user.username}
+    if not is_admin(user):
+        return
+    if not old_bot:
+        await message.answer("OLD_BOT_TOKEN не задан в Render — рассылать не через что.")
+        return
+    args = (command.args or "").split()
+    try:
+        cutoff = datetime.strptime(args[0], "%Y-%m-%d")
+    except (IndexError, ValueError):
+        await message.answer("Укажите дату первой рассылки о переезде:\n"
+                             "/moved_remind 2026-10-26 — посчитать, кому уйдёт\n"
+                             "/moved_remind 2026-10-26 go — отправить")
+        return
+    targets = await moved_reminder_targets(cutoff)
+    if len(args) < 2 or args[1].lower() != "go":
+        await message.answer(f"Напоминание получат {len(targets)} чел. — не открывали нового бота с {args[0]}.\n"
+                             f"Отправить: /moved_remind {args[0]} go\n\nТекст:\n\n{moved_reminder_text(150)}")
+        return
+    await message.answer(f"📨 Отправляю напоминание {len(targets)} пользователям…")
+    sent, failed = await send_moved_reminder(cutoff)
+    await message.answer(f"✅ Готово. Доставлено: {sent}. Не доставлено (заблокировали старого бота): {failed}.")
+
+
+@dp.message(Command("moved_gift"))
+async def cmd_moved_gift(message: Message, command: CommandObject):
+    """Только для админов. /moved_gift 2026-10-26 — посчитать; /moved_gift 2026-10-26 go — вручить подарок тем,
+    до кого не дошла первая рассылка. Дата — день переезда: кто зарегистрировался позже, подарок не получит."""
+    user = await get_user(message.from_user.id) or {"telegram_id": message.from_user.id, "username": message.from_user.username}
+    if not is_admin(user):
+        return
+    if not old_bot:
+        await message.answer("OLD_BOT_TOKEN не задан в Render — не через что проверить, кому дошла рассылка.")
+        return
+    args = (command.args or "").split()
+    try:
+        cutoff = datetime.strptime(args[0], "%Y-%m-%d")
+    except (IndexError, ValueError):
+        await message.answer("Укажите дату переезда:\n"
+                             "/moved_gift 2026-10-26 — посчитать\n"
+                             "/moved_gift 2026-10-26 go — вручить подарки")
+        return
+    candidates = await missed_gift_candidates(cutoff)
+    if len(args) < 2 or args[1].lower() != "go":
+        await message.answer(
+            f"Пользователей старого бота на проверку: {len(candidates)}.\n"
+            f"Кому первая рассылка дошла — пропущу, остальным начислю +{MOVE_GIFT} Энергии.\n"
+            f"Запустить: /moved_gift {args[0]} go")
+        return
+    await message.answer(f"🔎 Проверяю {len(candidates)} пользователей…")
+    had, given, pending, skipped = await send_missed_gifts(cutoff)
+    await message.answer(
+        f"✅ Готово.\n"
+        f"Уже получали подарок: {had}\n"
+        f"Подарено сейчас (написал через нового бота): {given}\n"
+        f"Ждут подарка до первого запуска нового бота: {pending}\n"
+        f"Не удалось проверить (можно запустить ещё раз): {skipped}")
 
 
 @dp.message(Command("sources"))
