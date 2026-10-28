@@ -116,12 +116,16 @@ SPREADS = {
 }
 # Второй проход «гуманизатора» для Быстрого ответа. 0 — ответ приходит быстрее, но без редактуры
 HUMANIZE_QUICK = os.getenv("HUMANIZE_QUICK", "1") == "1"
+# Описание в счёте Telegram (не может быть пустым). Без перечня услуг — их стало много.
+PACK_DESC = "Энергия для любых раскладов в Послании Таро."
 PACKS = {
     # id: (энергия, цена в Stars, цена для первой покупки, заголовок, описание)
-    "pack_75": (75, 75, 75, "+75 Энергии", "1 Быстрый ответ — короткий ответ карт на ваш вопрос."),
-    "pack_150": (150, 150, int(os.getenv("FIRST_PURCHASE_PRICE", "99")), "+150 Энергии", "1 Стандартный разбор (3 карты) или 2 Быстрых ответа."),
-    "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", "3 Стандартных разбора или 6 Быстрых ответов по выгодной цене."),
-    "pack_750": (750, 750, 750, "+750 Энергии", "1 Индивидуальный разбор (6–10 карт) или 10 Быстрых ответов."),
+    "pack_75": (75, 75, 75, "+75 Энергии", PACK_DESC),
+    "pack_150": (150, 150, int(os.getenv("FIRST_PURCHASE_PRICE", "99")), "+150 Энергии", PACK_DESC),
+    "pack_350": (350, 300, 300, "+350 Энергии (скидка 14%)", PACK_DESC),
+    "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", PACK_DESC),
+    "pack_750": (750, 600, 600, "+750 Энергии (скидка 20%)", PACK_DESC),
+    "pack_1500": (1500, 1125, 1125, "+1500 Энергии (скидка 25%)", PACK_DESC),
 }
 
 # Оплата картой через Tribute (Shop API). Без TRIBUTE_API_KEY кнопка «Картой» скрыта.
@@ -517,8 +521,8 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
                 row = await c.fetchrow("UPDATE users SET source = $2 WHERE telegram_id = $1 RETURNING *",
                                        uid, source or "ref")
             if created and referrer:
-                # Другу бонус сразу, пригласившему — когда друг вернётся во второй день или купит
-                # (credit_referrer_if_due). Так фейковые аккаунты не дают бесплатную Энергию.
+                # Другу бонус сразу, пригласившему — после первой покупки друга (credit_referrer_if_due).
+                # Так фейковые аккаунты не дают бесплатную Энергию.
                 ok = await c.fetchval("SELECT 1 FROM users WHERE telegram_id = $1", referrer)
                 if ok:
                     row = await c.fetchrow("""
@@ -596,7 +600,6 @@ async def save_reading(uid: int, kind: str, question: str, cards: list, text: st
             INSERT INTO readings (telegram_id, kind, question, cards, text)
             VALUES ($1, $2, $3, $4, $5) RETURNING id
         """, uid, kind, question or "", json.dumps(cards, ensure_ascii=False), text or "")
-        asyncio.create_task(credit_referrer_if_due(uid))
         return rid
     except Exception as e:
         log(f"save_reading {uid}: {e}")
@@ -631,16 +634,12 @@ def track(uid: int, name: str, props: Optional[dict] = None):
 
 
 async def credit_referrer_if_due(uid: int):
-    """Бонус пригласившему — когда друг сделал расклады в два разных дня или купил Энергию."""
+    """Бонус пригласившему — после первой покупки друга (Stars или картой)."""
     try:
         p = await db()
         u = await p.fetchrow("SELECT referred_by, ref_pending, purchases, first_name FROM users WHERE telegram_id = $1", uid)
-        if not u or not u["ref_pending"] or not u["referred_by"]:
+        if not u or not u["ref_pending"] or not u["referred_by"] or not (u["purchases"] or 0):
             return
-        if not (u["purchases"] or 0):
-            days = await p.fetchval("SELECT COUNT(DISTINCT created_at::date) FROM readings WHERE telegram_id = $1", uid)
-            if (days or 0) < 2:
-                return
         async with p.acquire() as c:
             async with c.transaction():
                 ref = await c.fetchval("UPDATE users SET ref_pending = FALSE WHERE telegram_id = $1 AND ref_pending "
@@ -651,7 +650,7 @@ async def credit_referrer_if_due(uid: int):
                                 ref, REF_BONUS)
         track(ref, "ref_credited", {"friend": uid})
         try:
-            await bot.send_message(ref, f"🎁 {u['first_name'] or 'Твой друг'} пользуется Посланием Таро по твоей ссылке! "
+            await bot.send_message(ref, f"🎁 {u['first_name'] or 'Твой друг'} сделал(а) первую покупку по твоей ссылке! "
                                         f"Тебе начислено +{REF_BONUS} Энергии ✨", reply_markup=webapp_kb())
         except Exception:
             pass
@@ -1955,6 +1954,8 @@ async def get_user_profile(authorization: str = Header(None)):
         track(uid, "signup", {"source": user.get("source")})
     track(uid, "app_open")
     out = profile_payload(user, is_admin(user))
+    p = await db()
+    out["ref_invited"] = await p.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
     out["today_daily_id"] = None
     if user.get("last_daily_date") == get_today_str():
         p = await db()
@@ -2637,8 +2638,8 @@ async def notify_referrer(referrer_id: int, friend_name: Optional[str]):
     try:
         await bot.send_message(
             referrer_id,
-            f"🎁 {friend_name or 'Твой друг'} пришёл(а) по твоей ссылке! Твои +{REF_BONUS} Энергии придут, "
-            "когда друг вернётся к картам ещё раз ✨",
+            f"🎁 {friend_name or 'Твой друг'} пришёл(а) по твоей ссылке! Твои +{REF_BONUS} Энергии придут "
+            "после его первой покупки ✨",
             reply_markup=webapp_kb(),
         )
     except Exception:
@@ -2685,12 +2686,13 @@ async def cmd_ref(message: Message):
     uid = message.from_user.id
     user = await get_user(uid)
     count = (user or {}).get("ref_count") or 0
+    invited = await (await db()).fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
     link = ref_link(uid)
-    share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Послание Таро в Telegram — первый ответ карт бесплатно, Карта Дня каждый день"})
+    share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Послание Таро в Telegram: первый ответ карт бесплатно, Карта Дня каждый день"})
     await message.answer(
         f"🎁 Приглашай друзей: за каждого вы оба получите +{REF_BONUS} Энергии.\n"
-        "Друг получает бонус сразу, а ты, когда он вернётся к картам во второй раз.\n\n"
-        f"Твоя ссылка:\n{link}\n\nУже пришло по ссылке: {count}",
+        "Друг получает бонус сразу, а ты после его первой покупки.\n\n"
+        f"Твоя ссылка:\n{link}\n\nПришло по ссылке: {invited}\nБонусов получено: {count}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Отправить другу", url=share)]]),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
