@@ -37,7 +37,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
-    Update, LabeledPrice, PreCheckoutQuery, Message, BotCommand,
+    Update, LabeledPrice, PreCheckoutQuery, Message, BotCommand, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, MenuButtonWebApp, MenuButtonDefault, LinkPreviewOptions,
 )
 
@@ -76,6 +76,46 @@ COST_AI = 750
 COST_QUICK = int(os.getenv("COST_QUICK", "75"))  # Быстрый ответ: ровно 1 карта
 REF_BONUS = int(os.getenv("REF_BONUS", "150"))
 FREE_READINGS_ON_START = 1
+# Стартовый подарок: кроме Быстрого ответа — первый Стандартный разбор, чтобы человек увидел полный расклад до оплаты
+FREE_PRESET_ON_START = int(os.getenv("FREE_PRESET_ON_START", "1"))
+# Уточняющая карта к уже сделанному раскладу. 25 делит без остатка все пакеты (75, 150, 450, 750).
+COST_CLARIFY = int(os.getenv("COST_CLARIFY", "25"))
+MAX_CLARIFY = int(os.getenv("MAX_CLARIFY", "3"))
+# Серия Карт Дня: на 3-й день подряд — Энергия, каждый 7-й день — бесплатный Быстрый ответ
+STREAK_ENERGY_DAY = 3
+STREAK_ENERGY = int(os.getenv("STREAK_ENERGY", "25"))
+STREAK_QUICK_EVERY = 7
+# «Сбылось?» — через сколько дней после расклада спросить, и возврат «спящих» с балансом
+FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "3"))
+WINBACK_IDLE_DAYS = int(os.getenv("WINBACK_IDLE_DAYS", "5"))
+WINBACK_REPEAT_DAYS = int(os.getenv("WINBACK_REPEAT_DAYS", "14"))
+# Подписка через Telegram Stars (30 дней, продлевается автоматически)
+SUB_PRICE = int(os.getenv("SUB_PRICE", "349"))  # 0,70 ⭐ за Энергию — на ~18% выгоднее пакета 450
+SUB_ENERGY = int(os.getenv("SUB_ENERGY", "500"))
+SUB_PERIOD = 30 * 24 * 3600  # Telegram принимает только 30 дней
+SUBS = {"sub_month": (SUB_ENERGY, SUB_PRICE, "Подписка «Послание+» на месяц",
+                      f"+{SUB_ENERGY} Энергии каждый месяц и бесплатные уточняющие карты.")}
+# Тематические расклады между Стандартным (150) и Индивидуальным (750)
+SPREADS = {
+    "yesno": {"title": "Да или нет", "emoji": "⚖️", "cost": 100,
+              "positions": ["За «да»", "За «нет»", "Итог"],
+              "desc": "3 карты: что за, что против и к чему склоняется",
+              "default_q": ""},
+    "career": {"title": "Работа и деньги", "emoji": "💼", "cost": 250,
+               "positions": ["Где ты сейчас", "Что помогает", "Что мешает", "Ближайшая перспектива"],
+               "desc": "4 карты о работе, деньгах и следующем шаге",
+               "default_q": "Что меня ждёт в работе и финансах?"},
+    "month": {"title": "Расклад на месяц", "emoji": "🌙", "cost": 250,
+              "positions": ["Первая неделя", "Вторая неделя", "Третья неделя", "Четвёртая неделя"],
+              "desc": "4 карты: по одной на каждую неделю",
+              "default_q": "Что меня ждёт в ближайший месяц?"},
+    "love": {"title": "Отношения", "emoji": "💞", "cost": 300,
+             "positions": ["Ты в этих отношениях", "Партнёр", "Что вас связывает", "Что мешает", "К чему всё идёт"],
+             "desc": "5 карт: ты, партнёр, связь, препятствия и итог",
+             "default_q": ""},
+}
+# Второй проход «гуманизатора» для Быстрого ответа. 0 — ответ приходит быстрее, но без редактуры
+HUMANIZE_QUICK = os.getenv("HUMANIZE_QUICK", "1") == "1"
 PACKS = {
     # id: (энергия, цена в Stars, цена для первой покупки, заголовок, описание)
     "pack_75": (75, 75, 75, "+75 Энергии", "1 Быстрый ответ — короткий ответ карт на ваш вопрос."),
@@ -344,8 +384,41 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS moved_reminded_at TIMESTAMP DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS move_gift_state VARCHAR(10) DEFAULT NULL",  # got / pending / given
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS source VARCHAR(32) DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_preset INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_push BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_pending BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_winback TIMESTAMP DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_until TIMESTAMP DEFAULT NULL",
         ]:
             await c.execute(ddl)
+        # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS readings (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                kind VARCHAR(16) NOT NULL,
+                question TEXT,
+                cards TEXT NOT NULL,
+                text TEXT NOT NULL,
+                clarifications TEXT NOT NULL DEFAULT '[]',
+                followup VARCHAR(8) DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await c.execute("CREATE INDEX IF NOT EXISTS readings_user_idx ON readings (telegram_id, created_at DESC)")
+        # События воронки: открыл → расклад → магазин → счёт → оплата
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                name VARCHAR(32) NOT NULL,
+                props TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await c.execute("CREATE INDEX IF NOT EXISTS events_name_idx ON events (name, created_at)")
         await c.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 charge_id TEXT PRIMARY KEY,
@@ -398,7 +471,8 @@ async def init_schema():
         """)
         for ddl in ["ALTER TABLE feedback ADD COLUMN IF NOT EXISTS reading_kind VARCHAR(16)",
                     "ALTER TABLE feedback ADD COLUMN IF NOT EXISTS question TEXT",
-                    "ALTER TABLE feedback ADD COLUMN IF NOT EXISTS cards TEXT"]:
+                    "ALTER TABLE feedback ADD COLUMN IF NOT EXISTS cards TEXT",
+                    "ALTER TABLE tribute_orders ADD COLUMN IF NOT EXISTS reading_id BIGINT DEFAULT NULL"]:
             await c.execute(ddl)
 
 
@@ -431,24 +505,24 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
     async with p.acquire() as c:
         async with c.transaction():
             row = await c.fetchrow("""
-                INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, free_readings, last_seen)
-                VALUES ($1, $2, $3, '', TRUE, 0, $4, NOW())
+                INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, free_readings,
+                                   free_preset, last_seen)
+                VALUES ($1, $2, $3, '', TRUE, 0, $4, $5, NOW())
                 ON CONFLICT (telegram_id) DO NOTHING
                 RETURNING *
-            """, uid, username, first_name, FREE_READINGS_ON_START)
+            """, uid, username, first_name, FREE_READINGS_ON_START, FREE_PRESET_ON_START)
             created = row is not None
             credited_ref = None
             if created and (source or referrer):
                 row = await c.fetchrow("UPDATE users SET source = $2 WHERE telegram_id = $1 RETURNING *",
                                        uid, source or "ref")
             if created and referrer:
-                ok = await c.fetchval("""
-                    UPDATE users SET balance = balance + $2, ref_count = ref_count + 1
-                    WHERE telegram_id = $1 RETURNING telegram_id
-                """, referrer, REF_BONUS)
+                # Другу бонус сразу, пригласившему — когда друг вернётся во второй день или купит
+                # (credit_referrer_if_due). Так фейковые аккаунты не дают бесплатную Энергию.
+                ok = await c.fetchval("SELECT 1 FROM users WHERE telegram_id = $1", referrer)
                 if ok:
                     row = await c.fetchrow("""
-                        UPDATE users SET referred_by = $2, balance = balance + $3
+                        UPDATE users SET referred_by = $2, balance = balance + $3, ref_pending = TRUE
                         WHERE telegram_id = $1 RETURNING *
                     """, uid, referrer, REF_BONUS)
                     credited_ref = referrer
@@ -479,14 +553,20 @@ async def add_balance(uid: int, delta: int) -> Optional[int]:
     return await p.fetchval("UPDATE users SET balance = GREATEST(0, balance + $2) WHERE telegram_id = $1 RETURNING balance", uid, delta)
 
 
-async def charge(uid: int, cost: int, allow_free: bool) -> str:
-    """Атомарно списывает: сначала бесплатный расклад (если разрешено), потом энергию.
-    Возвращает 'free' или 'paid'. Бросает 400, если не хватает."""
+FREE_FIELDS = {"quick": "free_readings", "preset": "free_preset"}
+
+
+async def charge(uid: int, cost: int, free: Optional[str] = None) -> str:
+    """Атомарно списывает: сначала подарок (free — 'quick' или 'preset'), потом энергию.
+    Возвращает 'free:<поле>' или 'paid'. Бросает 400, если не хватает."""
     p = await db()
-    if allow_free:
-        ok = await p.fetchval("UPDATE users SET free_readings = free_readings - 1 WHERE telegram_id = $1 AND free_readings > 0 RETURNING 1", uid)
+    col = FREE_FIELDS.get(free or "")
+    if col:
+        ok = await p.fetchval(f"UPDATE users SET {col} = {col} - 1 WHERE telegram_id = $1 AND {col} > 0 RETURNING 1", uid)
         if ok:
-            return "free"
+            return f"free:{col}"
+    if cost <= 0:
+        return "paid"
     ok = await p.fetchval("UPDATE users SET balance = balance - $2 WHERE telegram_id = $1 AND balance >= $2 RETURNING 1", uid, cost)
     if ok:
         return "paid"
@@ -495,10 +575,88 @@ async def charge(uid: int, cost: int, allow_free: bool) -> str:
 
 async def refund(uid: int, mode: str, cost: int):
     p = await db()
-    if mode == "free":
-        await p.execute("UPDATE users SET free_readings = free_readings + 1 WHERE telegram_id = $1", uid)
-    elif mode == "paid":
+    if mode.startswith("free:") and mode[5:] in FREE_FIELDS.values():
+        col = mode[5:]
+        await p.execute(f"UPDATE users SET {col} = {col} + 1 WHERE telegram_id = $1", uid)
+    elif mode == "paid" and cost > 0:
         await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, cost)
+
+
+def sub_active(user: dict) -> bool:
+    until = user.get("sub_until")
+    return bool(until and until > datetime.utcnow())
+
+
+# ── История раскладов и события воронки ───────────────────────────────────
+async def save_reading(uid: int, kind: str, question: str, cards: list, text: str) -> Optional[int]:
+    """Сохраняет расклад. Ошибка сохранения не должна ломать сам расклад — тогда вернём None."""
+    try:
+        p = await db()
+        rid = await p.fetchval("""
+            INSERT INTO readings (telegram_id, kind, question, cards, text)
+            VALUES ($1, $2, $3, $4, $5) RETURNING id
+        """, uid, kind, question or "", json.dumps(cards, ensure_ascii=False), text or "")
+        asyncio.create_task(credit_referrer_if_due(uid))
+        return rid
+    except Exception as e:
+        log(f"save_reading {uid}: {e}")
+        return None
+
+
+def reading_payload(row, user: Optional[dict] = None) -> dict:
+    clar = json.loads(row["clarifications"] or "[]")
+    out = {
+        "id": row["id"], "kind": row["kind"], "question": row["question"] or "",
+        "cards": json.loads(row["cards"] or "[]"), "text": row["text"],
+        "clarifications": clar, "created_at": row["created_at"].isoformat(),
+        "clarify_left": max(0, MAX_CLARIFY - len(clar)),
+    }
+    if user is not None:
+        out["clarify_cost"] = 0 if sub_active(user) else COST_CLARIFY
+    return out
+
+
+async def log_event(uid: int, name: str, props: Optional[dict] = None):
+    try:
+        p = await db()
+        await p.execute("INSERT INTO events (telegram_id, name, props) VALUES ($1, $2, $3)",
+                        uid, name[:32], json.dumps(props, ensure_ascii=False)[:500] if props else None)
+    except Exception as e:
+        log(f"event {name}: {e}")
+
+
+def track(uid: int, name: str, props: Optional[dict] = None):
+    """Событие в фоне, чтобы не задерживать ответ."""
+    asyncio.create_task(log_event(uid, name, props))
+
+
+async def credit_referrer_if_due(uid: int):
+    """Бонус пригласившему — когда друг сделал расклады в два разных дня или купил Энергию."""
+    try:
+        p = await db()
+        u = await p.fetchrow("SELECT referred_by, ref_pending, purchases, first_name FROM users WHERE telegram_id = $1", uid)
+        if not u or not u["ref_pending"] or not u["referred_by"]:
+            return
+        if not (u["purchases"] or 0):
+            days = await p.fetchval("SELECT COUNT(DISTINCT created_at::date) FROM readings WHERE telegram_id = $1", uid)
+            if (days or 0) < 2:
+                return
+        async with p.acquire() as c:
+            async with c.transaction():
+                ref = await c.fetchval("UPDATE users SET ref_pending = FALSE WHERE telegram_id = $1 AND ref_pending "
+                                       "RETURNING referred_by", uid)
+                if not ref:
+                    return
+                await c.execute("UPDATE users SET balance = balance + $2, ref_count = ref_count + 1 WHERE telegram_id = $1",
+                                ref, REF_BONUS)
+        track(ref, "ref_credited", {"friend": uid})
+        try:
+            await bot.send_message(ref, f"🎁 {u['first_name'] or 'Твой друг'} пользуется Посланием Таро по твоей ссылке! "
+                                        f"Тебе начислено +{REF_BONUS} Энергии ✨", reply_markup=webapp_kb())
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"credit_referrer {uid}: {e}")
 
 
 # =====================================================================
@@ -1197,14 +1355,15 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
     norm = await call_ai(system_prompt, user_prompt, max_tokens=1500, schema=QUICK_SCHEMA,
                          validate=_quick_validator(pre_selected_cards))
     if norm:
-        fields = {"answer": norm["answer"]}
-        labels = {"answer": "Ответ на вопрос"}
-        for n, (i, meaning) in enumerate(norm["cards"]):
-            fields[f"card_{n}"] = meaning
-            labels[f"card_{n}"] = "Значение карты — " + _card_name(pre_selected_cards[i])
-        new = await humanize_fields(fields, labels, question)
-        norm = {"answer": new["answer"],
-                "cards": [(i, new[f"card_{n}"]) for n, (i, _) in enumerate(norm["cards"])]}
+        if HUMANIZE_QUICK:
+            fields = {"answer": norm["answer"]}
+            labels = {"answer": "Ответ на вопрос"}
+            for n, (i, meaning) in enumerate(norm["cards"]):
+                fields[f"card_{n}"] = meaning
+                labels[f"card_{n}"] = "Значение карты — " + _card_name(pre_selected_cards[i])
+            new = await humanize_fields(fields, labels, question)
+            norm = {"answer": new["answer"],
+                    "cards": [(i, new[f"card_{n}"]) for n, (i, _) in enumerate(norm["cards"])]}
         return _build_quick(norm, pre_selected_cards)
     log("⚠️ Все AI недоступны для быстрого ответа. Локальное толкование.")
     card = pre_selected_cards[0]
@@ -1213,6 +1372,64 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
             f"в ближайшее время. Прислушайся к её совету.\n\n"
             f"**🃏 {name}**\n{get_rich_card_meaning(card['name'], 'present')}")
     return {"cards_used_indices": [0], "reading": text}
+
+
+async def generate_spread_reading(spread_id: str, question: str, pre_selected_cards: list) -> dict:
+    """Тематический расклад: фиксированные позиции из SPREADS, карты — по порядку вытягивания."""
+    sp = SPREADS[spread_id]
+    n = len(sp["positions"])
+    cards = pre_selected_cards[:n]
+    cards_str = ", ".join(f"[{i}] {c['name']} — позиция «{sp['positions'][i]}»" for i, c in enumerate(cards))
+    system_prompt = (
+        "Ты — опытный таролог, практикующий по системе Уэйта. Даёшь точные, живые ответы на жизненные вопросы.\n\n"
+        f"ЗАДАЧА: тематический расклад «{sp['title']}». Карты уже вытянуты и стоят на своих позициях — "
+        f"опиши ВСЕ {n} карт по порядку, index — номер карты в квадратных скобках, position — название её позиции.\n"
+        "Толкование каждой карты — 45-75 слов: классическое значение, применённое к вопросу строго с ракурса позиции.\n"
+        "synthesis — 50-80 слов. answer — 40-70 слов. advice — 3 пункта по 10-25 слов.\n\n"
+        + STRUCTURED_FORMAT
+    )
+    user_prompt = f"Вопрос: «{question}».\nКарты по позициям: {cards_str}."
+    norm = await call_ai(system_prompt, user_prompt, max_tokens=4000, schema=STRUCTURED_SCHEMA,
+                         validate=_make_validator(cards, n, n))
+    if norm:
+        # позиции — всегда наши, в нашем порядке, даже если модель переставила
+        by_idx = {idx: meaning for idx, _, meaning in norm["cards"]}
+        norm["cards"] = [(i, sp["positions"][i], by_idx[i]) for i in range(n) if i in by_idx]
+        if len(norm["cards"]) == n:
+            norm = await _humanize_structured(norm, question, cards)
+            return _build_structured(norm, cards)
+    log(f"⚠️ AI недоступен для расклада {spread_id}. Локальные толкования.")
+    parts = [f"Твой вопрос: **«{question}»**"]
+    for i, card in enumerate(cards):
+        parts.append(f"**{sp['positions'][i]} — {_card_name(card)}**\n{get_rich_card_meaning(card['name'], 'present')}")
+    parts.append("**🧭 Что делать**\n• Опирайся на карту последней позиции: она показывает, куда всё движется.\n"
+                 "• Вернись к раскладу через несколько дней и сверь, что изменилось.")
+    return {"cards_used_indices": list(range(n)), "reading": "\n\n".join(parts)}
+
+
+async def generate_clarification(question: str, kind: str, cards: list, reading_text: str, new_card: dict) -> str:
+    """Уточняющая карта к уже сделанному раскладу: отвечает на тот же вопрос с учётом выпавших карт."""
+    name = _card_name(new_card)
+    prev = ", ".join(_card_name(c) for c in cards) or "—"
+    system_prompt = (
+        "Ты — опытный таролог, практикующий по системе Уэйта. Человек уже получил расклад и вытянул "
+        "УТОЧНЯЮЩУЮ карту. Объясни, что она добавляет к раскладу и как уточняет ответ на его вопрос.\n\n"
+        "• 60-100 слов, тепло, на «ты», без повторения уже сказанного в раскладе.\n"
+        "• Свяжи уточняющую карту с уже выпавшими картами и закончи одним конкретным выводом или шагом.\n"
+        "• Только **жирный** Markdown, без заголовков и HTML. Не пиши название карты в начале.\n\n"
+        + ANSWER_RULE + "\n\n" + HUMAN_STYLE + "\n\n"
+        'ФОРМАТ — строго JSON: {"reading": "текст"}'
+    )
+    user_prompt = (f"Вопрос: «{question or 'Карта дня'}».\nВыпавшие карты: {prev}.\n"
+                   f"Расклад (кратко): {reading_text[:1500]}\n\nУточняющая карта: {new_card['name']} ({new_card['type']}).")
+
+    def validate(parsed: dict) -> Optional[dict]:
+        text = clean_ai_text(str(parsed.get("reading") or "")).strip()
+        return {"reading": text} if len(text) >= 60 else None
+
+    res = await call_ai(system_prompt, user_prompt, max_tokens=1200, validate=validate)
+    body = res["reading"] if res else get_rich_card_meaning(new_card["name"], "present")
+    return f"**🔎 Уточнение — {name}**\n{body}"
 
 
 _DAILY_LABEL_RE = re.compile(r"^[ \t]*\**[ \t]*Основное толкование[ \t]*\**[ \t]*:?[ \t]*\**[ \t]*", re.IGNORECASE | re.MULTILINE)
@@ -1291,6 +1508,8 @@ async def setup_bot():
         await bot.set_my_commands([
             BotCommand(command="start", description="🔮 Открыть Послание Таро"),
             BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
+            BotCommand(command="daily", description="🌅 Карта Дня каждое утро: вкл/выкл"),
+            BotCommand(command="subscription", description="🌟 Подписка «Послание+»"),
             BotCommand(command="stop", description="🔕 Отключить напоминания"),
             BotCommand(command="feedback", description="✍️ Отзыв или идея"),
             BotCommand(command="support", description="💬 Поддержка"),
@@ -1343,6 +1562,14 @@ def webapp_kb(text: str = "🔮 Открыть расклады", channel: bool 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def paid_kb(reading_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    """Кнопка после оплаты: если человек пополнял ради уточняющей карты — ведём обратно в тот расклад."""
+    if reading_id:
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="🔎 Вернуться к раскладу и вытянуть карту", web_app=WebAppInfo(url=webapp_url(reading_id)))]])
+    return webapp_kb()
+
+
 def _plural(n: int, one: str, few: str, many: str) -> str:
     if n % 10 == 1 and n % 100 != 11:
         return one
@@ -1368,19 +1595,30 @@ def energy_reminder(balance: int) -> str:
     return f"\n\n✨ У тебя осталось {balance} Энергии — хватит {what}. Заходи, задай вопрос картам!"
 
 
-async def send_daily_push() -> int:
-    """Отправляет утреннее напоминание всем, кто ещё не получил его сегодня. Возвращает число отправленных."""
+def yesterday_str() -> str:
+    return (local_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def webapp_url(reading_id: Optional[int] = None) -> str:
+    """Ссылка на мини-апп; с reading_id мини-апп сразу откроет этот расклад."""
+    return f"{FRONTEND_URL}?r={int(reading_id)}" if reading_id else FRONTEND_URL
+
+
+async def send_daily_push(weekly: bool) -> int:
+    """Утреннее напоминание: каждый день — тем, кто включил ежедневную карту (daily_push),
+    в день недельной рассылки — ещё и всем остальным с notify. Возвращает число отправленных."""
     p = await db()
     today = get_today_str()
+    yesterday = yesterday_str()
     sent = 0
     while True:
         rows = await p.fetch("""
-            SELECT telegram_id, first_name, free_readings, balance FROM users
-            WHERE notify AND NOT blocked
+            SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date FROM users
+            WHERE notify AND NOT blocked AND (daily_push OR $2)
               AND (last_push_date IS DISTINCT FROM $1)
               AND (last_daily_date IS DISTINCT FROM $1)
             LIMIT 200
-        """, today)
+        """, today, weekly)
         if not rows:
             # тем, кто уже взял карту сам, пуш не нужен — просто отмечаем
             await p.execute("UPDATE users SET last_push_date = $1 WHERE last_daily_date = $1 AND last_push_date IS DISTINCT FROM $1", today)
@@ -1388,7 +1626,14 @@ async def send_daily_push() -> int:
         for r in rows:
             uid = r["telegram_id"]
             text = random.choice(PUSH_TEXTS).format(name=r["first_name"] or "Искатель")
-            if (r["free_readings"] or 0) > 0:
+            streak = r["streak"] or 0
+            if streak >= 2 and r["last_daily_date"] == yesterday:
+                nxt = STREAK_QUICK_EVERY - streak % STREAK_QUICK_EVERY
+                text += (f"\n\n🔥 Серия: {streak} {_plural(streak, 'день', 'дня', 'дней')} подряд. Не прерывай! "
+                         f"Через {nxt} {_plural(nxt, 'день', 'дня', 'дней')} ждёт бесплатный Быстрый ответ.")
+            if (r["free_preset"] or 0) > 0:
+                text += "\n\n🎁 А ещё тебя ждёт бесплатный Стандартный разбор на 3 карты."
+            elif (r["free_readings"] or 0) > 0:
                 text += "\n\n🎁 А ещё у тебя есть бесплатный Быстрый ответ: задай картам свой вопрос."
             text += energy_reminder(r["balance"] or 0)
             await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, today)
@@ -1405,6 +1650,95 @@ async def send_daily_push() -> int:
     return sent
 
 
+async def _send_safe(uid: int, text: str, kb: InlineKeyboardMarkup) -> bool:
+    """Отправка в фоновых рассылках: помечает заблокировавших, переживает лимиты Telegram."""
+    p = await db()
+    for _ in range(2):
+        try:
+            await bot.send_message(uid, text, reply_markup=kb)
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            await p.execute("UPDATE users SET blocked = TRUE WHERE telegram_id = $1", uid)
+            return False
+        except Exception as e:
+            log(f"send {uid}: {e}")
+            return False
+    return False
+
+
+FOLLOWUP_KINDS = ("quick", "preset", "ai") + tuple(f"sp_{k}" for k in SPREADS)
+
+
+async def send_followups() -> int:
+    """«Сбылось?» через FOLLOWUP_DAYS после расклада. Одному человеку — не больше одного вопроса за раз:
+    берём его последний расклад в окне, остальные помечаем как пропущенные."""
+    p = await db()
+    rows = await p.fetch("""
+        SELECT DISTINCT ON (r.telegram_id) r.id, r.telegram_id, r.question, r.cards, u.first_name
+        FROM readings r JOIN users u ON u.telegram_id = r.telegram_id
+        WHERE r.followup IS NULL AND r.kind = ANY($1::text[])
+          AND r.created_at < NOW() - make_interval(days => $2)
+          AND r.created_at > NOW() - make_interval(days => $2 + 4)
+          AND u.notify AND NOT u.blocked
+        ORDER BY r.telegram_id, r.created_at DESC
+        LIMIT 200
+    """, list(FOLLOWUP_KINDS), FOLLOWUP_DAYS)
+    sent = 0
+    for r in rows:
+        uid = r["telegram_id"]
+        await p.execute("""
+            UPDATE readings SET followup = CASE WHEN id = $2 THEN 'sent' ELSE 'skip' END
+            WHERE telegram_id = $1 AND followup IS NULL AND created_at < NOW() - make_interval(days => $3)
+        """, uid, r["id"], FOLLOWUP_DAYS)
+        cards = json.loads(r["cards"] or "[]")
+        card = _card_name(cards[0]) if cards else ""
+        q = (r["question"] or "").strip()
+        text = (f"🔮 {r['first_name'] or 'Искатель'}, несколько дней назад ты спрашивал(а) карты:\n«{q[:200]}»\n\n"
+                + (f"Тогда выпала карта {card}. " if card else "") + "Как всё сложилось? Расклад сбылся?")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, сбылось", callback_data=f"fu:{r['id']}:yes"),
+             InlineKeyboardButton(text="❌ Нет", callback_data=f"fu:{r['id']}:no")],
+            [InlineKeyboardButton(text="⏳ Пока непонятно", callback_data=f"fu:{r['id']}:wait")],
+        ])
+        if await _send_safe(uid, text, kb):
+            sent += 1
+            track(uid, "followup_sent", {"reading": r["id"]})
+        await asyncio.sleep(0.05)
+    return sent
+
+
+async def send_winback() -> int:
+    """Возврат «спящих»: у кого есть Энергия или подарок, но не заходил WINBACK_IDLE_DAYS дней."""
+    p = await db()
+    rows = await p.fetch("""
+        SELECT telegram_id, first_name, balance, free_readings, free_preset FROM users
+        WHERE notify AND NOT blocked
+          AND (balance >= $1 OR free_readings > 0 OR free_preset > 0)
+          AND COALESCE(last_seen, created_at) < NOW() - make_interval(days => $2)
+          AND (last_winback IS NULL OR last_winback < NOW() - make_interval(days => $3))
+          AND last_push_date IS DISTINCT FROM $4
+        LIMIT 200
+    """, COST_QUICK, WINBACK_IDLE_DAYS, WINBACK_REPEAT_DAYS, get_today_str())
+    sent = 0
+    for r in rows:
+        uid = r["telegram_id"]
+        await p.execute("UPDATE users SET last_winback = NOW() WHERE telegram_id = $1", uid)
+        name = r["first_name"] or "Искатель"
+        if (r["free_preset"] or 0) > 0:
+            text = f"🎁 {name}, твой бесплатный Стандартный разбор на 3 карты всё ещё ждёт. Задай картам вопрос!"
+        elif (r["free_readings"] or 0) > 0:
+            text = f"🎁 {name}, у тебя есть бесплатный Быстрый ответ. Карты готовы ответить на твой вопрос."
+        else:
+            text = f"🔮 {name}, давно не виделись!" + energy_reminder(r["balance"] or 0)
+        if await _send_safe(uid, text, webapp_kb("🔮 Задать вопрос картам")):
+            sent += 1
+            track(uid, "winback_sent")
+        await asyncio.sleep(0.05)
+    return sent
+
+
 async def push_loop():
     if not PUSH_ENABLED:
         return
@@ -1412,12 +1746,20 @@ async def push_loop():
     while True:
         try:
             now = local_now()
-            # Рассылка раз в неделю: только в PUSH_WEEKDAY (по умолчанию понедельник) с PUSH_HOUR.
+            # Утром: ежедневная карта для подписавшихся, по PUSH_WEEKDAY — для всех с notify.
             # last_push_date не даёт отправить повторно в тот же день.
-            if now.weekday() == PUSH_WEEKDAY and now.hour >= PUSH_HOUR:
-                n = await send_daily_push()
+            if now.hour >= PUSH_HOUR:
+                n = await send_daily_push(weekly=now.weekday() == PUSH_WEEKDAY)
                 if n:
-                    log(f"📬 Еженедельный пуш отправлен: {n}")
+                    log(f"📬 Утренний пуш отправлен: {n}")
+            # «Сбылось?» и возврат — только днём, не ночью
+            if 10 <= now.hour < 21:
+                n = await send_followups()
+                if n:
+                    log(f"📬 «Сбылось?»: {n}")
+                n = await send_winback()
+                if n:
+                    log(f"📬 Возврат спящих: {n}")
         except Exception as e:
             log(f"push_loop: {e}")
         await asyncio.sleep(120)
@@ -1536,12 +1878,21 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "name": user.get("first_name") or "Искатель",
         "balance": 99999 if admin else user.get("balance", 0),
         "free_readings": 0 if admin else (user.get("free_readings") or 0),
+        "free_preset": 0 if admin else (user.get("free_preset") or 0),
         "daily_available": admin or user.get("last_daily_date") != get_today_str(),
+        "daily_push": bool(user.get("daily_push")),
+        "streak": (user.get("streak") or 0) if user.get("last_daily_date") in (get_today_str(), yesterday_str()) else 0,
         "ref_link": ref_link(user["telegram_id"]),
         "ref_count": user.get("ref_count") or 0,
         "ref_bonus": REF_BONUS,
         "first_purchase": (user.get("purchases") or 0) == 0,
-        "costs": {"quick": COST_QUICK, "preset": COST_PRESET, "ai": COST_AI},
+        "costs": {"quick": COST_QUICK, "preset": COST_PRESET, "ai": COST_AI,
+                  "clarify": 0 if sub_active(user) else COST_CLARIFY},
+        "max_clarify": MAX_CLARIFY,
+        "spreads": [{"id": k, "title": v["title"], "emoji": v["emoji"], "cost": v["cost"], "cards": len(v["positions"]),
+                     "desc": v["desc"], "default_q": v["default_q"]} for k, v in SPREADS.items()],
+        "sub": {"active": sub_active(user), "price": SUB_PRICE, "energy": SUB_ENERGY,
+                "until": user["sub_until"].isoformat() if user.get("sub_until") else None},
         "prices": {k: (v[2] if (user.get("purchases") or 0) == 0 else v[1]) for k, v in PACKS.items()},
         "card_enabled": card_enabled(),
         "card_currency": TRIBUTE_CURRENCY_SIGN,
@@ -1556,7 +1907,8 @@ def card_price(pack: str, user: dict) -> int:
     return CARD_PRICES[pack]
 
 
-READING_KINDS = {"daily": "🃏 Карта дня", "quick": "⚡ Быстрый ответ", "preset": "🎴 Стандартный", "ai": "🔮 Индивидуальный"}
+READING_KINDS = {"daily": "🃏 Карта дня", "quick": "⚡ Быстрый ответ", "preset": "🎴 Стандартный", "ai": "🔮 Индивидуальный",
+                 **{f"sp_{k}": f"{v['emoji']} {v['title']}" for k, v in SPREADS.items()}}
 
 
 @app.post("/api/reading-rating")
@@ -1596,9 +1948,20 @@ async def api_feedback(payload: dict, authorization: str = Header(None)):
 async def get_user_profile(authorization: str = Header(None)):
     auth = verify_telegram_init_data(authorization)
     user, created, referrer = await ensure_user(auth["user"], auth.get("start_param"))
+    uid = user["telegram_id"]
     if referrer:
         asyncio.create_task(notify_referrer(referrer, user.get("first_name")))
-    return profile_payload(user, is_admin(user))
+    if created:
+        track(uid, "signup", {"source": user.get("source")})
+    track(uid, "app_open")
+    out = profile_payload(user, is_admin(user))
+    out["today_daily_id"] = None
+    if user.get("last_daily_date") == get_today_str():
+        p = await db()
+        out["today_daily_id"] = await p.fetchval("""
+            SELECT id FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
+        """, uid)
+    return out
 
 
 def _question(payload: dict) -> str:
@@ -1608,13 +1971,32 @@ def _question(payload: dict) -> str:
     return q[:500]
 
 
+async def _finish_reading(uid: int, admin: bool, mode: str, kind: str, question: str, cards: list, text: str) -> dict:
+    """Общий хвост всех раскладов: сохранить в историю, событие, свежий баланс."""
+    rid = await save_reading(uid, kind, question, cards, text)
+    track(uid, "reading", {"kind": kind, "mode": mode})
+    fresh = await get_user(uid)
+    return {
+        "success": True,
+        "reading_id": rid,
+        "cards": cards,
+        "text": text,
+        "new_balance": 99999 if admin else fresh["balance"],
+        "free_readings": fresh.get("free_readings") or 0,
+        "free_preset": fresh.get("free_preset") or 0,
+        "used_free": mode.startswith("free"),
+        "clarify_left": MAX_CLARIFY,
+        "clarify_cost": 0 if sub_active(fresh) else COST_CLARIFY,
+    }
+
+
 @app.post("/api/user/use-preset-ai-reading")
 async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)):
-    """Стандартный разбор (3 карты) — 150 энергии. Бесплатный подарок теперь идёт на Быстрый ответ."""
+    """Стандартный разбор (3 карты) — 150 энергии. Новым пользователям первый — в подарок (free_preset)."""
     user, admin = await auth_user(authorization)
     question = _question(payload)
     uid = user["telegram_id"]
-    mode = "admin" if admin else await charge(uid, COST_PRESET, allow_free=False)
+    mode = "admin" if admin else await charge(uid, COST_PRESET, free="preset")
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 6)
@@ -1628,15 +2010,8 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
     used = list(dict.fromkeys(used))[:3]
     if len(used) < 3:
         used = [0, 1, 2]
-    fresh = await get_user(uid)
-    return {
-        "success": True,
-        "cards": [pre_selected[i] for i in used],
-        "text": result_data.get("reading", ""),
-        "new_balance": 99999 if admin else fresh["balance"],
-        "free_readings": fresh.get("free_readings") or 0,
-        "used_free": mode == "free",
-    }
+    return await _finish_reading(uid, admin, mode, "preset", question,
+                                 [pre_selected[i] for i in used], result_data.get("reading", ""))
 
 
 @app.post("/api/user/use-quick-reading")
@@ -1645,7 +2020,7 @@ async def use_quick_reading(payload: dict, authorization: str = Header(None)):
     user, admin = await auth_user(authorization)
     question = _question(payload)
     uid = user["telegram_id"]
-    mode = "admin" if admin else await charge(uid, COST_QUICK, allow_free=True)  # подарок — первый Быстрый ответ
+    mode = "admin" if admin else await charge(uid, COST_QUICK, free="quick")  # подарок — первый Быстрый ответ
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 1)
@@ -1655,41 +2030,87 @@ async def use_quick_reading(payload: dict, authorization: str = Header(None)):
         await refund(uid, mode, COST_QUICK)
         raise HTTPException(status_code=500, detail="Не получилось сделать расклад. Энергия возвращена.")
 
-    used = [0]
-    fresh = await get_user(uid)
-    return {
-        "success": True,
-        "cards": [pre_selected[i] for i in used],
-        "text": result_data.get("reading", ""),
-        "new_balance": 99999 if admin else fresh["balance"],
-        "free_readings": fresh.get("free_readings") or 0,
-        "used_free": mode == "free",
-    }
+    return await _finish_reading(uid, admin, mode, "quick", question, [pre_selected[0]], result_data.get("reading", ""))
+
+
+@app.post("/api/user/use-spread")
+async def use_spread(payload: dict, authorization: str = Header(None)):
+    """Тематический расклад из SPREADS."""
+    user, admin = await auth_user(authorization)
+    spread_id = str(payload.get("spread") or "")
+    if spread_id not in SPREADS:
+        raise HTTPException(status_code=400, detail="Неизвестный расклад.")
+    sp = SPREADS[spread_id]
+    question = (payload.get("question") or "").strip()[:500] or sp["default_q"]
+    if not question:
+        raise HTTPException(status_code=400, detail="Введите вопрос.")
+    uid = user["telegram_id"]
+    mode = "admin" if admin else await charge(uid, sp["cost"])
+    n = len(sp["positions"])
+    try:
+        pre_selected = random.sample(get_tarot_deck(), n)
+        result_data = await generate_spread_reading(spread_id, question, pre_selected)
+    except Exception as e:
+        log(f"spread {spread_id} error: {e}")
+        await refund(uid, mode, sp["cost"])
+        raise HTTPException(status_code=500, detail="Не получилось сделать расклад. Энергия возвращена.")
+    return await _finish_reading(uid, admin, mode, f"sp_{spread_id}", question, pre_selected,
+                                 result_data.get("reading", ""))
+
+
+async def _streak_reward(uid: int, streak: int) -> Optional[str]:
+    """Награда за серию Карт Дня. Возвращает текст для показа или None."""
+    p = await db()
+    if streak > 0 and streak % STREAK_QUICK_EVERY == 0:
+        await p.execute("UPDATE users SET free_readings = free_readings + 1 WHERE telegram_id = $1", uid)
+        track(uid, "streak_reward", {"streak": streak, "kind": "quick"})
+        return f"🔥 {streak} дней подряд! Дарим бесплатный Быстрый ответ."
+    if streak == STREAK_ENERGY_DAY:
+        await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, STREAK_ENERGY)
+        track(uid, "streak_reward", {"streak": streak, "kind": "energy"})
+        return f"🔥 3 дня подряд! Дарим +{STREAK_ENERGY} Энергии. На 7-й день подарим бесплатный Быстрый ответ."
+    return None
 
 
 @app.post("/api/user/use-daily-ai-reading")
 async def use_daily_ai_reading(authorization: str = Header(None)):
-    """Карта дня — бесплатно, 1 раз в сутки (граница суток — по TZ_OFFSET_HOURS)."""
+    """Карта дня — бесплатно, 1 раз в сутки (граница суток — по TZ_OFFSET_HOURS).
+    Повторный запрос в тот же день возвращает уже полученную карту, а не ошибку."""
     user, admin = await auth_user(authorization)
     uid = user["telegram_id"]
     today = get_today_str()
+    p = await db()
+    streak = user.get("streak") or 0
     if not admin:
-        p = await db()
-        ok = await p.fetchval("""
-            UPDATE users SET last_daily_date = $2
-            WHERE telegram_id = $1 AND last_daily_date IS DISTINCT FROM $2 RETURNING 1
-        """, uid, today)
-        if not ok:
-            raise HTTPException(status_code=429, detail="Карта дня уже получена сегодня. Возвращайтесь завтра 🌙")
+        streak = await p.fetchval("""
+            UPDATE users SET
+                streak = CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END,
+                best_streak = GREATEST(best_streak, CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END),
+                last_daily_date = $2
+            WHERE telegram_id = $1 AND last_daily_date IS DISTINCT FROM $2 RETURNING streak
+        """, uid, today, yesterday_str())
+        if streak is None:
+            row = await p.fetchrow("""
+                SELECT * FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
+            """, uid)
+            if row and row["created_at"] > datetime.utcnow() - timedelta(hours=26):
+                fresh = await get_user(uid)
+                out = reading_payload(row, fresh)
+                out.update({"success": True, "repeat": True, "reading_id": row["id"],
+                            "new_balance": fresh["balance"], "streak": fresh.get("streak") or 0})
+                return out
+            raise HTTPException(status_code=429, detail="Карта дня ещё готовится. Загляните через минуту 🌙")
 
     pre_selected = random.sample(get_tarot_deck(), 1)
-    result_data = await generate_daily_reading(pre_selected)
-    return {
-        "success": True,
-        "cards": [pre_selected[0]],
-        "text": result_data.get("reading", ""),
-        "new_balance": 99999 if admin else user.get("balance", 0),
-    }
+    try:
+        result_data = await generate_daily_reading(pre_selected)
+    except Exception as e:  # день уже отмечен — карта должна прийти в любом случае
+        log(f"daily error: {e}")
+        result_data = generate_local_tarot_reading("", pre_selected, reading_type="daily")
+    reward = None if admin else await _streak_reward(uid, streak)
+    out = await _finish_reading(uid, admin, "free", "daily", "", [pre_selected[0]], result_data.get("reading", ""))
+    out.update({"streak": streak, "streak_reward": reward})
+    return out
 
 
 @app.post("/api/user/use-ai-reading")
@@ -1698,7 +2119,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     user, admin = await auth_user(authorization)
     question = _question(payload)
     uid = user["telegram_id"]
-    mode = "admin" if admin else await charge(uid, COST_AI, allow_free=False)
+    mode = "admin" if admin else await charge(uid, COST_AI)
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 12)
@@ -1712,32 +2133,138 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     used = list(dict.fromkeys(used))[:12]
     if len(used) < 6:
         used = list(range(6))
+    return await _finish_reading(uid, admin, mode, "ai", question,
+                                 [pre_selected[i] for i in used], result_data.get("reading", ""))
+
+
+# ── История раскладов и уточняющая карта ──────────────────────────────────
+@app.get("/api/readings")
+async def list_readings(authorization: str = Header(None), limit: int = 30):
+    user, _ = await auth_user(authorization)
+    p = await db()
+    rows = await p.fetch("""
+        SELECT id, kind, question, cards, clarifications, created_at FROM readings
+        WHERE telegram_id = $1 ORDER BY created_at DESC LIMIT $2
+    """, user["telegram_id"], max(1, min(limit, 100)))
+    track(user["telegram_id"], "history_open")
+    return {"readings": [{
+        "id": r["id"], "kind": r["kind"], "title": READING_KINDS.get(r["kind"], r["kind"]),
+        "question": r["question"] or "", "created_at": r["created_at"].isoformat(),
+        "cards": [_card_name(c) for c in json.loads(r["cards"] or "[]")],
+        "clarifications": len(json.loads(r["clarifications"] or "[]")),
+    } for r in rows]}
+
+
+@app.get("/api/readings/{reading_id}")
+async def get_reading(reading_id: int, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    p = await db()
+    row = await p.fetchrow("SELECT * FROM readings WHERE id = $1 AND telegram_id = $2", reading_id, user["telegram_id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Расклад не найден.")
+    return reading_payload(row, user)
+
+
+@app.post("/api/readings/{reading_id}/clarify")
+async def clarify_reading(reading_id: int, authorization: str = Header(None)):
+    """Уточняющая карта к раскладу: COST_CLARIFY Энергии (подписчикам бесплатно), до MAX_CLARIFY на расклад."""
+    user, admin = await auth_user(authorization)
+    uid = user["telegram_id"]
+    p = await db()
+    row = await p.fetchrow("SELECT * FROM readings WHERE id = $1 AND telegram_id = $2", reading_id, uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Расклад не найден.")
+    if len(json.loads(row["clarifications"] or "[]")) >= MAX_CLARIFY:
+        raise HTTPException(status_code=400, detail="К этому раскладу уже вытянуты все уточняющие карты.")
+    cost = 0 if (admin or sub_active(user)) else COST_CLARIFY
+    mode = await charge(uid, cost)
+
+    try:
+        cards = json.loads(row["cards"] or "[]")
+        taken = {c["name"] for c in cards} | {c["card"]["name"] for c in json.loads(row["clarifications"] or "[]")}
+        new_card = random.choice([c for c in get_tarot_deck() if c["name"] not in taken])
+        text = await generate_clarification(row["question"] or "", row["kind"], cards, row["text"], new_card)
+    except Exception as e:
+        log(f"clarify error: {e}")
+        await refund(uid, mode, cost)
+        raise HTTPException(status_code=500, detail="Не получилось вытянуть карту. Энергия возвращена.")
+
+    item = {"card": new_card, "text": text, "at": datetime.utcnow().isoformat()}
+    async with p.acquire() as c:
+        async with c.transaction():
+            cur = await c.fetchval("SELECT clarifications FROM readings WHERE id = $1 FOR UPDATE", reading_id)
+            clar = json.loads(cur or "[]")
+            if len(clar) >= MAX_CLARIFY:
+                clar = None
+            else:
+                clar.append(item)
+                await c.execute("UPDATE readings SET clarifications = $2 WHERE id = $1",
+                                reading_id, json.dumps(clar, ensure_ascii=False))
+    if clar is None:  # параллельный запрос успел первым
+        await refund(uid, mode, cost)
+        raise HTTPException(status_code=400, detail="К этому раскладу уже вытянуты все уточняющие карты.")
+    track(uid, "clarify", {"kind": row["kind"], "n": len(clar), "paid": cost > 0})
     fresh = await get_user(uid)
-    return {
-        "success": True,
-        "cards": [pre_selected[i] for i in used],
-        "text": result_data.get("reading", ""),
-        "new_balance": 99999 if admin else fresh["balance"],
-    }
+    return {"success": True, "clarification": item, "clarify_left": MAX_CLARIFY - len(clar),
+            "new_balance": 99999 if admin else fresh["balance"]}
+
+
+# ── Настройки и события из мини-аппа ──────────────────────────────────────
+@app.post("/api/user/settings")
+async def user_settings(payload: dict, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    p = await db()
+    if "daily_push" in payload:
+        on = bool(payload.get("daily_push"))
+        await p.execute("UPDATE users SET daily_push = $2, notify = notify OR $2 WHERE telegram_id = $1",
+                        user["telegram_id"], on)
+        track(user["telegram_id"], "daily_push_on" if on else "daily_push_off")
+    return {"ok": True}
+
+
+CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
+                 "sub_click", "pay_start"}
+
+
+@app.post("/api/event")
+async def client_event(payload: dict, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    name = str(payload.get("name") or "")
+    if name in CLIENT_EVENTS:
+        props = payload.get("props") if isinstance(payload.get("props"), dict) else None
+        track(user["telegram_id"], name, props)
+    return {"ok": True}
 
 
 @app.post("/api/payment/stars-invoice")
 async def create_stars_invoice(payload: dict, authorization: str = Header(None)):
     user, _ = await auth_user(authorization)
     pack = payload.get("pack")
-    if pack not in PACKS:
+    extra = {}
+    if pack in SUBS:
+        if sub_active(user):
+            raise HTTPException(status_code=400, detail="Подписка уже активна.")
+        energy, price, title, description = SUBS[pack]
+        extra["subscription_period"] = SUB_PERIOD
+    elif pack in PACKS:
+        energy, price, first_price, title, description = PACKS[pack]
+        if (user.get("purchases") or 0) == 0 and first_price < price:
+            price = first_price
+            title += " · цена первой покупки"
+    else:
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
-    energy, price, first_price, title, description = PACKS[pack]
-    if (user.get("purchases") or 0) == 0 and first_price < price:
-        price = first_price
-        title += " · цена первой покупки"
-    invoice_payload = f"{pack}:{user['telegram_id']}:{random.randint(100000, 999999)}"
+    # 4-я часть payload — расклад, к которому вернуть человека после оплаты
+    rid = payload.get("reading_id")
+    tail = f":r{int(rid)}" if str(rid or "").isdigit() else ""
+    invoice_payload = f"{pack}:{user['telegram_id']}:{random.randint(100000, 999999)}{tail}"
     try:
         link = await bot.create_invoice_link(
             title=title, description=description, payload=invoice_payload,
             provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Telegram Stars", amount=int(price))],
+            **extra,
         )
+        track(user["telegram_id"], "invoice", {"pack": pack, "method": "stars", "reading": bool(tail)})
         return {"invoice_link": link}
     except Exception as e:
         log(f"Ошибка создания инвойса: {e}")
@@ -1758,11 +2285,14 @@ async def create_tribute_order(payload: dict, authorization: str = Header(None))
     energy = PACKS[pack][0]
     price = card_price(pack, user)
     order_id = f"intent:{uid}:{secrets.token_hex(6)}"
+    rid = payload.get("reading_id")
+    rid = int(rid) if str(rid or "").isdigit() else None
     p = await db()
     await p.execute("""
-        INSERT INTO tribute_orders (uuid, telegram_id, pack, energy, amount, currency)
-        VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (uuid) DO NOTHING
-    """, order_id, uid, pack, energy, price * 100, TRIBUTE_CURRENCY)
+        INSERT INTO tribute_orders (uuid, telegram_id, pack, energy, amount, currency, reading_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (uuid) DO NOTHING
+    """, order_id, uid, pack, energy, price * 100, TRIBUTE_CURRENCY, rid)
+    track(uid, "invoice", {"pack": pack, "method": "card", "reading": bool(rid)})
     return {
         "order_id": order_id,
         "payment_url": CARD_LINKS.get(pack) or f"https://web.tribute.tg/p/{TRIBUTE_PRODUCT_IDS[pack]}",
@@ -1858,17 +2388,20 @@ async def tribute_webhook(request: Request):
                     "UPDATE users SET balance = balance + $2, purchases = purchases + 1 WHERE telegram_id = $1 RETURNING 1",
                     uid, energy)
                 # Отмечаем последнее «намерение» этого пакета — мини-апп увидит статус paid
-                await c.execute("""
+                rid = await c.fetchval("""
                     UPDATE tribute_orders SET status = 'paid', paid_at = NOW()
                     WHERE uuid = (SELECT uuid FROM tribute_orders WHERE telegram_id = $1 AND pack = $2
                                   AND status = 'pending' ORDER BY created_at DESC LIMIT 1)
+                    RETURNING reading_id
                 """, uid, pack)
         if not user_ok:
             log(f"Tribute: оплатил {uid}, но его нет в users — энергия не зачислена, проверь вручную")
             return {"ok": True}
+        track(uid, "payment", {"pack": pack, "method": "card"})
+        asyncio.create_task(credit_referrer_if_due(uid))
         try:
             await bot.send_message(uid, f"💳 Оплата картой прошла! Зачислено +{energy} Энергии ✨",
-                                   reply_markup=webapp_kb())
+                                   reply_markup=paid_kb(rid))
         except Exception:
             pass
     else:
@@ -1892,7 +2425,10 @@ async def payment_status(order_id: str, authorization: str = Header(None)):
 
 
 @app.get("/api/system/setup-webhook")
-async def setup_webhook_manually():
+async def setup_webhook_manually(key: str = ""):
+    # Без ключа кто угодно мог дёргать переустановку вебхука. Ключ — WEBHOOK_SECRET.
+    if not hmac.compare_digest(key, WEBHOOK_SECRET):
+        raise HTTPException(status_code=403, detail="forbidden")
     await setup_bot()
     info = await bot.get_webhook_info()
     return {"status": "ok", "webhook_url": info.url, "pending": info.pending_update_count, "last_error": info.last_error_message}
@@ -2101,7 +2637,8 @@ async def notify_referrer(referrer_id: int, friend_name: Optional[str]):
     try:
         await bot.send_message(
             referrer_id,
-            f"🎁 {friend_name or 'Твой друг'} пришёл(а) по твоей ссылке! Тебе начислено +{REF_BONUS} Энергии ✨",
+            f"🎁 {friend_name or 'Твой друг'} пришёл(а) по твоей ссылке! Твои +{REF_BONUS} Энергии придут, "
+            "когда друг вернётся к картам ещё раз ✨",
             reply_markup=webapp_kb(),
         )
     except Exception:
@@ -2125,9 +2662,13 @@ async def cmd_start(message: Message, command: CommandObject):
         lines.append(f"🎁 В честь переезда в новый бот мы начислили вам +{MOVE_GIFT} Энергии ✨ "
                      f"Теперь на балансе {user.get('balance', 0)}.")
     if created:
-        lines.append("🎁 Первый Быстрый ответ — в подарок.")
+        track(u.id, "signup", {"source": user.get("source")})
+        lines.append("🎁 В подарок: первый Быстрый ответ" +
+                     (" и первый Стандартный разбор на 3 карты." if FREE_PRESET_ON_START else "."))
         if referrer:
             lines.append(f"✨ Ты пришёл(а) по приглашению — тебе начислено +{REF_BONUS} Энергии.")
+    elif (user.get("free_preset") or 0) > 0:
+        lines.append("🎁 У тебя есть бесплатный Стандартный разбор на 3 карты.")
     elif (user.get("free_readings") or 0) > 0:
         lines.append("🎁 У тебя есть бесплатный Быстрый ответ.")
     lines += ["🃏 Карта Дня — бесплатно каждый день.",
@@ -2147,7 +2688,8 @@ async def cmd_ref(message: Message):
     link = ref_link(uid)
     share = "https://t.me/share/url?" + urllib.parse.urlencode({"url": link, "text": "🔮 Послание Таро в Telegram — первый ответ карт бесплатно, Карта Дня каждый день"})
     await message.answer(
-        f"🎁 Приглашай друзей — за каждого вы оба получите +{REF_BONUS} Энергии.\n\n"
+        f"🎁 Приглашай друзей: за каждого вы оба получите +{REF_BONUS} Энергии.\n"
+        "Друг получает бонус сразу, а ты, когда он вернётся к картам во второй раз.\n\n"
         f"Твоя ссылка:\n{link}\n\nУже пришло по ссылке: {count}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Отправить другу", url=share)]]),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2165,7 +2707,110 @@ async def cmd_stop(message: Message):
 async def cmd_notify(message: Message):
     p = await db()
     await p.execute("UPDATE users SET notify = TRUE WHERE telegram_id = $1", message.from_user.id)
-    await message.answer("🔔 Напоминания снова включены — пришлю Карту Дня в понедельник утром.")
+    await message.answer("🔔 Напоминания снова включены. Пришлю Карту Дня в понедельник утром.\n"
+                         "Хочешь получать её каждое утро? /daily")
+
+
+@dp.message(Command("daily"))
+async def cmd_daily(message: Message):
+    p = await db()
+    on = await p.fetchval("""
+        UPDATE users SET daily_push = NOT daily_push, notify = TRUE WHERE telegram_id = $1 RETURNING daily_push
+    """, message.from_user.id)
+    track(message.from_user.id, "daily_push_on" if on else "daily_push_off")
+    if on:
+        await message.answer("🌅 Готово! Карта Дня будет приходить каждое утро. Выключить: /daily")
+    else:
+        await message.answer("Ежедневная Карта Дня выключена. Напомню о ней раз в неделю. Включить снова: /daily")
+
+
+@dp.message(Command("subscription"))
+async def cmd_subscription(message: Message):
+    user = await get_user(message.from_user.id) or {}
+    if sub_active(user):
+        until = user["sub_until"] + timedelta(hours=TZ_OFFSET_HOURS)
+        await message.answer(
+            f"🌟 Подписка «Послание+» активна до {until:%d.%m.%Y}.\n"
+            f"Каждый месяц +{SUB_ENERGY} Энергии, уточняющие карты бесплатно.\n\n"
+            "Отменить продление можно в Telegram: Настройки → Мои звёзды → Подписки.",
+            reply_markup=webapp_kb())
+    else:
+        await message.answer(
+            f"🌟 Подписка «Послание+»: {SUB_PRICE} ⭐ в месяц.\n"
+            f"• +{SUB_ENERGY} Энергии каждый месяц (дешевле, чем пакетами);\n"
+            "• уточняющие карты к любому раскладу бесплатно.\n\n"
+            "Оформить можно в магазине приложения.", reply_markup=webapp_kb("🌟 Открыть магазин"))
+
+
+@dp.callback_query(F.data.startswith("fu:"))
+async def followup_answer(q: CallbackQuery):
+    """Ответ на «Сбылось?»."""
+    try:
+        _, rid, ans = q.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        await q.answer()
+        return
+    if ans not in ("yes", "no", "wait"):
+        await q.answer()
+        return
+    p = await db()
+    ok = await p.fetchval("UPDATE readings SET followup = $3 WHERE id = $1 AND telegram_id = $2 RETURNING 1",
+                          rid, q.from_user.id, ans)
+    await q.answer()
+    if not ok:
+        return
+    track(q.from_user.id, f"followup_{ans}", {"reading": rid})
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if ans == "yes":
+        text = "✨ Как здорово! Карты рады, что попали в точку. Если появился новый вопрос, они готовы ответить."
+        kb = webapp_kb("🔮 Задать новый вопрос")
+    elif ans == "no":
+        text = ("Спасибо за честность 🙏 Карты показывают тенденцию, и она могла измениться. "
+                "Вытяни уточняющую карту к тому раскладу: она покажет, что сейчас влияет на ситуацию.")
+        kb = paid_kb(rid)
+    else:
+        text = "Хорошо 🌙 Иногда событиям нужно чуть больше времени. Расклад сохранён в «Моих раскладах»."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="📜 Открыть расклад", web_app=WebAppInfo(url=webapp_url(rid)))]])
+    await q.message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("funnel"))
+async def cmd_funnel(message: Message, command: CommandObject):
+    """Только для админов: воронка за N дней (по умолчанию 7)."""
+    if not _is_admin_msg(message):
+        return
+    days = int(command.args) if command.args and command.args.strip().isdigit() else 7
+    p = await db()
+    steps = [("Новые пользователи", "SELECT COUNT(*) FROM users WHERE created_at > NOW() - make_interval(days => $1)"),
+             ("Открыли мини-апп", "app_open"), ("Сделали расклад", "reading"), ("Открыли магазин", "store_open"),
+             ("Создали счёт", "invoice"), ("Оплатили", "payment")]
+    lines = [f"📊 Воронка за {days} дн. (уникальные пользователи)\n"]
+    for title, q in steps:
+        if q.startswith("SELECT"):
+            n = await p.fetchval(q, days)
+        else:
+            n = await p.fetchval("SELECT COUNT(DISTINCT telegram_id) FROM events "
+                                 "WHERE name = $1 AND created_at > NOW() - make_interval(days => $2)", q, days)
+        lines.append(f"{title}: {n}")
+    rows = await p.fetch("""
+        SELECT name, COUNT(*) AS n, COUNT(DISTINCT telegram_id) AS u FROM events
+        WHERE created_at > NOW() - make_interval(days => $1)
+          AND name IN ('clarify', 'upsell_click', 'followup_yes', 'followup_no', 'followup_wait',
+                       'daily_push_on', 'streak_reward', 'ref_credited', 'history_open', 'story_share', 'sub_click')
+        GROUP BY name ORDER BY n DESC
+    """, days)
+    if rows:
+        lines.append("\nДругие события (раз / людей):")
+        lines += [f"{r['name']}: {r['n']} / {r['u']}" for r in rows]
+    subs = await p.fetchval("SELECT COUNT(*) FROM users WHERE sub_until > NOW()")
+    lines.append(f"\n🌟 Активных подписок: {subs}")
+    lines.append("Другой период: /funnel 30")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("moved_broadcast"))
@@ -2307,22 +2952,36 @@ async def cmd_terms(message: Message):
     )
 
 
+def _parse_invoice_payload(raw: str) -> Optional[tuple]:
+    """«pack:uid:rand» или «pack:uid:rand:r<reading_id>» → (pack, uid, reading_id|None)."""
+    parts = (raw or "").split(":")
+    if len(parts) not in (3, 4) or (parts[0] not in PACKS and parts[0] not in SUBS) or not parts[1].isdigit():
+        return None
+    rid = int(parts[3][1:]) if len(parts) == 4 and parts[3][:1] == "r" and parts[3][1:].isdigit() else None
+    return parts[0], int(parts[1]), rid
+
+
 @dp.pre_checkout_query()
 async def process_pre_checkout(q: PreCheckoutQuery):
-    parts = (q.invoice_payload or "").split(":")
-    ok = len(parts) == 3 and parts[0] in PACKS and parts[1].isdigit()
+    ok = _parse_invoice_payload(q.invoice_payload) is not None
     await q.answer(ok=ok, error_message=None if ok else "Счёт устарел, создайте новый в приложении.")
 
 
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     pay = message.successful_payment
-    parts = (pay.invoice_payload or "").split(":")
-    if len(parts) != 3 or parts[0] not in PACKS:
+    parsed = _parse_invoice_payload(pay.invoice_payload)
+    if not parsed:
         log(f"Неизвестный payload платежа: {pay.invoice_payload}")
         return
-    pack, uid = parts[0], int(parts[1])
-    energy = PACKS[pack][0]
+    pack, uid, rid = parsed
+    is_sub = pack in SUBS
+    energy = SUBS[pack][0] if is_sub else PACKS[pack][0]
+    # Подписка: Telegram сообщает дату окончания оплаченного периода; продления приходят таким же сообщением
+    exp = getattr(pay, "subscription_expiration_date", None)
+    sub_until = (datetime.utcfromtimestamp(exp) if isinstance(exp, int) else
+                 exp.astimezone(timezone.utc).replace(tzinfo=None) if isinstance(exp, datetime) else
+                 datetime.utcnow() + timedelta(seconds=SUB_PERIOD))
     p = await db()
     async with p.acquire() as c:
         async with c.transaction():
@@ -2333,7 +2992,17 @@ async def process_successful_payment(message: Message):
             if not inserted:
                 return  # повторная доставка того же платежа — уже зачислено
             await c.execute("UPDATE users SET balance = balance + $2, purchases = purchases + 1 WHERE telegram_id = $1", uid, energy)
-    await message.answer(f"🔮 Оплата успешна! Зачислено +{energy} Энергии.", reply_markup=webapp_kb())
+            if is_sub:
+                await c.execute("UPDATE users SET sub_until = $2 WHERE telegram_id = $1", uid, sub_until)
+    track(uid, "payment", {"pack": pack, "method": "stars", "stars": pay.total_amount,
+                           "renewal": bool(getattr(pay, "is_recurring", False) and not getattr(pay, "is_first_recurring", False))})
+    asyncio.create_task(credit_referrer_if_due(uid))
+    if is_sub:
+        await message.answer(f"🌟 Подписка «Послание+» активна до {sub_until + timedelta(hours=TZ_OFFSET_HOURS):%d.%m.%Y}.\n"
+                             f"Зачислено +{energy} Энергии, уточняющие карты теперь бесплатно ✨\n\n"
+                             "Управлять подпиской: /subscription", reply_markup=paid_kb(rid))
+    else:
+        await message.answer(f"🔮 Оплата успешна! Зачислено +{energy} Энергии.", reply_markup=paid_kb(rid))
 
 
 # ── Отзывы через бота: /feedback ──────────────────────────────────────────
@@ -2430,18 +3099,18 @@ async def cmd_ratings(message: Message, command: CommandObject):
 
 
 # ── Рассылка новостей: /news (превью себе) и /news go (всем) ──────────────
-NEWS_ID = "2026-10-28-card-feedback"   # поменяй для следующей рассылки, чтобы она ушла заново
+NEWS_ID = "2026-10-29-history-clarify"   # поменяй для следующей рассылки, чтобы она ушла заново
 news_running = False
 
 
 def news_text(name: str, balance: int, free_readings: int) -> str:
     text = (
-        f"✨ {name}, у Послания Таро обновления!\n\n"
-        "💳 Энергию теперь можно купить не только за звёзды, но и картой. "
-        "Выбирай способ оплаты в магазине.\n\n"
-        "💬 Появилась кнопка «Отзыв или идея». Напиши, что нравится, чего не хватает "
-        "или что работает не так. Мы читаем каждое сообщение.\n\n"
-        "👍 После расклада можно отметить, откликнулся ли он. Так ответы карт будут становиться точнее."
+        f"✨ {name}, в Послании Таро большое обновление!\n\n"
+        "📜 «Мои расклады»: все твои расклады теперь сохраняются, их можно перечитать.\n"
+        "🔎 Уточняющая карта: если остался вопрос, вытяни ещё одну карту к любому раскладу.\n"
+        "💞 Новые расклады: «Отношения», «Да или нет», «Работа и деньги» и «Расклад на месяц».\n"
+        "🔥 Серия Карт Дня: заходи каждый день и получай подарки.\n"
+        "🌟 Подписка «Послание+»: Энергия каждый месяц и бесплатные уточнения."
     )
     if balance >= COST_QUICK:
         if balance >= COST_PRESET:
