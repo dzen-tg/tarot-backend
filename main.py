@@ -24,7 +24,7 @@ import time
 import unicodedata
 import urllib.parse
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
@@ -62,6 +62,8 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))  # Алматы UTC+5; 
 PUSH_HOUR = int(os.getenv("PUSH_HOUR", "11"))          # 11:00 Алматы = 09:00 МСК
 PUSH_WEEKDAY = int(os.getenv("PUSH_WEEKDAY", "0"))     # день недели рассылки: 0=Пн ... 6=Вс (раз в неделю)
 PUSH_ENABLED = os.getenv("PUSH_ENABLED", "1") == "1"
+PUSH_HOUR_MIN, PUSH_HOUR_MAX = 6, 23                     # какой час человек может выбрать сам
+PUSH_WINDOW_HOURS = 3                                    # опоздали (сервер спал) больше чем на 3 часа — не шлём ночью
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/poslanie_taro_tg").strip()
 # Контакт поддержки для /support и /paysupport (обязательные команды для ботов с оплатой Stars)
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@backoffice_media").strip()  # пусто — кнопка канала скрыта
@@ -81,10 +83,11 @@ FREE_PRESET_ON_START = int(os.getenv("FREE_PRESET_ON_START", "1"))
 # Уточняющая карта к уже сделанному раскладу. 25 делит без остатка все пакеты (75, 150, 450, 750).
 COST_CLARIFY = int(os.getenv("COST_CLARIFY", "25"))
 MAX_CLARIFY = int(os.getenv("MAX_CLARIFY", "3"))
-# Серия Карт Дня: на 3-й день подряд — Энергия, каждый 7-й день — бесплатный Быстрый ответ
+# Серия Карт Дня: на 3-й день подряд — Энергия, каждый 7-й день — ещё Энергия (копится на любой расклад)
 STREAK_ENERGY_DAY = 3
 STREAK_ENERGY = int(os.getenv("STREAK_ENERGY", "25"))
 STREAK_QUICK_EVERY = 7
+STREAK_WEEK_ENERGY = int(os.getenv("STREAK_WEEK_ENERGY", "75"))
 # «Сбылось?» — через сколько дней после расклада спросить, и возврат «спящих» с балансом
 FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "3"))
 WINBACK_IDLE_DAYS = int(os.getenv("WINBACK_IDLE_DAYS", "5"))
@@ -395,6 +398,14 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_pending BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_winback TIMESTAMP DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_until TIMESTAMP DEFAULT NULL",
+            # Релиз 1: метка первого /start, дата рождения и сохранённый «Код судьбы»
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS start_param TEXT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_code_text TEXT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_code_at TIMESTAMPTZ DEFAULT NULL",
+            # Своё время рассылки: час по местному времени и часовой пояс телефона (минуты от UTC)
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS push_hour SMALLINT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_offset_min SMALLINT DEFAULT NULL",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -485,8 +496,38 @@ async def db() -> asyncpg.Pool:
         try:
             await asyncio.wait_for(pool_ready.wait(), timeout=25)
         except asyncio.TimeoutError:
-            raise HTTPException(status_code=503, detail="Сервис просыпается, попробуйте через минуту.")
+            raise HTTPException(status_code=503, detail="Сервис просыпается, попробуй через минуту.")
     return pool
+
+
+# Ответы на «Откуда вы о нас узнали?». Новый источник — просто новая строка (например, ("tiktok_kz", "TikTok (на казахском)")).
+SOURCE_OPTIONS = [
+    ("tiktok", "TikTok"),
+    ("threads", "Threads"),
+    ("insta", "Instagram"),
+    ("friends", "Друзья посоветовали"),
+    ("other", "Другое"),
+]
+# Start-параметры, по которым источник понятен без вопроса: t.me/Poslanie_tarobot?start=threads
+START_SOURCES = {"tiktok": "tiktok", "tt": "tiktok", "threads": "threads", "insta": "insta", "instagram": "insta",
+                 "ig": "insta"}
+
+
+def source_from_start(param: Optional[str]) -> Optional[str]:
+    """Источник из start-параметра или None, если по нему не понять, откуда человек."""
+    if not param:
+        return None
+    low = param.lower()
+    if low.startswith("ref_"):
+        return "ref"
+    if low.startswith("_tgr_"):  # партнёрская программа Telegram
+        return "tg_partner"
+    if low.startswith("src_"):
+        return re.sub(r"[^a-z0-9_]", "", low[4:])[:32] or None
+    for key, src in START_SOURCES.items():
+        if low == key or low.startswith(key + "_"):
+            return src
+    return None
 
 
 async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
@@ -497,10 +538,8 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
     first_name = (tg_user.get("first_name") or "Искатель")[:255]
     username = (tg_user.get("username") or None)
     referrer = None
-    # Метка источника из ссылки вида t.me/<бот>?start=src_youtube — сохраняется только для новых пользователей
-    source = None
-    if ref_param and ref_param.startswith("src_"):
-        source = re.sub(r"[^a-z0-9_]", "", ref_param[4:].lower())[:32] or None
+    # Метка источника из ссылки вида t.me/<бот>?start=threads — сохраняется только для новых пользователей
+    source = source_from_start(ref_param)
     if ref_param and ref_param.startswith("ref_") and ref_param[4:].isdigit():
         referrer = int(ref_param[4:])
         if referrer == uid:
@@ -517,9 +556,9 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
             """, uid, username, first_name, FREE_READINGS_ON_START, FREE_PRESET_ON_START)
             created = row is not None
             credited_ref = None
-            if created and (source or referrer):
-                row = await c.fetchrow("UPDATE users SET source = $2 WHERE telegram_id = $1 RETURNING *",
-                                       uid, source or "ref")
+            if created and (source or ref_param):
+                row = await c.fetchrow("UPDATE users SET source = $2, start_param = $3 WHERE telegram_id = $1 RETURNING *",
+                                       uid, source, (ref_param or "")[:64] or None)
             if created and referrer:
                 # Другу бонус сразу, пригласившему — после первой покупки друга (credit_referrer_if_due).
                 # Так фейковые аккаунты не дают бесплатную Энергию.
@@ -670,7 +709,7 @@ def verify_telegram_init_data(init_data: Optional[str]) -> dict:
     if not init_data:
         if DEV_MODE:
             return {"user": {"id": 123456789, "first_name": "Искатель", "username": "test_user"}, "start_param": None}
-        raise HTTPException(status_code=401, detail="Откройте Послание Таро через Telegram.")
+        raise HTTPException(status_code=401, detail="Открой Послание Таро через Telegram.")
     try:
         pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
     except ValueError:
@@ -683,7 +722,7 @@ def verify_telegram_init_data(init_data: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail="Подпись Telegram не прошла проверку.")
     try:
         if time.time() - int(data.get("auth_date", "0")) > INIT_DATA_MAX_AGE:
-            raise HTTPException(status_code=401, detail="Сессия устарела, перезапустите приложение.")
+            raise HTTPException(status_code=401, detail="Сессия устарела, перезапусти приложение.")
     except ValueError:
         raise HTTPException(status_code=401, detail="Неверные данные авторизации.")
     try:
@@ -1506,6 +1545,7 @@ async def setup_bot():
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🔮 Открыть Послание Таро"),
+            BotCommand(command="code", description="🔢 Мой Код судьбы"),
             BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
             BotCommand(command="daily", description="🌅 Карта Дня каждое утро: вкл/выкл"),
             BotCommand(command="subscription", description="🌟 Подписка «Послание+»"),
@@ -1586,7 +1626,7 @@ def energy_reminder(balance: int) -> str:
         return (f"\n\n✨ У тебя осталось {balance} Энергии — хватит на {q} "
                 f"{_plural(q, 'Быстрый ответ', 'Быстрых ответа', 'Быстрых ответов')}. Задай вопрос картам!")
     n = balance // COST_PRESET
-    std = f"{n} {_plural(n, 'Стандартный разбор', 'Стандартных разбора', 'Стандартных разборов')}"
+    std = f"{n} {_plural(n, 'Расклад на ситуацию', 'Расклада на ситуацию', 'Раскладов на ситуацию')}"
     if balance >= COST_AI:
         what = f"на 🔮 Индивидуальный разбор или {std}"
     else:
@@ -1603,24 +1643,32 @@ def webapp_url(reading_id: Optional[int] = None) -> str:
     return f"{FRONTEND_URL}?r={int(reading_id)}" if reading_id else FRONTEND_URL
 
 
-async def send_daily_push(weekly: bool) -> int:
-    """Утреннее напоминание: каждый день — тем, кто включил ежедневную карту (daily_push),
-    в день недельной рассылки — ещё и всем остальным с notify. Возвращает число отправленных."""
+async def send_daily_push() -> int:
+    """Напоминание о Карте Дня по местному времени человека: каждый день — тем, кто включил ежедневную карту
+    (daily_push), в день недельной рассылки — ещё и всем остальным с notify. Время — выбранный час (push_hour)
+    в часовом поясе телефона (tz_offset_min); если час не выбран — PUSH_HOUR по TZ_OFFSET_HOURS, как раньше.
+    Возвращает число отправленных."""
     p = await db()
     today = get_today_str()
     yesterday = yesterday_str()
     sent = 0
     while True:
         rows = await p.fetch("""
-            SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date FROM users
-            WHERE notify AND NOT blocked AND (daily_push OR $2)
-              AND (last_push_date IS DISTINCT FROM $1)
-              AND (last_daily_date IS DISTINCT FROM $1)
+            WITH t AS (
+                SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date,
+                       daily_push, last_push_date, COALESCE(push_hour, $3) AS hour,
+                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN push_hour IS NULL THEN $4
+                           ELSE COALESCE(tz_offset_min, $4) END) AS local_ts
+                FROM users
+                WHERE notify AND NOT blocked AND (last_daily_date IS DISTINCT FROM $1)
+            )
+            SELECT *, to_char(local_ts, 'YYYY-MM-DD') AS local_day FROM t
+            WHERE EXTRACT(HOUR FROM local_ts) >= hour AND EXTRACT(HOUR FROM local_ts) < hour + $5
+              AND (daily_push OR EXTRACT(ISODOW FROM local_ts) - 1 = $2)
+              AND last_push_date IS DISTINCT FROM to_char(local_ts, 'YYYY-MM-DD')
             LIMIT 200
-        """, today, weekly)
+        """, today, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS)
         if not rows:
-            # тем, кто уже взял карту сам, пуш не нужен — просто отмечаем
-            await p.execute("UPDATE users SET last_push_date = $1 WHERE last_daily_date = $1 AND last_push_date IS DISTINCT FROM $1", today)
             break
         for r in rows:
             uid = r["telegram_id"]
@@ -1629,13 +1677,13 @@ async def send_daily_push(weekly: bool) -> int:
             if streak >= 2 and r["last_daily_date"] == yesterday:
                 nxt = STREAK_QUICK_EVERY - streak % STREAK_QUICK_EVERY
                 text += (f"\n\n🔥 Серия: {streak} {_plural(streak, 'день', 'дня', 'дней')} подряд. Не прерывай! "
-                         f"Через {nxt} {_plural(nxt, 'день', 'дня', 'дней')} ждёт бесплатный Быстрый ответ.")
+                         f"Через {nxt} {_plural(nxt, 'день', 'дня', 'дней')} ждёт +{STREAK_WEEK_ENERGY} Энергии.")
             if (r["free_preset"] or 0) > 0:
-                text += "\n\n🎁 А ещё тебя ждёт бесплатный Стандартный разбор на 3 карты."
+                text += "\n\n🎁 А ещё тебя ждёт бесплатный Расклад на ситуацию (3 карты)."
             elif (r["free_readings"] or 0) > 0:
                 text += "\n\n🎁 А ещё у тебя есть бесплатный Быстрый ответ: задай картам свой вопрос."
             text += energy_reminder(r["balance"] or 0)
-            await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, today)
+            await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
             try:
                 await bot.send_message(uid, text, reply_markup=webapp_kb("🃏 Открыть Карту Дня", channel=True))
                 sent += 1
@@ -1726,7 +1774,7 @@ async def send_winback() -> int:
         await p.execute("UPDATE users SET last_winback = NOW() WHERE telegram_id = $1", uid)
         name = r["first_name"] or "Искатель"
         if (r["free_preset"] or 0) > 0:
-            text = f"🎁 {name}, твой бесплатный Стандартный разбор на 3 карты всё ещё ждёт. Задай картам вопрос!"
+            text = f"🎁 {name}, твой бесплатный Расклад на ситуацию (3 карты) всё ещё ждёт. Задай картам вопрос!"
         elif (r["free_readings"] or 0) > 0:
             text = f"🎁 {name}, у тебя есть бесплатный Быстрый ответ. Карты готовы ответить на твой вопрос."
         else:
@@ -1745,12 +1793,11 @@ async def push_loop():
     while True:
         try:
             now = local_now()
-            # Утром: ежедневная карта для подписавшихся, по PUSH_WEEKDAY — для всех с notify.
-            # last_push_date не даёт отправить повторно в тот же день.
-            if now.hour >= PUSH_HOUR:
-                n = await send_daily_push(weekly=now.weekday() == PUSH_WEEKDAY)
-                if n:
-                    log(f"📬 Утренний пуш отправлен: {n}")
+            # Карта Дня: у каждого своё время (см. send_daily_push). last_push_date — местный день человека,
+            # не даёт отправить повторно в тот же день.
+            n = await send_daily_push()
+            if n:
+                log(f"📬 Пуш Карты Дня отправлен: {n}")
             # «Сбылось?» и возврат — только днём, не ночью
             if 10 <= now.hour < 21:
                 n = await send_followups()
@@ -1805,7 +1852,7 @@ async def save_feedback(uid: int, username: Optional[str], kind: str, rating: Op
     recent = await p.fetchval(
         "SELECT COUNT(*) FROM feedback WHERE telegram_id = $1 AND created_at > NOW() - INTERVAL '1 hour'", uid)
     if recent >= FEEDBACK_LIMIT_PER_HOUR:
-        raise HTTPException(status_code=429, detail="Вы уже отправили несколько сообщений. Попробуйте чуть позже 🙏")
+        raise HTTPException(status_code=429, detail="Ты уже отправил(а) несколько сообщений. Попробуй чуть позже 🙏")
     # тот же текст от того же человека за 2 минуты — дубль (двойное нажатие), не пересылаем
     dup = await p.fetchval("""
         SELECT id FROM feedback WHERE telegram_id = $1 AND text = $2
@@ -1880,6 +1927,12 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "free_preset": 0 if admin else (user.get("free_preset") or 0),
         "daily_available": admin or user.get("last_daily_date") != get_today_str(),
         "daily_push": bool(user.get("daily_push")),
+        "push_hour": user.get("push_hour"),
+        "tz_offset_min": user.get("tz_offset_min"),
+        "push_default": {"hour": PUSH_HOUR, "tz_offset_min": TZ_OFFSET_HOURS * 60},
+        "push_hours": [PUSH_HOUR_MIN, PUSH_HOUR_MAX],
+        "streak_rules": {"energy_day": STREAK_ENERGY_DAY, "energy": STREAK_ENERGY, "quick_every": STREAK_QUICK_EVERY,
+                         "week_energy": STREAK_WEEK_ENERGY},
         "streak": (user.get("streak") or 0) if user.get("last_daily_date") in (get_today_str(), yesterday_str()) else 0,
         "ref_link": ref_link(user["telegram_id"]),
         "ref_count": user.get("ref_count") or 0,
@@ -1898,6 +1951,8 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "card_prices": {k: card_price(k, user) for k in PACKS if k in TRIBUTE_PRODUCT_IDS and k in CARD_PRICES},
         "card_prices_alt": {k: alt_price(card_price(k, user)) for k in PACKS
                             if k in TRIBUTE_PRODUCT_IDS and k in CARD_PRICES},
+        "birth_date": user["birth_date"].strftime("%d.%m.%Y") if user.get("birth_date") else None,
+        "fate": fate_payload(user),
     }
 
 
@@ -1906,7 +1961,7 @@ def card_price(pack: str, user: dict) -> int:
     return CARD_PRICES[pack]
 
 
-READING_KINDS = {"daily": "🃏 Карта дня", "quick": "⚡ Быстрый ответ", "preset": "🎴 Стандартный", "ai": "🔮 Индивидуальный",
+READING_KINDS = {"daily": "🃏 Карта дня", "quick": "⚡ Быстрый ответ", "preset": "🎴 Расклад на ситуацию", "ai": "🔮 Индивидуальный",
                  **{f"sp_{k}": f"{v['emoji']} {v['title']}" for k, v in SPREADS.items()}}
 
 
@@ -1935,7 +1990,7 @@ async def api_feedback(payload: dict, authorization: str = Header(None)):
     user, _ = await auth_user(authorization)
     text = str(payload.get("text") or "").strip()
     if len(text) < 3:
-        raise HTTPException(status_code=400, detail="Напишите хотя бы пару слов 🙂")
+        raise HTTPException(status_code=400, detail="Напиши хотя бы пару слов 🙂")
     rating = payload.get("rating")
     rating = int(rating) if str(rating).isdigit() else None
     await save_feedback(user["telegram_id"], user.get("username"), str(payload.get("kind") or "idea"),
@@ -1968,7 +2023,7 @@ async def get_user_profile(authorization: str = Header(None)):
 def _question(payload: dict) -> str:
     q = (payload.get("question") or "").strip()
     if not q:
-        raise HTTPException(status_code=400, detail="Введите вопрос.")
+        raise HTTPException(status_code=400, detail="Напиши свой вопрос.")
     return q[:500]
 
 
@@ -2044,7 +2099,7 @@ async def use_spread(payload: dict, authorization: str = Header(None)):
     sp = SPREADS[spread_id]
     question = (payload.get("question") or "").strip()[:500] or sp["default_q"]
     if not question:
-        raise HTTPException(status_code=400, detail="Введите вопрос.")
+        raise HTTPException(status_code=400, detail="Напиши свой вопрос.")
     uid = user["telegram_id"]
     mode = "admin" if admin else await charge(uid, sp["cost"])
     n = len(sp["positions"])
@@ -2063,13 +2118,14 @@ async def _streak_reward(uid: int, streak: int) -> Optional[str]:
     """Награда за серию Карт Дня. Возвращает текст для показа или None."""
     p = await db()
     if streak > 0 and streak % STREAK_QUICK_EVERY == 0:
-        await p.execute("UPDATE users SET free_readings = free_readings + 1 WHERE telegram_id = $1", uid)
-        track(uid, "streak_reward", {"streak": streak, "kind": "quick"})
-        return f"🔥 {streak} дней подряд! Дарим бесплатный Быстрый ответ."
+        await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, STREAK_WEEK_ENERGY)
+        track(uid, "streak_reward", {"streak": streak, "kind": "week_energy"})
+        return (f"🔥 {streak} дней подряд! Дарим +{STREAK_WEEK_ENERGY} Энергии. "
+                "Она копится: можно потратить сразу или собрать на большой расклад.")
     if streak == STREAK_ENERGY_DAY:
         await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, STREAK_ENERGY)
         track(uid, "streak_reward", {"streak": streak, "kind": "energy"})
-        return f"🔥 3 дня подряд! Дарим +{STREAK_ENERGY} Энергии. На 7-й день подарим бесплатный Быстрый ответ."
+        return f"🔥 3 дня подряд! Дарим +{STREAK_ENERGY} Энергии. На 7-й день подарим ещё +{STREAK_WEEK_ENERGY}."
     return None
 
 
@@ -2100,7 +2156,7 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
                 out.update({"success": True, "repeat": True, "reading_id": row["id"],
                             "new_balance": fresh["balance"], "streak": fresh.get("streak") or 0})
                 return out
-            raise HTTPException(status_code=429, detail="Карта дня ещё готовится. Загляните через минуту 🌙")
+            raise HTTPException(status_code=429, detail="Карта дня ещё готовится. Загляни через минуту 🌙")
 
     pre_selected = random.sample(get_tarot_deck(), 1)
     try:
@@ -2220,11 +2276,18 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
         await p.execute("UPDATE users SET daily_push = $2, notify = notify OR $2 WHERE telegram_id = $1",
                         user["telegram_id"], on)
         track(user["telegram_id"], "daily_push_on" if on else "daily_push_off")
+    tz = payload.get("tz_offset_min")
+    if isinstance(tz, int) and not isinstance(tz, bool) and -720 <= tz <= 840:
+        await p.execute("UPDATE users SET tz_offset_min = $2 WHERE telegram_id = $1", user["telegram_id"], tz)
+    hour = payload.get("push_hour")
+    if isinstance(hour, int) and not isinstance(hour, bool) and PUSH_HOUR_MIN <= hour <= PUSH_HOUR_MAX:
+        await p.execute("UPDATE users SET push_hour = $2 WHERE telegram_id = $1", user["telegram_id"], hour)
+        track(user["telegram_id"], "push_hour", {"hour": hour})
     return {"ok": True}
 
 
 CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
-                 "sub_click", "pay_start"}
+                 "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open"}
 
 
 @app.post("/api/event")
@@ -2269,7 +2332,7 @@ async def create_stars_invoice(payload: dict, authorization: str = Header(None))
         return {"invoice_link": link}
     except Exception as e:
         log(f"Ошибка создания инвойса: {e}")
-        raise HTTPException(status_code=500, detail="Не удалось создать счёт, попробуйте ещё раз.")
+        raise HTTPException(status_code=500, detail="Не удалось создать счёт, попробуй ещё раз.")
 
 
 @app.post("/api/payment/tribute-order")
@@ -2479,7 +2542,7 @@ def moved_broadcast_text(old_balance: int, new_balance: int) -> str:
                 f"Теперь у вас {new_balance} Энергии.")
     else:
         body = (f"В честь переезда дарим вам +{MOVE_GIFT} Энергии ✨ "
-                f"Этого хватит на Стандартный разбор на 3 карты.")
+                f"Этого хватит на Расклад на ситуацию (3 карты).")
     return head + body + "\n\nОткройте нового бота и нажмите «Запустить», чтобы забрать подарок."
 
 
@@ -2614,7 +2677,7 @@ async def send_missed_gifts(cutoff: datetime) -> tuple:
         if balance is None:
             continue
         text = (f"🔮 Послание Таро переехало в этот бот, и в честь переезда мы дарим вам +{MOVE_GIFT} Энергии ✨\n"
-                f"Теперь на балансе {balance + MOVE_GIFT} — хватит на Стандартный разбор на 3 карты.")
+                f"Теперь на балансе {balance + MOVE_GIFT} — хватит на Расклад на ситуацию (3 карты).")
         try:
             await bot.send_message(uid, text, reply_markup=webapp_kb())
             await p.execute("""
@@ -2646,6 +2709,10 @@ async def notify_referrer(referrer_id: int, friend_name: Optional[str]):
         pass
 
 
+DISCLAIMER = ("🔮 Добро пожаловать в «Послание Таро». Здесь карты помогают взглянуть на ситуацию со стороны. "
+              "Расклады носят рекомендательный и развлекательный характер.")
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
     feedback_waiting.pop(message.from_user.id, None)
@@ -2656,29 +2723,360 @@ async def cmd_start(message: Message, command: CommandObject):
     except Exception as e:
         log(f"/start db: {e}")
         user, created, referrer = {}, False, None
+    track(u.id, "start", {"param": (command.args or "")[:64] or None, "new": created})
+
+    if created:
+        # Новый пользователь: приветствие → «Откуда вы о нас узнали?» (если метка не сказала) → дата → Код судьбы
+        track(u.id, "signup", {"source": user.get("source")})
+        lines = [DISCLAIMER, ""]
+        lines.append("🎁 В подарок: первый Быстрый ответ" +
+                     (" и первый Расклад на ситуацию (3 карты)." if FREE_PRESET_ON_START else "."))
+        if referrer:
+            lines.append(f"✨ Ты пришёл(а) по приглашению — тебе начислено +{REF_BONUS} Энергии.")
+        await message.answer("\n".join(lines))
+        if user.get("source"):
+            await ask_birth_date(message.chat.id, u.id)
+        else:
+            await message.answer("Откуда ты о нас узнал(а)?", reply_markup=source_kb())
+        if referrer:
+            asyncio.create_task(notify_referrer(referrer, u.first_name))
+        return
 
     lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
              "Это Послание Таро. Задай вопрос — и карты ответят.", ""]
     if user.get("_move_gift"):
         lines.append(f"🎁 В честь переезда в новый бот мы начислили вам +{MOVE_GIFT} Энергии ✨ "
                      f"Теперь на балансе {user.get('balance', 0)}.")
-    if created:
-        track(u.id, "signup", {"source": user.get("source")})
-        lines.append("🎁 В подарок: первый Быстрый ответ" +
-                     (" и первый Стандартный разбор на 3 карты." if FREE_PRESET_ON_START else "."))
-        if referrer:
-            lines.append(f"✨ Ты пришёл(а) по приглашению — тебе начислено +{REF_BONUS} Энергии.")
-    elif (user.get("free_preset") or 0) > 0:
-        lines.append("🎁 У тебя есть бесплатный Стандартный разбор на 3 карты.")
+    if (user.get("free_preset") or 0) > 0:
+        lines.append("🎁 У тебя есть бесплатный Расклад на ситуацию (3 карты).")
     elif (user.get("free_readings") or 0) > 0:
         lines.append("🎁 У тебя есть бесплатный Быстрый ответ.")
     lines += ["🃏 Карта Дня — бесплатно каждый день.",
               f"⚡ Быстрый ответ одной картой на любой вопрос — {COST_QUICK} Энергии.",
-              "🎴 Стандартный и 🔮 Индивидуальный разборы — за Энергию.", "",
+              "🎴 Расклад на ситуацию и 🔮 Индивидуальный разбор — за Энергию.",
+              "🔢 Твой Код судьбы по дате рождения — /code", "",
               "Жми кнопку ниже 👇"]
     await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
-    if referrer:
-        asyncio.create_task(notify_referrer(referrer, u.first_name))
+
+
+# =====================================================================
+# КОД СУДЬБЫ — лид-магнит по дате рождения (релиз 1)
+# Расчёты делает код, ИИ пишет только толкование.
+# =====================================================================
+ARCANA = {1: "Маг", 2: "Верховная Жрица", 3: "Императрица", 4: "Император", 5: "Иерофант", 6: "Влюблённые",
+          7: "Колесница", 8: "Справедливость", 9: "Отшельник", 10: "Колесо Фортуны", 11: "Сила", 12: "Повешенный",
+          13: "Смерть", 14: "Умеренность", 15: "Дьявол", 16: "Башня", 17: "Звезда", 18: "Луна", 19: "Солнце",
+          20: "Суд", 21: "Мир", 22: "Шут"}  # нумерация матрицы судьбы: 8 — Справедливость, 11 — Сила
+ROMAN = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV", "XV", "XVI",
+         "XVII", "XVIII", "XIX", "XX", "XXI", "XXII"]
+ZODIAC = [((1, 20), "Козерог"), ((2, 19), "Водолей"), ((3, 21), "Рыбы"), ((4, 20), "Овен"), ((5, 21), "Телец"),
+          ((6, 21), "Близнецы"), ((7, 23), "Рак"), ((8, 23), "Лев"), ((9, 23), "Дева"), ((10, 23), "Весы"),
+          ((11, 22), "Скорпион"), ((12, 22), "Стрелец"), ((12, 32), "Козерог")]
+BIRTH_YEAR_MIN = 1920
+BIRTH_DATE_RE = re.compile(r"^\s*(\d{1,2})[.\-/ ](\d{1,2})[.\-/ ](\d{4})\s*$")
+BIRTH_ASK_TEXT = ("Чтобы открыть твой подарок — «Код судьбы», напиши дату рождения в формате ДД.ММ.ГГГГ "
+                  "(например, 14.03.1992).")
+BIRTH_ERROR_TEXT = "Не получилось распознать дату, попробуй ещё раз: ДД.ММ.ГГГГ"
+birth_waiting: dict = {}  # telegram_id → до какого времени ждём дату рождения
+
+
+def reduce22(n: int) -> int:
+    while n > 22:
+        n = sum(int(d) for d in str(n))
+    return n
+
+
+def matrix_main_arcana(d: date) -> int:
+    a = reduce22(d.day)
+    b = d.month
+    c = reduce22(sum(int(x) for x in str(d.year)))
+    dd = reduce22(a + b + c)
+    return reduce22(a + b + c + dd)  # центр матрицы — «главная энергия»
+
+
+def life_path(d: date) -> int:
+    n = sum(int(x) for x in d.strftime("%d%m%Y"))
+    while n > 9 and n not in (11, 22, 33):
+        n = sum(int(x) for x in str(n))
+    return n
+
+
+def zodiac(d: date) -> str:
+    for (m, day), name in ZODIAC:
+        if (d.month, d.day) < (m, day):
+            return name
+
+
+def parse_birth_date(text: str) -> Optional[date]:
+    """ДД.ММ.ГГГГ (также через - / или пробел), реальная дата, год 1920…текущий, не в будущем."""
+    m = BIRTH_DATE_RE.match(text or "")
+    if not m:
+        return None
+    try:
+        d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
+    today = local_now().date()
+    if not BIRTH_YEAR_MIN <= d.year <= today.year or d > today:
+        return None
+    return d
+
+
+def fate_numbers(d: date) -> dict:
+    arc = matrix_main_arcana(d)
+    return {"zodiac": zodiac(d), "life_path": life_path(d), "arcana_num": arc, "arcana_name": ARCANA[arc]}
+
+
+def fate_header(d: date) -> str:
+    f = fate_numbers(d)
+    return (f"🔢 Твой Код судьбы\n\nЗнак: {f['zodiac']}\nЧисло судьбы: {f['life_path']}\n"
+            f"Главный аркан: {ROMAN[f['arcana_num']]} {f['arcana_name']}")
+
+
+FATE_STYLE = (
+    "СТИЛЬ ТЕКСТА — пиши как живой человек, а не как ИИ:\n"
+    "- Обращайся на «ты», тепло и спокойно, как опытный таролог на личной встрече.\n"
+    "- Пиши простым разговорным русским. Короткие и длинные предложения вперемешку.\n"
+    "- Конкретика вместо общих слов: опиши, как это проявляется в обычной жизни (в работе, в разговорах, "
+    "в отношениях), а не «энергия», «вибрации», «поток».\n"
+    "- Запрещено:\n"
+    "  • конструкции «не X, а Y», «не просто…, а…»;\n"
+    "  • перечисления ровно из трёх пунктов подряд ради ритма;\n"
+    "  • длинные тире в каждом предложении (максимум одно на весь текст);\n"
+    "  • штампы: «важно отметить», «стоит подчеркнуть», «в современном мире», «погрузиться», «уникальный», "
+    "«путешествие», «гармония», «Вселенная подсказывает», «ключ к», «раскрыть потенциал»;\n"
+    "  • вступления вроде «Давай разберём» и пересказ вопроса пользователя;\n"
+    "  • финальная мотивационная фраза-лозунг одной строкой;\n"
+    "  • заголовки, жирный текст, списки — только обычные абзацы;\n"
+    "  • больше одного эмодзи на весь ответ.\n"
+    "- Не льсти и не преувеличивай. Если у аркана есть сложная сторона, скажи о ней мягко, но прямо.\n"
+    "- Без предсказаний судьбы, обещаний про здоровье, деньги и возврат партнёра."
+)
+
+FATE_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+
+
+def _fate_validator(parsed: dict) -> Optional[dict]:
+    text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
+    words = len(text.split())
+    return {"text": text} if 80 <= words <= 260 else None
+
+
+async def generate_fate_code(d: date) -> str:
+    f = fate_numbers(d)
+    system_prompt = (
+        "Ты — таролог проекта «Послание Таро». Напиши человеку его персональный «Код судьбы» по дате рождения.\n\n"
+        "Структура (без заголовков, 3–4 абзаца, всего 120–180 слов):\n"
+        "1. Каким этот человек кажется окружающим и в чём его сильная сторона, через сочетание знака и числа судьбы.\n"
+        "2. Главный аркан: как эта энергия проявляется в его решениях и характере, с одним бытовым примером.\n"
+        "3. Одна зона роста: что даётся труднее, сказано мягко и по-честному.\n"
+        "4. Последнее предложение — вопрос о его текущей ситуации, который естественно подводит к раскладу. "
+        "Не упоминай цены и кнопки.\n\n"
+        "Абзацы разделяй пустой строкой. Никогда не используй слова «нейросеть», «ИИ», «алгоритм».\n\n"
+        + FATE_STYLE + "\n\n"
+        'ФОРМАТ — строго JSON: {"text": "..."}'
+    )
+    user_prompt = (f"Данные: знак — {f['zodiac']}; число судьбы — {f['life_path']}; главный аркан — "
+                   f"{f['arcana_num']} {f['arcana_name']}.")
+    res = await call_ai(system_prompt, user_prompt, max_tokens=1200, schema=FATE_SCHEMA, validate=_fate_validator)
+    if res:
+        return res["text"]
+    log("⚠️ AI недоступен для Кода судьбы — запасной текст")
+    return (f"Твой главный аркан — {f['arcana_name']}. Он показывает, как ты обычно принимаешь решения и что "
+            f"тебе помогает в трудные моменты. Число судьбы {f['life_path']} и знак {f['zodiac']} добавляют к этому "
+            "твою манеру держаться с людьми.\n\nЕсть вопрос, на который ты сейчас ищешь ответ?")
+
+
+def source_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=f"src:{key}")]
+                                                 for key, label in SOURCE_OPTIONS])
+
+
+def fate_cta_kb(user: dict) -> InlineKeyboardMarkup:
+    """Кнопки после Кода судьбы: бесплатный подарок (или 75) и Расклад на ситуацию (или бесплатный, если есть)."""
+    free_q = (user.get("free_readings") or 0) > 0
+    free_p = (user.get("free_preset") or 0) > 0
+    q_text = "🎁 Задать вопрос картам (бесплатно)" if free_q else f"⚡ Задать вопрос картам — {COST_QUICK}"
+    p_text = "🎴 Расклад на ситуацию (бесплатно)" if free_p else f"🎴 Расклад на ситуацию — {COST_PRESET}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=q_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=quick&from=fate"))],
+        [InlineKeyboardButton(text=p_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=preset&from=fate"))],
+    ])
+
+
+async def ask_birth_date(chat_id: int, uid: int):
+    birth_waiting[uid] = time.time() + 24 * 3600
+    await bot.send_message(chat_id, BIRTH_ASK_TEXT, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Пропустить", callback_data="bd:skip")]]))
+
+
+async def save_fate_code(uid: int, d: date) -> str:
+    """Сгенерировать текст один раз и сохранить. Если параллельно уже сохранили — вернуть сохранённый."""
+    text = await generate_fate_code(d)
+    p = await db()
+    return await p.fetchval("""
+        UPDATE users SET fate_code_text = COALESCE(fate_code_text, $2),
+                         fate_code_at = COALESCE(fate_code_at, NOW())
+        WHERE telegram_id = $1 RETURNING fate_code_text
+    """, uid, text)
+
+
+def fate_payload(user: dict) -> Optional[dict]:
+    """Код судьбы для мини-аппа: цифры считаются из даты, текст — сохранённый."""
+    if not user.get("birth_date") or not user.get("fate_code_text"):
+        return None
+    f = fate_numbers(user["birth_date"])
+    f.update({"arcana_roman": ROMAN[f["arcana_num"]], "text": user["fate_code_text"]})
+    return f
+
+
+@app.post("/api/user/fate-code")
+async def api_fate_code(payload: dict, authorization: str = Header(None)):
+    """Код судьбы из мини-аппа: сохранить дату (если её ещё нет) и вернуть расчёт с текстом."""
+    user, _ = await auth_user(authorization)
+    uid = user["telegram_id"]
+    d = user.get("birth_date")
+    if not d:
+        d = parse_birth_date(str(payload.get("birth_date") or ""))
+        if not d:
+            raise HTTPException(status_code=400, detail=BIRTH_ERROR_TEXT)
+        p = await db()
+        d = await p.fetchval("UPDATE users SET birth_date = COALESCE(birth_date, $2) WHERE telegram_id = $1 "
+                             "RETURNING birth_date", uid, d)
+        birth_waiting.pop(uid, None)
+        track(uid, "birthdate_entered", {"via": "app"})
+    text = user.get("fate_code_text") or await save_fate_code(uid, d)
+    track(uid, "fate_code_viewed", {"via": "app"})
+    return {"fate": fate_payload({"birth_date": d, "fate_code_text": text}),
+            "birth_date": d.strftime("%d.%m.%Y")}
+
+
+async def send_fate_code(chat_id: int, uid: int):
+    """Показать сохранённый Код судьбы; если текста ещё нет — сгенерировать и сохранить один раз."""
+    user = await get_user(uid)
+    if not user or not user.get("birth_date"):
+        await ask_birth_date(chat_id, uid)
+        return
+    text = user.get("fate_code_text")
+    if not text:
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+        text = await save_fate_code(uid, user["birth_date"])
+    await bot.send_message(chat_id, fate_header(user["birth_date"]) + "\n\n" + text, reply_markup=fate_cta_kb(user))
+    track(uid, "fate_code_viewed")
+
+
+@dp.callback_query(F.data.startswith("src:"))
+async def source_selected(q: CallbackQuery):
+    key = q.data[4:]
+    labels = dict(SOURCE_OPTIONS)
+    if key not in labels:
+        await q.answer()
+        return
+    p = await db()
+    await p.execute("UPDATE users SET source = $2 WHERE telegram_id = $1 AND source IS NULL", q.from_user.id, key)
+    track(q.from_user.id, "source_selected", {"source": key})
+    await q.answer("Спасибо!")
+    try:
+        await q.message.edit_text(f"Откуда ты о нас узнал(а)? — {labels[key]}")
+    except Exception:
+        pass
+    user = await get_user(q.from_user.id)
+    if user and not user.get("birth_date"):
+        await ask_birth_date(q.message.chat.id, q.from_user.id)
+
+
+@dp.callback_query(F.data == "bd:skip")
+async def birth_date_skipped(q: CallbackQuery):
+    uid = q.from_user.id
+    birth_waiting.pop(uid, None)
+    track(uid, "birthdate_skipped")
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    user = await get_user(uid) or {}
+    free = (user.get("free_readings") or 0) > 0
+    text = ("Хорошо! Твой подарок — бесплатный ответ карт. Задай вопрос 👇" if free
+            else "Хорошо! Задай вопрос картам 👇")
+    await q.message.answer(text + "\n\nКод судьбы можно открыть позже: /code", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(
+            text="🎁 Задать вопрос картам (бесплатно)" if free else f"⚡ Задать вопрос картам — {COST_QUICK}",
+            web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=quick"))]]))
+
+
+@dp.message(Command("code"))
+async def cmd_code(message: Message):
+    feedback_waiting.pop(message.from_user.id, None)
+    await send_fate_code(message.chat.id, message.from_user.id)
+
+
+def _awaiting_birth_date(message: Message) -> bool:
+    """Ждём дату: после вопроса (24 ч) или текст похож на дату (на случай перезапуска сервера)."""
+    if not message.text or message.text.startswith("/"):
+        return False
+    if feedback_waiting.get(message.from_user.id, 0) > time.time():
+        return False
+    if message.reply_to_message and _is_admin_msg(message):  # ответ админа на отзыв
+        return False
+    return birth_waiting.get(message.from_user.id, 0) > time.time() or bool(BIRTH_DATE_RE.match(message.text))
+
+
+@dp.message(F.text, _awaiting_birth_date)
+async def birth_date_text(message: Message):
+    uid = message.from_user.id
+    user = await get_user(uid)
+    if not user:
+        return
+    if user.get("birth_date"):
+        birth_waiting.pop(uid, None)
+        await message.answer("Дата рождения уже сохранена. Твой Код судьбы: /code")
+        return
+    d = parse_birth_date(message.text)
+    if not d:
+        birth_waiting[uid] = time.time() + 24 * 3600
+        await message.answer(BIRTH_ERROR_TEXT)
+        return
+    birth_waiting.pop(uid, None)
+    p = await db()
+    await p.execute("UPDATE users SET birth_date = $2 WHERE telegram_id = $1 AND birth_date IS NULL", uid, d)
+    track(uid, "birthdate_entered")
+    await send_fate_code(message.chat.id, uid)
+
+
+@dp.message(Command("onboarding"))
+async def cmd_onboarding(message: Message, command: CommandObject):
+    """Только для админов: воронка релиза 1 по источникам за N дней (по умолчанию 7)."""
+    if not _is_admin_msg(message):
+        return
+    days = int(command.args) if command.args and command.args.strip().isdigit() else 7
+    p = await db()
+    rows = await p.fetch("""
+        WITH u AS (SELECT telegram_id, COALESCE(source, 'без метки') AS src, purchases FROM users
+                   WHERE created_at > NOW() - make_interval(days => $1)),
+             e AS (SELECT telegram_id, name FROM events WHERE created_at > NOW() - make_interval(days => $1)
+                   AND name IN ('birthdate_entered', 'birthdate_skipped', 'fate_code_viewed',
+                                'fate_cta_free', 'fate_cta_paid'))
+        SELECT u.src, COUNT(DISTINCT u.telegram_id) AS users,
+               COUNT(DISTINCT e.telegram_id) FILTER (WHERE e.name = 'birthdate_entered') AS dated,
+               COUNT(DISTINCT e.telegram_id) FILTER (WHERE e.name = 'birthdate_skipped') AS skipped,
+               COUNT(DISTINCT e.telegram_id) FILTER (WHERE e.name = 'fate_code_viewed') AS shown,
+               COUNT(DISTINCT e.telegram_id) FILTER (WHERE e.name IN ('fate_cta_free', 'fate_cta_paid')) AS clicked,
+               COUNT(DISTINCT u.telegram_id) FILTER (WHERE u.purchases > 0) AS buyers
+        FROM u LEFT JOIN e ON e.telegram_id = u.telegram_id
+        GROUP BY u.src ORDER BY users DESC
+    """, days)
+    lines = [f"📊 Новые за {days} дн.: start → дата → код → кнопка → покупка", "(пропустили дату)", ""]
+    for r in rows:
+        lines.append(f"{r['src']}: {r['users']} → {r['dated']} → {r['shown']} → {r['clicked']} → {r['buyers']} "
+                     f"({r['skipped']})")
+    if not rows:
+        lines.append("Новых пользователей нет.")
+    lines.append("\nДругой период: /onboarding 30")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("ref"))
@@ -2721,7 +3119,7 @@ async def cmd_daily(message: Message):
     """, message.from_user.id)
     track(message.from_user.id, "daily_push_on" if on else "daily_push_off")
     if on:
-        await message.answer("🌅 Готово! Карта Дня будет приходить каждое утро. Выключить: /daily")
+        await message.answer("🌅 Готово! Карта Дня будет приходить каждый день. Время можно выбрать в приложении, на карточке «Карта Дня». Выключить: /daily")
     else:
         await message.answer("Ежедневная Карта Дня выключена. Напомню о ней раз в неделю. Включить снова: /daily")
 
@@ -3117,7 +3515,7 @@ def news_text(name: str, balance: int, free_readings: int) -> str:
     if balance >= COST_QUICK:
         if balance >= COST_PRESET:
             n = balance // COST_PRESET
-            what = f"{n} {_plural(n, 'Стандартный разбор', 'Стандартных разбора', 'Стандартных разборов')}"
+            what = f"{n} {_plural(n, 'Расклад на ситуацию', 'Расклада на ситуацию', 'Раскладов на ситуацию')}"
             if balance >= COST_AI:
                 what = f"🔮 Индивидуальный разбор или {what}"
         else:
