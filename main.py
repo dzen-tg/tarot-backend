@@ -403,6 +403,9 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_code_text TEXT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_code_at TIMESTAMPTZ DEFAULT NULL",
+            # Аркан личности, с которым написан текст Кода судьбы. NULL при сохранённом тексте — старый
+            # текст с одним арканом, его один раз перегенерируем.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS personality_arcana SMALLINT DEFAULT NULL",
             # Своё время рассылки: час по местному времени и часовой пояс телефона (минуты от UTC)
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS push_hour SMALLINT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_offset_min SMALLINT DEFAULT NULL",
@@ -2786,6 +2789,11 @@ def reduce22(n: int) -> int:
     return n
 
 
+def personality_arcana(d: date) -> int:
+    """Аркан личности — день рождения: 1–22 как есть, 23–31 → сумма цифр (23→5, 31→4)."""
+    return reduce22(d.day)
+
+
 def matrix_main_arcana(d: date) -> int:
     a = reduce22(d.day)
     b = d.month
@@ -2823,14 +2831,22 @@ def parse_birth_date(text: str) -> Optional[date]:
 
 
 def fate_numbers(d: date) -> dict:
-    arc = matrix_main_arcana(d)
-    return {"zodiac": zodiac(d), "life_path": life_path(d), "arcana_num": arc, "arcana_name": ARCANA[arc]}
+    arc, pers = matrix_main_arcana(d), personality_arcana(d)
+    return {"zodiac": zodiac(d), "life_path": life_path(d), "arcana_num": arc, "arcana_name": ARCANA[arc],
+            "personality_num": pers, "personality_name": ARCANA[pers]}
+
+
+FATE_SAME_TEXT = "Оба аркана совпали: одна и та же энергия у тебя и в характере, и в главной задаче."
 
 
 def fate_header(d: date) -> str:
     f = fate_numbers(d)
-    return (f"🔢 Твой Код судьбы\n\nЗнак: {f['zodiac']}\nЧисло судьбы: {f['life_path']}\n"
-            f"Главный аркан: {ROMAN[f['arcana_num']]} {f['arcana_name']}")
+    lines = [f"Знак: {f['zodiac']}", f"Число судьбы: {f['life_path']}",
+             f"Аркан личности: {f['personality_num']}, {f['personality_name']} — каким тебя видят люди",
+             f"Главная энергия: {f['arcana_num']}, {f['arcana_name']} — твоя главная тема и задача"]
+    if f["personality_num"] == f["arcana_num"]:
+        lines.append(FATE_SAME_TEXT)
+    return "🔢 Твой Код судьбы\n\n" + "\n".join(lines)
 
 
 FATE_STYLE = (
@@ -2856,35 +2872,75 @@ FATE_STYLE = (
 FATE_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
 
 
+FATE_PERSONALITY_LEAD = "Твой аркан личности"
+FATE_MAIN_LEAD = "Твоя главная энергия"
+
+
 def _fate_validator(parsed: dict) -> Optional[dict]:
+    """Длина 100–300 слов, первый абзац начинается с аркана личности, второй — с главной энергии,
+    чтобы было видно, какой абзац про какой аркан."""
     text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
+    paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
+    if len(paras) < 3 or not paras[0].startswith(FATE_PERSONALITY_LEAD) or not paras[1].startswith(FATE_MAIN_LEAD):
+        return None
     words = len(text.split())
-    return {"text": text} if 80 <= words <= 260 else None
+    return {"text": "\n\n".join(paras)} if 100 <= words <= 300 else None
+
+
+FATE_SOFT_ARCANA = {13, 16}  # Смерть и Башня пугают по названию
 
 
 async def generate_fate_code(d: date) -> str:
     f = fate_numbers(d)
+    same = f["personality_num"] == f["arcana_num"]
+    soft = sorted({f["personality_num"], f["arcana_num"]} & FATE_SOFT_ARCANA)
+    rules = ""
+    if soft:
+        rules += ("\nАРКАНЫ ПЕРЕМЕН: " + " и ".join(f"{n} ({ARCANA[n]})" for n in soft)
+                  + " — в абзаце про такой аркан сразу после первой фразы объясни, что это аркан перемен и обновления. "
+                    "Без пугающих слов: никаких «гибели», «разрушения», «краха», «катастрофы», «конца».\n")
+    if same:
+        rules += ("\nОба аркана совпали, и над текстом это уже написано. Не повторяй это. Пиши первый абзац о том, "
+                  "как аркан виден в характере, второй — о том, какую задачу он ставит. Второй абзац начни так: "
+                  f"«{FATE_MAIN_LEAD} — тоже {f['arcana_name']}.»\n")
     system_prompt = (
         "Ты — таролог проекта «Послание Таро». Напиши человеку его персональный «Код судьбы» по дате рождения.\n\n"
-        "Структура (без заголовков, 3–4 абзаца, всего 120–180 слов):\n"
-        "1. Каким этот человек кажется окружающим и в чём его сильная сторона, через сочетание знака и числа судьбы.\n"
-        "2. Главный аркан: как эта энергия проявляется в его решениях и характере, с одним бытовым примером.\n"
+        "Структура (без заголовков, 4 абзаца, всего 140–220 слов):\n"
+        f"1. Аркан личности. Абзац начинается словами «{FATE_PERSONALITY_LEAD} — {f['personality_name']}.» "
+        "Дальше: каким человека видят окружающие и в чём его сильная сторона в общении, "
+        "с учётом знака и числа судьбы.\n"
+        f"2. Главная энергия. Абзац начинается словами «{FATE_MAIN_LEAD} — {f['arcana_name']}.» "
+        "Дальше: главная тема и задача его жизни, как она проявляется в решениях, с одним бытовым примером.\n"
         "3. Одна зона роста: что даётся труднее, сказано мягко и по-честному.\n"
         "4. Последнее предложение — вопрос о его текущей ситуации, который естественно подводит к раскладу. "
-        "Не упоминай цены и кнопки.\n\n"
+        "Не упоминай цены и кнопки.\n"
+        "Называй арканы по названию. Номера арканов уже показаны над текстом, не повторяй их.\n"
+        + rules + "\n"
         "Абзацы разделяй пустой строкой. Никогда не используй слова «нейросеть», «ИИ», «алгоритм».\n\n"
         + FATE_STYLE + "\n\n"
         'ФОРМАТ — строго JSON: {"text": "..."}'
     )
-    user_prompt = (f"Данные: знак — {f['zodiac']}; число судьбы — {f['life_path']}; главный аркан — "
-                   f"{f['arcana_num']} {f['arcana_name']}.")
-    res = await call_ai(system_prompt, user_prompt, max_tokens=1200, schema=FATE_SCHEMA, validate=_fate_validator)
+    user_prompt = (f"Данные: знак — {f['zodiac']}; число судьбы — {f['life_path']}; "
+                   f"аркан личности — {f['personality_num']} {f['personality_name']}; "
+                   f"главная энергия — {f['arcana_num']} {f['arcana_name']}.")
+    res = await call_ai(system_prompt, user_prompt, max_tokens=1400, schema=FATE_SCHEMA, validate=_fate_validator)
     if res:
         return res["text"]
     log("⚠️ AI недоступен для Кода судьбы — запасной текст")
-    return (f"Твой главный аркан — {f['arcana_name']}. Он показывает, как ты обычно принимаешь решения и что "
-            f"тебе помогает в трудные моменты. Число судьбы {f['life_path']} и знак {f['zodiac']} добавляют к этому "
-            "твою манеру держаться с людьми.\n\nЕсть вопрос, на который ты сейчас ищешь ответ?")
+
+    def soft_note(n: int) -> str:
+        return " Это аркан перемен и обновления: старое уходит, чтобы освободить место новому." \
+            if n in FATE_SOFT_ARCANA else ""
+    first = (f"{FATE_PERSONALITY_LEAD} — {f['personality_name']}.{soft_note(f['personality_num'])} Он показывает, "
+             f"каким тебя видят люди и как ты держишься в разговоре. Знак {f['zodiac']} и число судьбы "
+             f"{f['life_path']} добавляют к этому твою манеру общаться.")
+    if same:
+        second = (f"{FATE_MAIN_LEAD} — тоже {f['arcana_name']}. Значит, то, что люди видят в тебе снаружи, "
+                  "и есть твоя главная тема и задача.")
+    else:
+        second = (f"{FATE_MAIN_LEAD} — {f['arcana_name']}.{soft_note(f['arcana_num'])} Для тебя это главная тема "
+                  "и задача, то, к чему ты снова и снова приходишь в важных решениях.")
+    return first + "\n\n" + second + "\n\nЕсть вопрос, на который ты сейчас ищешь ответ?"
 
 
 def source_kb() -> InlineKeyboardMarkup:
@@ -2910,23 +2966,33 @@ async def ask_birth_date(chat_id: int, uid: int):
         InlineKeyboardButton(text="Пропустить", callback_data="bd:skip")]]))
 
 
+def fate_is_fresh(user: dict) -> bool:
+    """Текст написан уже с двумя арканами (старые тексты с одним арканом — personality_arcana пустой)."""
+    return bool(user.get("fate_code_text")) and user.get("personality_arcana") is not None
+
+
 async def save_fate_code(uid: int, d: date) -> str:
-    """Сгенерировать текст один раз и сохранить. Если параллельно уже сохранили — вернуть сохранённый."""
+    """Сгенерировать текст и сохранить: впервые или вместо старого текста с одним арканом — один раз.
+    Если параллельно уже сохранили новый — вернуть сохранённый."""
     text = await generate_fate_code(d)
     p = await db()
-    return await p.fetchval("""
-        UPDATE users SET fate_code_text = COALESCE(fate_code_text, $2),
-                         fate_code_at = COALESCE(fate_code_at, NOW())
-        WHERE telegram_id = $1 RETURNING fate_code_text
-    """, uid, text)
+    saved = await p.fetchval("""
+        UPDATE users SET fate_code_text = $2, fate_code_at = NOW(), personality_arcana = $3
+        WHERE telegram_id = $1 AND (fate_code_text IS NULL OR personality_arcana IS NULL)
+        RETURNING fate_code_text
+    """, uid, text, personality_arcana(d))
+    return saved or await p.fetchval("SELECT fate_code_text FROM users WHERE telegram_id = $1", uid)
 
 
 def fate_payload(user: dict) -> Optional[dict]:
-    """Код судьбы для мини-аппа: цифры считаются из даты, текст — сохранённый."""
+    """Код судьбы для мини-аппа: цифры считаются из даты, текст — сохранённый.
+    stale — текст старый, с одним арканом: приложение попросит новый через /api/user/fate-code."""
     if not user.get("birth_date") or not user.get("fate_code_text"):
         return None
     f = fate_numbers(user["birth_date"])
-    f.update({"arcana_roman": ROMAN[f["arcana_num"]], "text": user["fate_code_text"]})
+    f.update({"arcana_roman": ROMAN[f["arcana_num"]], "personality_roman": ROMAN[f["personality_num"]],
+              "same": f["arcana_num"] == f["personality_num"], "text": user["fate_code_text"],
+              "stale": not fate_is_fresh(user)})
     return f
 
 
@@ -2945,20 +3011,22 @@ async def api_fate_code(payload: dict, authorization: str = Header(None)):
                              "RETURNING birth_date", uid, d)
         birth_waiting.pop(uid, None)
         track(uid, "birthdate_entered", {"via": "app"})
-    text = user.get("fate_code_text") or await save_fate_code(uid, d)
+    text = user["fate_code_text"] if fate_is_fresh(user) else await save_fate_code(uid, d)
     track(uid, "fate_code_viewed", {"via": "app"})
-    return {"fate": fate_payload({"birth_date": d, "fate_code_text": text}),
+    return {"fate": fate_payload({"birth_date": d, "fate_code_text": text,
+                                  "personality_arcana": personality_arcana(d)}),
             "birth_date": d.strftime("%d.%m.%Y")}
 
 
 async def send_fate_code(chat_id: int, uid: int):
-    """Показать сохранённый Код судьбы; если текста ещё нет — сгенерировать и сохранить один раз."""
+    """Показать сохранённый Код судьбы; если текста ещё нет или он старый (с одним арканом) —
+    сгенерировать и сохранить один раз."""
     user = await get_user(uid)
     if not user or not user.get("birth_date"):
         await ask_birth_date(chat_id, uid)
         return
     text = user.get("fate_code_text")
-    if not text:
+    if not fate_is_fresh(user):
         try:
             await bot.send_chat_action(chat_id, "typing")
         except Exception:
