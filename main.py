@@ -1836,6 +1836,7 @@ async def lifespan(_app: FastAPI):
         asyncio.create_task(setup_bot()),
         asyncio.create_task(keepalive_loop()),
         asyncio.create_task(push_loop()),
+        asyncio.create_task(fate_refresh_loop()),
         asyncio.create_task(load_tribute_products()),
         asyncio.create_task(news_scheduler()),
     ]
@@ -2907,7 +2908,7 @@ def _fate_validator(parsed: dict) -> Optional[dict]:
 FATE_SOFT_ARCANA = {13, 16}  # Смерть и Башня пугают по названию
 
 
-async def generate_fate_code(d: date) -> str:
+async def generate_fate_code(d: date, fallback: bool = True) -> Optional[str]:
     f = fate_numbers(d)
     same = f["personality_num"] == f["arcana_num"]
     soft = sorted({f["personality_num"], f["arcana_num"]} & FATE_SOFT_ARCANA)
@@ -2947,6 +2948,8 @@ async def generate_fate_code(d: date) -> str:
     res = await call_ai(system_prompt, user_prompt, max_tokens=1400, schema=FATE_SCHEMA, validate=_fate_validator)
     if res:
         return res["text"]
+    if not fallback:
+        return None
     log("⚠️ AI недоступен для Кода судьбы – запасной текст")
 
     def soft_note(n: int) -> str:
@@ -2992,10 +2995,10 @@ def fate_is_fresh(user: dict) -> bool:
     return bool(user.get("fate_code_text")) and user.get("personality_arcana") is not None
 
 
-async def save_fate_code(uid: int, d: date) -> str:
+async def save_fate_code(uid: int, d: date, text: Optional[str] = None) -> str:
     """Сгенерировать текст и сохранить: впервые или вместо старого текста с одним арканом – один раз.
     Если параллельно уже сохранили новый – вернуть сохранённый."""
-    text = await generate_fate_code(d)
+    text = text or await generate_fate_code(d)
     p = await db()
     saved = await p.fetchval("""
         UPDATE users SET fate_code_text = $2, fate_code_at = NOW(), personality_arcana = $3
@@ -3003,6 +3006,53 @@ async def save_fate_code(uid: int, d: date) -> str:
         RETURNING fate_code_text
     """, uid, text, personality_arcana(d))
     return saved or await p.fetchval("SELECT fate_code_text FROM users WHERE telegram_id = $1", uid)
+
+
+# Тексты с ошибкой «Овнам ты кажешься…» (то же, что FATE_SIGN_PLURAL_RE, в синтаксисе Postgres)
+FATE_SIGN_PLURAL_SQL = ("(Овнам|Тельцам|Близнецам|Ракам|Львам|Девам|Весам|Скорпионам|Стрельцам|Козерогам|"
+                        "Водолеям|Рыбам)")
+FATE_REFRESH_EVERY = 600   # секунд до повтора, если не всё переписано (ИИ недоступен)
+FATE_REFRESH_BATCH = 30    # текстов за проход, по одному раз в несколько секунд – чтобы не упереться в лимиты ИИ
+
+
+async def refresh_fate_codes() -> int:
+    """Переписать заранее, до захода человека: старые тексты с одним арканом и тексты с ошибкой «Овнам…».
+    Длинные тире в сохранённых текстах меняем на короткие без генерации. Возвращает, сколько осталось."""
+    p = await db()
+    await p.execute("UPDATE users SET fate_code_text = replace(fate_code_text, '\u2014', '–') "
+                    "WHERE fate_code_text LIKE '%\u2014%'")
+    await p.execute("UPDATE users SET personality_arcana = NULL "
+                    "WHERE personality_arcana IS NOT NULL AND fate_code_text ~ $1", FATE_SIGN_PLURAL_SQL)
+    rows = await p.fetch("""
+        SELECT telegram_id, birth_date FROM users
+        WHERE fate_code_text IS NOT NULL AND personality_arcana IS NULL AND birth_date IS NOT NULL
+        ORDER BY fate_code_at DESC NULLS LAST LIMIT $1
+    """, FATE_REFRESH_BATCH)
+    done = 0
+    for r in rows:
+        text = await generate_fate_code(r["birth_date"], fallback=False)
+        if not text:  # ИИ недоступен – запасным текстом не затираем, попробуем в следующий проход
+            break
+        await save_fate_code(r["telegram_id"], r["birth_date"], text)
+        done += 1
+        await asyncio.sleep(3)
+    if done:
+        log(f"🔢 Коды судьбы переписаны заранее: {done}")
+    return await p.fetchval("SELECT COUNT(*) FROM users WHERE fate_code_text IS NOT NULL "
+                            "AND personality_arcana IS NULL AND birth_date IS NOT NULL")
+
+
+async def fate_refresh_loop():
+    """Разовая чистка после запуска сервера: повторяет, пока не перепишет всё, и останавливается."""
+    await pool_ready.wait()
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if not await refresh_fate_codes():
+                return
+        except Exception as e:
+            log(f"⚠️ fate_refresh_loop: {e}")
+        await asyncio.sleep(FATE_REFRESH_EVERY)
 
 
 def fate_payload(user: dict) -> Optional[dict]:
