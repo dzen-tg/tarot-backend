@@ -17,6 +17,7 @@ import json
 import base64
 import hmac
 import hashlib
+import math
 import random
 import asyncio
 import re
@@ -267,6 +268,33 @@ def get_today_str() -> str:
     return local_now().strftime("%Y-%m-%d")
 
 
+def user_tz_min(user: dict) -> int:
+    """Часовой пояс человека в минутах от UTC: с телефона (мини-апп присылает его при входе),
+    а пока не прислал – по умолчанию TZ_OFFSET_HOURS (Алматы)."""
+    tz = user.get("tz_offset_min")
+    return int(tz) if tz is not None else TZ_OFFSET_HOURS * 60
+
+
+def user_now(user: dict) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(minutes=user_tz_min(user))
+
+
+def user_today(user: dict) -> str:
+    """Сегодня по местному времени человека – граница суток для Карты Дня и серии."""
+    return user_now(user).strftime("%Y-%m-%d")
+
+
+def user_yesterday(user: dict) -> str:
+    return (user_now(user) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def daily_taken(user: dict) -> bool:
+    """Карта Дня на сегодня уже открыта. last_daily_date «из будущего» бывает после смены часового пояса
+    (сутки по Алматы уже наступили, по местному – ещё нет): считаем, что сегодняшняя карта получена."""
+    last = user.get("last_daily_date")
+    return bool(last) and last >= user_today(user)
+
+
 def ref_link(user_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
@@ -409,6 +437,8 @@ async def init_schema():
             # Своё время рассылки: час по местному времени и часовой пояс телефона (минуты от UTC)
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS push_hour SMALLINT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_offset_min SMALLINT DEFAULT NULL",
+            # Релиз 2: день, когда отправили вечернее «серия сгорит» (местная дата, один раз в день)
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_remind_date VARCHAR(10) DEFAULT NULL",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -437,6 +467,16 @@ async def init_schema():
             );
         """)
         await c.execute("CREATE INDEX IF NOT EXISTS events_name_idx ON events (name, created_at)")
+        # Релиз 2: толкования «Числа дня» – одно на число в день, общее для всех
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS day_numbers (
+                day DATE NOT NULL,
+                num SMALLINT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (day, num)
+            );
+        """)
         await c.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 charge_id TEXT PRIMARY KEY,
@@ -511,6 +551,8 @@ SOURCE_OPTIONS = [
     ("friends", "Друзья посоветовали"),
     ("other", "Другое"),
 ]
+# С этой даты новых пользователей без источника (пришли сразу в мини-апп) спрашиваем в приложении
+SOURCE_ASK_SINCE = datetime(2026, 10, 31)
 # Start-параметры, по которым источник понятен без вопроса: t.me/Poslanie_tarobot?start=threads
 START_SOURCES = {"tiktok": "tiktok", "tt": "tiktok", "threads": "threads", "insta": "insta", "instagram": "insta",
                  "ig": "insta"}
@@ -1757,32 +1799,35 @@ async def send_daily_push() -> int:
     в часовом поясе телефона (tz_offset_min); если час не выбран – PUSH_HOUR по TZ_OFFSET_HOURS, как раньше.
     Возвращает число отправленных."""
     p = await db()
-    today = get_today_str()
-    yesterday = yesterday_str()
     sent = 0
     while True:
+        # local_ts – время рассылки (час выбран – по телефону, не выбран – по Алматы, как раньше);
+        # day_ts – местные сутки человека, по ним считаются Карта Дня и серия
         rows = await p.fetch("""
             WITH t AS (
                 SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date,
-                       daily_push, last_push_date, COALESCE(push_hour, $3) AS hour,
-                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN push_hour IS NULL THEN $4
-                           ELSE COALESCE(tz_offset_min, $4) END) AS local_ts
+                       daily_push, last_push_date, COALESCE(push_hour, $2) AS hour,
+                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN push_hour IS NULL THEN $3
+                           ELSE COALESCE(tz_offset_min, $3) END) AS local_ts,
+                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(tz_offset_min, $3)) AS day_ts
                 FROM users
-                WHERE notify AND NOT blocked AND (last_daily_date IS DISTINCT FROM $1)
+                WHERE notify AND NOT blocked
             )
-            SELECT *, to_char(local_ts, 'YYYY-MM-DD') AS local_day FROM t
-            WHERE EXTRACT(HOUR FROM local_ts) >= hour AND EXTRACT(HOUR FROM local_ts) < hour + $5
-              AND (daily_push OR EXTRACT(ISODOW FROM local_ts) - 1 = $2)
+            SELECT *, to_char(local_ts, 'YYYY-MM-DD') AS local_day,
+                   to_char(day_ts - INTERVAL '1 day', 'YYYY-MM-DD') AS day_yesterday FROM t
+            WHERE EXTRACT(HOUR FROM local_ts) >= hour AND EXTRACT(HOUR FROM local_ts) < hour + $4
+              AND (daily_push OR EXTRACT(ISODOW FROM local_ts) - 1 = $1)
               AND last_push_date IS DISTINCT FROM to_char(local_ts, 'YYYY-MM-DD')
+              AND (last_daily_date IS NULL OR last_daily_date < to_char(day_ts, 'YYYY-MM-DD'))
             LIMIT 200
-        """, today, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS)
+        """, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS)
         if not rows:
             break
         for r in rows:
             uid = r["telegram_id"]
             text = random.choice(PUSH_TEXTS).format(name=r["first_name"] or "Искатель")
             streak = r["streak"] or 0
-            if streak >= 2 and r["last_daily_date"] == yesterday:
+            if streak >= 2 and r["last_daily_date"] == r["day_yesterday"]:
                 nxt = STREAK_QUICK_EVERY - streak % STREAK_QUICK_EVERY
                 text += (f"\n\n🔥 Серия: {streak} {_plural(streak, 'день', 'дня', 'дней')} подряд. Не прерывай! "
                          f"Через {nxt} {_plural(nxt, 'день', 'дня', 'дней')} ждёт +{STREAK_WEEK_ENERGY} Энергии.")
@@ -1802,6 +1847,46 @@ async def send_daily_push() -> int:
             except Exception as e:
                 log(f"push {uid}: {e}")
             await asyncio.sleep(0.05)  # ~20 сообщений/сек – в пределах лимитов Telegram
+    return sent
+
+
+STREAK_REMIND_FROM, STREAK_REMIND_TO = 20, 23   # с 20:00 до 23:00 по местному времени
+
+
+async def send_streak_reminders() -> int:
+    """Вечером напоминаем тем, у кого серия от 2 дней, а сегодняшняя Карта Дня ещё не открыта: иначе серия
+    сгорит в полночь. Только тем, кто сам включил ежедневную рассылку; один раз в день. Кто выбрал время
+    рассылки на вечер, только что получил утреннее напоминание – им не пишем."""
+    p = await db()
+    sent = 0
+    while True:
+        rows = await p.fetch("""
+            WITH t AS (
+                SELECT telegram_id, streak, last_daily_date, push_hour, streak_remind_date,
+                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(tz_offset_min, $1)) AS day_ts
+                FROM users
+                WHERE daily_push AND notify AND NOT blocked AND streak >= 2
+            )
+            SELECT telegram_id, streak, to_char(day_ts, 'YYYY-MM-DD') AS local_day FROM t
+            WHERE EXTRACT(HOUR FROM day_ts) >= $2 AND EXTRACT(HOUR FROM day_ts) < $3
+              AND last_daily_date = to_char(day_ts - INTERVAL '1 day', 'YYYY-MM-DD')
+              AND streak_remind_date IS DISTINCT FROM to_char(day_ts, 'YYYY-MM-DD')
+              AND (push_hour IS NULL OR push_hour < $2 - 1)
+            LIMIT 200
+        """, TZ_OFFSET_HOURS * 60, STREAK_REMIND_FROM, STREAK_REMIND_TO)
+        if not rows:
+            break
+        for r in rows:
+            uid, streak = r["telegram_id"], r["streak"] or 0
+            await p.execute("UPDATE users SET streak_remind_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
+            nxt = STREAK_QUICK_EVERY - streak % STREAK_QUICK_EVERY
+            text = (f"🔥 Твоя серия – {streak} {_plural(streak, 'день', 'дня', 'дней')} подряд. "
+                    "Открой сегодняшнюю Карту Дня, чтобы не потерять её: в полночь серия начнётся заново.")
+            if nxt == 1:
+                text += f"\n\n🎁 Сегодняшняя карта принесёт +{STREAK_WEEK_ENERGY} Энергии."
+            if await _send_safe(uid, text, webapp_kb("🃏 Открыть Карту Дня")):
+                sent += 1
+            await asyncio.sleep(0.05)
     return sent
 
 
@@ -1906,6 +1991,9 @@ async def push_loop():
             n = await send_daily_push()
             if n:
                 log(f"📬 Пуш Карты Дня отправлен: {n}")
+            n = await send_streak_reminders()
+            if n:
+                log(f"📬 «Серия сгорит»: {n}")
             # «Сбылось?» и возврат – только днём, не ночью
             if 10 <= now.hour < 21:
                 n = await send_followups()
@@ -2034,7 +2122,7 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "balance": 99999 if admin else user.get("balance", 0),
         "free_readings": 0 if admin else (user.get("free_readings") or 0),
         "free_preset": 0 if admin else (user.get("free_preset") or 0),
-        "daily_available": admin or user.get("last_daily_date") != get_today_str(),
+        "daily_available": admin or not daily_taken(user),
         "daily_push": bool(user.get("daily_push")),
         "push_hour": user.get("push_hour"),
         "tz_offset_min": user.get("tz_offset_min"),
@@ -2042,7 +2130,7 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "push_hours": [PUSH_HOUR_MIN, PUSH_HOUR_MAX],
         "streak_rules": {"energy_day": STREAK_ENERGY_DAY, "energy": STREAK_ENERGY, "quick_every": STREAK_QUICK_EVERY,
                          "week_energy": STREAK_WEEK_ENERGY},
-        "streak": (user.get("streak") or 0) if user.get("last_daily_date") in (get_today_str(), yesterday_str()) else 0,
+        "streak": (user.get("streak") or 0) if (user.get("last_daily_date") or "") >= user_yesterday(user) else 0,
         "ref_link": ref_link(user["telegram_id"]),
         "ref_count": user.get("ref_count") or 0,
         "ref_bonus": REF_BONUS,
@@ -2062,6 +2150,10 @@ def profile_payload(user: dict, admin: bool) -> dict:
                             if k in TRIBUTE_PRODUCT_IDS and k in CARD_PRICES},
         "birth_date": user["birth_date"].strftime("%d.%m.%Y") if user.get("birth_date") else None,
         "fate": fate_payload(user),
+        # Пришёл сразу в мини-апп, мимо /start: спросим «Откуда узнал(а)?» в приложении
+        "ask_source": not user.get("source") and bool(user.get("created_at"))
+                      and user["created_at"] >= SOURCE_ASK_SINCE,
+        "source_options": [[k, v] for k, v in SOURCE_OPTIONS],
     }
 
 
@@ -2121,7 +2213,7 @@ async def get_user_profile(authorization: str = Header(None)):
     p = await db()
     out["ref_invited"] = await p.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
     out["today_daily_id"] = None
-    if user.get("last_daily_date") == get_today_str():
+    if daily_taken(user):
         p = await db()
         out["today_daily_id"] = await p.fetchval("""
             SELECT id FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
@@ -2240,11 +2332,11 @@ async def _streak_reward(uid: int, streak: int) -> Optional[str]:
 
 @app.post("/api/user/use-daily-ai-reading")
 async def use_daily_ai_reading(authorization: str = Header(None)):
-    """Карта дня – бесплатно, 1 раз в сутки (граница суток – по TZ_OFFSET_HOURS).
+    """Карта дня – бесплатно, 1 раз в сутки (граница суток – по местному времени человека).
     Повторный запрос в тот же день возвращает уже полученную карту, а не ошибку."""
     user, admin = await auth_user(authorization)
     uid = user["telegram_id"]
-    today = get_today_str()
+    today = user_today(user)
     p = await db()
     streak = user.get("streak") or 0
     if not admin:
@@ -2253,8 +2345,8 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
                 streak = CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END,
                 best_streak = GREATEST(best_streak, CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END),
                 last_daily_date = $2
-            WHERE telegram_id = $1 AND last_daily_date IS DISTINCT FROM $2 RETURNING streak
-        """, uid, today, yesterday_str())
+            WHERE telegram_id = $1 AND (last_daily_date IS NULL OR last_daily_date < $2) RETURNING streak
+        """, uid, today, user_yesterday(user))
         if streak is None:
             row = await p.fetchrow("""
                 SELECT * FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
@@ -2396,7 +2488,23 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
 
 
 CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
-                 "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open"}
+                 "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open"}
+
+
+@app.post("/api/user/source")
+async def api_source(payload: dict, authorization: str = Header(None)):
+    """«Откуда узнал(а)?» в мини-аппе – для тех, кто пришёл мимо /start. Пропуск сохраняем как unknown,
+    чтобы не спрашивать снова."""
+    user, _ = await auth_user(authorization)
+    key = str(payload.get("source") or "")
+    if key not in dict(SOURCE_OPTIONS) and key != "skip":
+        raise HTTPException(status_code=400, detail="bad source")
+    p = await db()
+    await p.execute("UPDATE users SET source = $2 WHERE telegram_id = $1 AND source IS NULL",
+                    user["telegram_id"], "unknown" if key == "skip" else key)
+    if key != "skip":
+        track(user["telegram_id"], "source_selected", {"source": key, "via": "app"})
+    return {"ok": True}
 
 
 @app.post("/api/event")
@@ -2854,7 +2962,7 @@ async def cmd_start(message: Message, command: CommandObject):
     lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
              "Это Послание Таро. Задай вопрос – и карты ответят.", ""]
     if user.get("_move_gift"):
-        lines.append(f"🎁 В честь переезда в новый бот мы начислили вам +{MOVE_GIFT} Энергии ✨ "
+        lines.append(f"🎁 В честь переезда в новый бот мы начислили тебе +{MOVE_GIFT} Энергии ✨ "
                      f"Теперь на балансе {user.get('balance', 0)}.")
     if (user.get("free_preset") or 0) > 0:
         lines.append("🎁 У тебя есть бесплатный Расклад на ситуацию (3 карты).")
@@ -2866,6 +2974,216 @@ async def cmd_start(message: Message, command: CommandObject):
               "🔢 Твой Код судьбы по дате рождения – /code", "",
               "Жми кнопку ниже 👇"]
     await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
+
+
+# =====================================================================
+# СЕГОДНЯ: Число дня и Луна (релиз 2)
+# Числа и фазы считает код; ИИ пишет только толкование числа – один текст на число в день, общий для всех.
+# =====================================================================
+def _digits_sum(n: int) -> int:
+    return sum(int(x) for x in str(n))
+
+
+def _reduce9(n: int) -> int:
+    while n > 9:
+        n = _digits_sum(n)
+    return n
+
+
+def _reduce_master(n: int) -> int:
+    while n > 9 and n not in (11, 22):
+        n = _digits_sum(n)
+    return n
+
+
+def day_number(day: date, birth: Optional[date] = None) -> int:
+    """Личное число дня: личный год (день и месяц рождения + текущий год) → личный месяц → + число месяца.
+    Без даты рождения – общее число дня по сумме цифр даты. Мастер-числа 11 и 22 сохраняем."""
+    if not birth:
+        return _reduce_master(_digits_sum(int(day.strftime("%d%m%Y"))))
+    year = _reduce9(_reduce9(birth.day) + _reduce9(birth.month) + _reduce9(_digits_sum(day.year)))
+    month = _reduce9(year + _reduce9(day.month))
+    return _reduce_master(month + day.day)
+
+
+DAY_NUMBER_WORDS = {1: "Начало", 2: "Партнёрство", 3: "Самовыражение", 4: "Порядок", 5: "Перемены", 6: "Забота",
+                    7: "Тишина", 8: "Результат", 9: "Завершение", 11: "Интуиция", 22: "Большие планы"}
+# Если ИИ недоступен: короткие тексты, которые не сохраняем в кэш – в следующий раз попробуем снова
+DAY_NUMBER_FALLBACK = {
+    1: "День хорош, чтобы начать то, что давно откладывалось: первый шаг сегодня даётся легче обычного.\n\n"
+       "Следи, чтобы напор не превратился в спешку. Решения лучше принимать самому, но выслушать других стоит.",
+    2: "Сегодня легче договариваться и замечать, что чувствуют другие. Хороший день для совместных дел.\n\n"
+       "Не растворяйся в чужих желаниях: мягкость работает, когда ты помнишь и о своих интересах.",
+    3: "Слова сегодня работают на тебя: легче объяснить, предложить, рассказать о себе.\n\n"
+       "Энергии много, и её легко распылить. Выбери одно-два дела и доведи их до конца.",
+    4: "День для порядка: разобрать дела, составить план, закрыть мелкие хвосты.\n\n"
+       "Не требуй от себя идеала. Достаточно сделать то, что запланировал, без лишнего контроля.",
+    5: "Сегодня проще отпустить привычное и попробовать новое: маршрут, подход, разговор.\n\n"
+       "Перемены хороши, когда они осознанные. Не принимай важных решений на одном порыве.",
+    6: "День про близких и заботу: разговоры по душам и помощь сегодня особенно ценятся.\n\n"
+       "Заботясь о других, не забудь о себе. Говорить «нет» сегодня тоже можно.",
+    7: "Хороший день, чтобы побыть в тишине, подумать, почитать, разобраться в себе.\n\n"
+       "Не торопи события и не жди от людей лишнего. Ответы сегодня приходят изнутри.",
+    8: "Сегодня легче добиваться результата: в делах, деньгах, переговорах.\n\n"
+       "Сила работает лучше без давления. Действуй уверенно, но оставь людям выбор.",
+    9: "День, чтобы завершать: закончить дело, отпустить обиду, разобрать старое.\n\n"
+       "Не начинай большое с нуля. Сначала освободи место для нового.",
+    11: "Сегодня интуиция звучит громче обычного: прислушайся к первому впечатлению.\n\n"
+        "Чувствительность высокая, поэтому береги себя от лишнего шума и чужих эмоций.",
+    22: "День для больших планов: хорошо думать о том, что строится годами.\n\n"
+        "Начни с одного практичного шага. Большая цель держится на маленьких делах.",
+}
+DAY_NUMBER_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+_day_number_locks: dict = {}
+
+
+def _day_number_validator(parsed: dict) -> Optional[dict]:
+    text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
+    words = len(text.split())
+    if not 30 <= words <= 110 or text.rstrip().endswith("?"):
+        return None
+    return {"text": text}
+
+
+async def _generate_day_number_text(num: int, day: date) -> Optional[str]:
+    system_prompt = (
+        "Ты нумеролог проекта «Послание Таро». Напиши короткое толкование числа дня.\n\n"
+        "Структура: 2 коротких абзаца через пустую строку, всего 45–75 слов. Первый – что сегодня даётся легче, "
+        "на что можно опереться. Второй – на что обратить внимание, мягко и конкретно: дела, разговоры, "
+        "отношения, отдых.\n"
+        "Текст читают все, у кого сегодня это число: без имён и без предположений о жизни и прошлом человека. "
+        "Без предсказаний событий и обещаний про деньги, здоровье и отношения. Без вопроса в конце.\n\n"
+        + HUMAN_STYLE + "\n\n"
+        'ФОРМАТ – строго JSON: {"text": "..."}'
+    )
+    user_prompt = f"Число дня: {num} ({DAY_NUMBER_WORDS[num]}). Дата: {day:%d.%m.%Y}."
+    res = await call_ai(system_prompt, user_prompt, max_tokens=900, schema=DAY_NUMBER_SCHEMA,
+                        validate=_day_number_validator)
+    if not res:
+        return None
+    new = (await humanize_fields({"text": res["text"]}, {"text": "Толкование числа дня"}, ""))["text"]
+    checked = _day_number_validator({"text": new})
+    return checked["text"] if checked else res["text"]
+
+
+async def day_number_text(num: int, day: date) -> str:
+    """Текст числа дня из кэша; если его ещё нет – пишем один раз (параллельные запросы ждут первый)."""
+    p = await db()
+    text = await p.fetchval("SELECT text FROM day_numbers WHERE day = $1 AND num = $2", day, num)
+    if text:
+        return text
+    if len(_day_number_locks) > 60:
+        _day_number_locks.clear()
+    async with _day_number_locks.setdefault((day, num), asyncio.Lock()):
+        text = await p.fetchval("SELECT text FROM day_numbers WHERE day = $1 AND num = $2", day, num)
+        if text:
+            return text
+        text = await _generate_day_number_text(num, day)
+        if not text:
+            return DAY_NUMBER_FALLBACK[num]
+        await p.execute("INSERT INTO day_numbers (day, num, text) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        day, num, text)
+        return text
+
+
+# --- Луна: моменты новолуний и полнолуний по Миусу («Астрономические алгоритмы», гл. 49), точность – минуты
+SYNODIC_MONTH = 29.530588861
+_J2000 = datetime(2000, 1, 1, 12, tzinfo=timezone.utc)
+_DELTA_T_DAYS = 69 / 86400  # разница земного и всемирного времени, ~69 с
+
+
+def _moon_phase_jde(k: float) -> float:
+    """JDE новолуния (k целое) или полнолуния (k + 0.5)."""
+    t = k / 1236.85
+    jde = (2451550.09766 + SYNODIC_MONTH * k + 0.00015437 * t ** 2 - 0.000000150 * t ** 3
+           + 0.00000000073 * t ** 4)
+    e = 1 - 0.002516 * t - 0.0000074 * t ** 2
+    r = math.radians
+    m = r(2.5534 + 29.10535670 * k - 0.0000014 * t ** 2 - 0.00000011 * t ** 3)
+    mp = r(201.5643 + 385.81693528 * k + 0.0107582 * t ** 2 + 0.00001238 * t ** 3 - 0.000000058 * t ** 4)
+    f = r(160.7108 + 390.67050284 * k - 0.0016118 * t ** 2 - 0.00000227 * t ** 3 + 0.000000011 * t ** 4)
+    om = r(124.7746 - 1.56375588 * k + 0.0020672 * t ** 2 + 0.00000215 * t ** 3)
+    full = (k % 1) != 0
+    c = ((-0.40614 if full else -0.40720) * math.sin(mp) + (0.17302 if full else 0.17241) * e * math.sin(m)
+         + (0.01614 if full else 0.01608) * math.sin(2 * mp) + (0.01043 if full else 0.01039) * math.sin(2 * f)
+         + (0.00734 if full else 0.00739) * e * math.sin(mp - m) - (0.00515 if full else 0.00514) * e * math.sin(mp + m)
+         + (0.00209 if full else 0.00208) * e * e * math.sin(2 * m) - 0.00111 * math.sin(mp - 2 * f)
+         - 0.00057 * math.sin(mp + 2 * f) + 0.00056 * e * math.sin(2 * mp + m) - 0.00042 * math.sin(3 * mp)
+         + 0.00042 * e * math.sin(m + 2 * f) + 0.00038 * e * math.sin(m - 2 * f)
+         - 0.00024 * e * math.sin(2 * mp - m) - 0.00017 * math.sin(om))
+    return jde + c
+
+
+def _jde_to_utc(jde: float) -> datetime:
+    return _J2000 + timedelta(days=jde - _DELTA_T_DAYS - 2451545.0)
+
+
+def moon_events(now: datetime) -> tuple:
+    """(последнее новолуние, ближайшее полнолуние этого цикла, следующее новолуние) – в UTC."""
+    k0 = math.floor((now - _J2000).total_seconds() / 86400 / SYNODIC_MONTH)
+    news = [_jde_to_utc(_moon_phase_jde(k)) for k in range(k0 - 1, k0 + 3)]
+    i = max(j for j, d in enumerate(news) if d <= now)
+    return news[i], _jde_to_utc(_moon_phase_jde(k0 - 1 + i + 0.5)), news[i + 1]
+
+
+MOON_PHASES = {
+    "new": ("🌑", "Новолуние", "Время тишины и замыслов. Хорошо загадать намерение и наметить планы, "
+                               "а с большими делами подождать пару дней."),
+    "wax_crescent": ("🌒", "Растущий серп", "Силы прибывают. Хорошо начинать новое, делать первые шаги "
+                                            "и пробовать то, что давно хотелось."),
+    "first_quarter": ("🌓", "Первая четверть", "Время действовать и решать. Препятствия сейчас проще "
+                                               "преодолеть, если не откладывать."),
+    "wax_gibbous": ("🌔", "Растущая Луна", "Хорошо доводить начатое, развивать и укреплять. "
+                                          "Усилия сейчас дают заметный результат."),
+    "full": ("🌕", "Полнолуние", "Пик энергии и эмоций. Хорошо подводить итоги и замечать главное, "
+                                 "а в спорах лучше выдохнуть, прежде чем отвечать."),
+    "wan_gibbous": ("🌖", "Убывающая Луна", "Время делиться, благодарить и разбирать сделанное. "
+                                            "Хорошо завершать дела, а не начинать новые."),
+    "last_quarter": ("🌗", "Последняя четверть", "Хорошо отпускать лишнее: старые дела, вещи, обиды. "
+                                                 "Освобождай место для нового цикла."),
+    "wan_crescent": ("🌘", "Убывающий серп", "Время отдыха и восстановления. Береги силы, "
+                                             "не нагружай себя лишним, готовься к новому началу."),
+}
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+              "ноября", "декабря"]
+
+
+def moon_info(now: datetime, tz_min: int) -> dict:
+    """Фаза, освещённость и лунный день (упрощённо: сутки от момента новолуния, 1–30) на момент now (UTC)."""
+    prev_new, full, next_new = moon_events(now)
+    age = (now - prev_new).total_seconds() / 86400
+    frac = age / ((next_new - prev_new).total_seconds() / 86400)
+    illum = round((1 - math.cos(2 * math.pi * frac)) / 2 * 100)
+    waxing = now < full
+    if age < 1 or next_new - now < timedelta(days=1):
+        key = "new"
+    elif abs(now - full) < timedelta(days=1):
+        key = "full"
+    elif waxing:
+        key = "wax_crescent" if illum < 40 else "first_quarter" if illum <= 60 else "wax_gibbous"
+    else:
+        key = "wan_gibbous" if illum > 60 else "last_quarter" if illum >= 40 else "wan_crescent"
+    emoji, name, text = MOON_PHASES[key]
+    nxt_name, nxt = ("Полнолуние", full) if waxing and key != "full" else ("Новолуние", next_new)
+    nxt_local = nxt + timedelta(minutes=tz_min)
+    return {"phase": key, "emoji": emoji, "name": name, "text": text, "illumination": illum,
+            "lunar_day": min(30, int(age) + 1), "waxing": waxing,
+            "next": {"name": nxt_name, "date": f"{nxt_local.day} {MONTHS_GEN[nxt_local.month - 1]}"}}
+
+
+@app.get("/api/user/today")
+async def api_today(authorization: str = Header(None)):
+    """Блок «Сегодня» на главном экране: личное (или общее) число дня с толкованием и Луна."""
+    user, _ = await auth_user(authorization)
+    day = user_now(user).date()
+    birth = user.get("birth_date")
+    num = day_number(day, birth)
+    return {
+        "date": day.strftime("%d.%m.%Y"),
+        "number": {"value": num, "word": DAY_NUMBER_WORDS[num], "personal": bool(birth),
+                   "text": await day_number_text(num, day)},
+        "moon": moon_info(datetime.now(timezone.utc), user_tz_min(user)),
+    }
 
 
 # =====================================================================
@@ -2992,7 +3310,7 @@ def _fate_validator(parsed: dict) -> Optional[dict]:
     paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
     if len(paras) < 3 or not paras[0].startswith(FATE_PERSONALITY_LEAD) or not paras[1].startswith(FATE_MAIN_LEAD):
         return None
-    if FATE_SIGN_PLURAL_RE.search(text):
+    if FATE_SIGN_PLURAL_RE.search(text) or not paras[-1].rstrip().endswith("?"):
         return None
     words = len(text.split())
     return {"text": "\n\n".join(paras)} if 100 <= words <= 300 else None
