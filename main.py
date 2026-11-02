@@ -38,7 +38,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
-    Update, LabeledPrice, PreCheckoutQuery, Message, BotCommand, CallbackQuery,
+    Update, LabeledPrice, PreCheckoutQuery, Message, BotCommand, CallbackQuery, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, MenuButtonWebApp, MenuButtonDefault, LinkPreviewOptions,
 )
 
@@ -439,6 +439,8 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS tz_offset_min SMALLINT DEFAULT NULL",
             # Релиз 2: день, когда отправили вечернее «серия сгорит» (местная дата, один раз в день)
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_remind_date VARCHAR(10) DEFAULT NULL",
+            # Когда бот последний раз писал человеку сам (рассылки, напоминания) – не больше одного раза в сутки
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_bot_msg_at TIMESTAMP DEFAULT NULL",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -1686,7 +1688,7 @@ async def setup_bot():
         await bot.set_webhook(
             url=webhook_url,
             secret_token=WEBHOOK_SECRET,
-            allowed_updates=["message", "pre_checkout_query", "callback_query"],
+            allowed_updates=["message", "pre_checkout_query", "callback_query", "my_chat_member"],
             drop_pending_updates=False,
         )
         log(f"Вебхук: {webhook_url}")
@@ -1806,7 +1808,7 @@ async def send_daily_push() -> int:
         rows = await p.fetch("""
             WITH t AS (
                 SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date,
-                       daily_push, last_push_date, COALESCE(push_hour, $2) AS hour,
+                       daily_push, last_push_date, created_at, last_bot_msg_at, COALESCE(push_hour, $2) AS hour,
                        (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN push_hour IS NULL THEN $3
                            ELSE COALESCE(tz_offset_min, $3) END) AS local_ts,
                        (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(tz_offset_min, $3)) AS day_ts
@@ -1816,11 +1818,13 @@ async def send_daily_push() -> int:
             SELECT *, to_char(local_ts, 'YYYY-MM-DD') AS local_day,
                    to_char(day_ts - INTERVAL '1 day', 'YYYY-MM-DD') AS day_yesterday FROM t
             WHERE EXTRACT(HOUR FROM local_ts) >= hour AND EXTRACT(HOUR FROM local_ts) < hour + $4
-              AND (daily_push OR EXTRACT(ISODOW FROM local_ts) - 1 = $1)
+              AND (daily_push OR (EXTRACT(ISODOW FROM local_ts) - 1 = $1
+                   AND created_at < NOW() - make_interval(days => $5)
+                   AND (last_bot_msg_at IS NULL OR last_bot_msg_at < NOW() - make_interval(hours => $6))))
               AND last_push_date IS DISTINCT FROM to_char(local_ts, 'YYYY-MM-DD')
               AND (last_daily_date IS NULL OR last_daily_date < to_char(day_ts, 'YYYY-MM-DD'))
             LIMIT 200
-        """, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS)
+        """, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS, NEW_USER_QUIET_DAYS, QUIET_HOURS)
         if not rows:
             break
         for r in rows:
@@ -1836,7 +1840,8 @@ async def send_daily_push() -> int:
             elif (r["free_readings"] or 0) > 0:
                 text += "\n\n🎁 А ещё у тебя есть бесплатный Быстрый ответ: задай картам свой вопрос."
             text += energy_reminder(r["balance"] or 0)
-            await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
+            await p.execute("UPDATE users SET last_push_date = $2, last_bot_msg_at = NOW() WHERE telegram_id = $1",
+                            uid, r["local_day"])
             try:
                 await bot.send_message(uid, text, reply_markup=webapp_kb("🃏 Открыть Карту Дня", channel=True))
                 sent += 1
@@ -1851,6 +1856,8 @@ async def send_daily_push() -> int:
 
 
 STREAK_REMIND_FROM, STREAK_REMIND_TO = 20, 23   # с 20:00 до 23:00 по местному времени
+QUIET_HOURS = 20          # между сообщениями, о которых человек не просил (недельная рассылка, «вернись», «сбылось?»)
+NEW_USER_QUIET_DAYS = 3   # новичкам без включённой Карты Дня недельную рассылку не шлём первые 3 дня
 
 
 async def send_streak_reminders() -> int:
@@ -1896,6 +1903,7 @@ async def _send_safe(uid: int, text: str, kb: InlineKeyboardMarkup) -> bool:
     for _ in range(2):
         try:
             await bot.send_message(uid, text, reply_markup=kb)
+            await p.execute("UPDATE users SET last_bot_msg_at = NOW() WHERE telegram_id = $1", uid)
             return True
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
@@ -1922,9 +1930,10 @@ async def send_followups() -> int:
           AND r.created_at < NOW() - make_interval(days => $2)
           AND r.created_at > NOW() - make_interval(days => $2 + 4)
           AND u.notify AND NOT u.blocked
+          AND (u.last_bot_msg_at IS NULL OR u.last_bot_msg_at < NOW() - make_interval(hours => $3))
         ORDER BY r.telegram_id, r.created_at DESC
         LIMIT 200
-    """, list(FOLLOWUP_KINDS), FOLLOWUP_DAYS)
+    """, list(FOLLOWUP_KINDS), FOLLOWUP_DAYS, QUIET_HOURS)
     sent = 0
     for r in rows:
         uid = r["telegram_id"]
@@ -1959,8 +1968,9 @@ async def send_winback() -> int:
           AND COALESCE(last_seen, created_at) < NOW() - make_interval(days => $2)
           AND (last_winback IS NULL OR last_winback < NOW() - make_interval(days => $3))
           AND last_push_date IS DISTINCT FROM $4
+          AND (last_bot_msg_at IS NULL OR last_bot_msg_at < NOW() - make_interval(hours => $5))
         LIMIT 200
-    """, COST_QUICK, WINBACK_IDLE_DAYS, WINBACK_REPEAT_DAYS, get_today_str())
+    """, COST_QUICK, WINBACK_IDLE_DAYS, WINBACK_REPEAT_DAYS, get_today_str(), QUIET_HOURS)
     sent = 0
     for r in rows:
         uid = r["telegram_id"]
@@ -3925,6 +3935,29 @@ def _parse_invoice_payload(raw: str) -> Optional[tuple]:
         return None
     rid = int(parts[3][1:]) if len(parts) == 4 and parts[3][:1] == "r" and parts[3][1:].isdigit() else None
     return parts[0], int(parts[1]), rid
+
+
+@dp.my_chat_member()
+async def on_bot_blocked(ev: ChatMemberUpdated):
+    """Человек заблокировал или разблокировал бота. Пишем событие с тем, сколько часов прошло после последнего
+    сообщения от бота и после последнего входа: так видно, блокируют из-за рассылок или сразу после знакомства."""
+    if ev.chat.type != "private":
+        return
+    status = str(getattr(ev.new_chat_member.status, "value", ev.new_chat_member.status))
+    uid = ev.from_user.id
+    p = await db()
+    if status == "kicked":
+        row = await p.fetchrow("""
+            UPDATE users SET blocked = TRUE WHERE telegram_id = $1
+            RETURNING EXTRACT(EPOCH FROM NOW() - last_bot_msg_at) / 3600 AS since_msg,
+                      EXTRACT(EPOCH FROM NOW() - COALESCE(last_seen, created_at)) / 3600 AS since_seen,
+                      EXTRACT(EPOCH FROM NOW() - created_at) / 3600 AS since_signup
+        """, uid)
+        hours = lambda v: round(float(v), 1) if v is not None else None
+        track(uid, "bot_blocked", {k: hours(row[k]) for k in ("since_msg", "since_seen", "since_signup")} if row else None)
+    elif status == "member":
+        await p.execute("UPDATE users SET blocked = FALSE WHERE telegram_id = $1", uid)
+        track(uid, "bot_unblocked")
 
 
 @dp.pre_checkout_query()
