@@ -3,3 +3,4 @@ uvicorn[standard]>=0.29
 aiogram>=3.13,<4
 asyncpg>=0.29
 httpx>=0.27
+skyfield==1.49

@@ -441,6 +441,8 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_remind_date VARCHAR(10) DEFAULT NULL",
             # Когда бот последний раз писал человеку сам (рассылки, напоминания) – не больше одного раза в сутки
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_bot_msg_at TIMESTAMP DEFAULT NULL",
+            # Релиз 3: знак, выбранный в приложении для гороскопа (если даты рождения нет)
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS horo_sign VARCHAR(16) DEFAULT NULL",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -469,6 +471,16 @@ async def init_schema():
             );
         """)
         await c.execute("CREATE INDEX IF NOT EXISTS events_name_idx ON events (name, created_at)")
+        # Релиз 3: гороскопы на неделю – 12 текстов на неделю (week_start – понедельник)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS horoscopes (
+                week_start DATE NOT NULL,
+                sign VARCHAR(16) NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (week_start, sign)
+            );
+        """)
         # Релиз 2: толкования «Числа дня» – одно на число в день, общее для всех
         await c.execute("""
             CREATE TABLE IF NOT EXISTS day_numbers (
@@ -1392,7 +1404,7 @@ async def _humanize_structured(norm: dict, question: str, pre_selected_cards: li
     return out
 
 
-async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> dict:
+async def generate_dynamic_reading(question: str, pre_selected_cards: list, context: str = "") -> dict:
     """Индивидуальный разбор – 6-12 карт + общая картина, прямой ответ и шаги."""
     cards_str = ", ".join([f"[{i}] {c['name']}" for i, c in enumerate(pre_selected_cards)])
     system_prompt = (
@@ -1411,6 +1423,8 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
         + STRUCTURED_FORMAT
     )
     user_prompt = f"Вопрос человека: «{question}».\nДоступные карты (выбирай по номеру в квадратных скобках): {cards_str}."
+    if context:
+        user_prompt += "\n" + context
     norm = await call_ai(system_prompt, user_prompt, max_tokens=6000, schema=STRUCTURED_SCHEMA,
                          validate=_make_validator(pre_selected_cards, 6, 10))
     if norm:
@@ -1423,7 +1437,7 @@ async def generate_dynamic_reading(question: str, pre_selected_cards: list) -> d
 PRESET_POSITIONS = ["Настоящее", "Действие", "Перспектива"]
 
 
-async def generate_preset_reading(question: str, pre_selected_cards: list) -> dict:
+async def generate_preset_reading(question: str, pre_selected_cards: list, context: str = "") -> dict:
     """Расклад на ситуацию – 3 карты (Настоящее/Действие/Перспектива) + ответ, шаги и общая картина."""
     cards_str = ", ".join([f"[{i}] {c['name']}" for i, c in enumerate(pre_selected_cards)])
     system_prompt = (
@@ -1443,6 +1457,8 @@ async def generate_preset_reading(question: str, pre_selected_cards: list) -> di
         + STRUCTURED_FORMAT
     )
     user_prompt = f"Вопрос: «{question}».\nДоступные карты (выбирай по номеру в квадратных скобках): {cards_str}."
+    if context:
+        user_prompt += "\n" + context
     norm = await call_ai(system_prompt, user_prompt, max_tokens=3500, schema=STRUCTURED_SCHEMA,
                          validate=_make_validator(pre_selected_cards, 3, 3))
     if norm:
@@ -1512,7 +1528,7 @@ def _build_quick(norm: dict, pre_selected_cards: list) -> dict:
     return {"cards_used_indices": [i for i, _ in norm["cards"]], "reading": "\n\n".join(parts)}
 
 
-async def generate_quick_reading(question: str, pre_selected_cards: list) -> dict:
+async def generate_quick_reading(question: str, pre_selected_cards: list, context: str = "") -> dict:
     """Быстрый ответ – короткий ответ по одной карте."""
     pre_selected_cards = pre_selected_cards[:1]
     cards_str = f"[0] {pre_selected_cards[0]['name']} ({pre_selected_cards[0]['type']})"
@@ -1537,6 +1553,8 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
         + TAROLOGIST_PROMPT + "\n\n" + ANSWER_RULE + "\n\n" + HUMAN_STYLE
     )
     user_prompt = f"Вопрос: «{question}».\nВытянутая карта: {cards_str}."
+    if context:
+        user_prompt += "\n" + context
     norm = await call_ai(system_prompt, user_prompt, max_tokens=1500, schema=QUICK_SCHEMA,
                          validate=_quick_validator(pre_selected_cards))
     if norm:
@@ -1561,7 +1579,7 @@ async def generate_quick_reading(question: str, pre_selected_cards: list) -> dic
     return {"cards_used_indices": [0], "reading": text}
 
 
-async def generate_spread_reading(spread_id: str, question: str, pre_selected_cards: list) -> dict:
+async def generate_spread_reading(spread_id: str, question: str, pre_selected_cards: list, context: str = "") -> dict:
     """Тематический расклад: фиксированные позиции из SPREADS, карты – по порядку вытягивания."""
     sp = SPREADS[spread_id]
     n = len(sp["positions"])
@@ -1576,6 +1594,8 @@ async def generate_spread_reading(spread_id: str, question: str, pre_selected_ca
         + STRUCTURED_FORMAT
     )
     user_prompt = f"Вопрос: «{question}».\nКарты по позициям: {cards_str}."
+    if context:
+        user_prompt += "\n" + context
     norm = await call_ai(system_prompt, user_prompt, max_tokens=4000, schema=STRUCTURED_SCHEMA,
                          validate=_make_validator(cards, n, n))
     if norm:
@@ -1594,7 +1614,8 @@ async def generate_spread_reading(spread_id: str, question: str, pre_selected_ca
     return {"cards_used_indices": list(range(n)), "reading": "\n\n".join(parts)}
 
 
-async def generate_clarification(question: str, kind: str, cards: list, reading_text: str, new_card: dict) -> str:
+async def generate_clarification(question: str, kind: str, cards: list, reading_text: str, new_card: dict,
+                                context: str = "") -> str:
     """Уточняющая карта к уже сделанному раскладу: отвечает на тот же вопрос с учётом выпавших карт."""
     name = _card_name(new_card)
     prev = ", ".join(_card_name(c) for c in cards) or "–"
@@ -1614,6 +1635,8 @@ async def generate_clarification(question: str, kind: str, cards: list, reading_
         text = clean_ai_text(str(parsed.get("reading") or "")).strip()
         return {"reading": text} if len(text) >= 60 else None
 
+    if context:
+        user_prompt += "\n" + context
     res = await call_ai(system_prompt, user_prompt, max_tokens=1200, validate=validate)
     if res:
         new = await humanize_fields({"reading": res["reading"]}, {"reading": f"Уточняющая карта – {name}"}, question)
@@ -1802,20 +1825,23 @@ async def send_daily_push() -> int:
     Возвращает число отправленных."""
     p = await db()
     sent = 0
+    ws = week_start(local_now().date())
+    horo_ready = {r["sign"] for r in await p.fetch("SELECT sign FROM horoscopes WHERE week_start = $1", ws)}
     while True:
         # local_ts – время рассылки (час выбран – по телефону, не выбран – по Алматы, как раньше);
         # day_ts – местные сутки человека, по ним считаются Карта Дня и серия
         rows = await p.fetch("""
             WITH t AS (
                 SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date,
-                       daily_push, last_push_date, created_at, last_bot_msg_at, COALESCE(push_hour, $2) AS hour,
+                       daily_push, last_push_date, created_at, last_bot_msg_at, birth_date, horo_sign,
+                       COALESCE(push_hour, $2) AS hour,
                        (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN push_hour IS NULL THEN $3
                            ELSE COALESCE(tz_offset_min, $3) END) AS local_ts,
                        (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(tz_offset_min, $3)) AS day_ts
                 FROM users
                 WHERE notify AND NOT blocked
             )
-            SELECT *, to_char(local_ts, 'YYYY-MM-DD') AS local_day,
+            SELECT *, to_char(local_ts, 'YYYY-MM-DD') AS local_day, EXTRACT(ISODOW FROM local_ts) - 1 AS local_dow,
                    to_char(day_ts - INTERVAL '1 day', 'YYYY-MM-DD') AS day_yesterday FROM t
             WHERE EXTRACT(HOUR FROM local_ts) >= hour AND EXTRACT(HOUR FROM local_ts) < hour + $4
               AND (daily_push OR (EXTRACT(ISODOW FROM local_ts) - 1 = $1
@@ -1840,10 +1866,18 @@ async def send_daily_push() -> int:
             elif (r["free_readings"] or 0) > 0:
                 text += "\n\n🎁 А ещё у тебя есть бесплатный Быстрый ответ: задай картам свой вопрос."
             text += energy_reminder(r["balance"] or 0)
+            kb = webapp_kb("🃏 Открыть Карту Дня", channel=True)
+            # В день недельной рассылки – гороскоп: знак известен – сразу его, нет – выбор знака
+            sign = user_sign(dict(r))
+            if int(r["local_dow"]) == PUSH_WEEKDAY and (sign in horo_ready if sign else horo_ready):
+                text += "\n\n🔭 Твой гороскоп на неделю готов."
+                url = f"{FRONTEND_URL}?open=horoscope&from=broadcast" + (f"&sign={sign}" if sign else "")
+                kb.inline_keyboard.insert(1, [InlineKeyboardButton(text="🔭 Гороскоп на неделю",
+                                                                   web_app=WebAppInfo(url=url))])
             await p.execute("UPDATE users SET last_push_date = $2, last_bot_msg_at = NOW() WHERE telegram_id = $1",
                             uid, r["local_day"])
             try:
-                await bot.send_message(uid, text, reply_markup=webapp_kb("🃏 Открыть Карту Дня", channel=True))
+                await bot.send_message(uid, text, reply_markup=kb)
                 sent += 1
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
@@ -2028,6 +2062,7 @@ async def lifespan(_app: FastAPI):
         asyncio.create_task(keepalive_loop()),
         asyncio.create_task(push_loop()),
         asyncio.create_task(fate_refresh_loop()),
+        asyncio.create_task(horoscope_loop()),
         asyncio.create_task(load_tribute_products()),
         asyncio.create_task(news_scheduler()),
     ]
@@ -2164,6 +2199,8 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "ask_source": not user.get("source") and bool(user.get("created_at"))
                       and user["created_at"] >= SOURCE_ASK_SINCE,
         "source_options": [[k, v] for k, v in SOURCE_OPTIONS],
+        "horo_sign": user_sign(user),
+        "signs": [[k, n, e] for k, n, e in SIGNS],
     }
 
 
@@ -2267,7 +2304,7 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 6)
-        result_data = await generate_preset_reading(question, pre_selected)
+        result_data = await generate_preset_reading(question, pre_selected, await sky_line(user))
     except Exception as e:
         log(f"preset error: {e}")
         await refund(uid, mode, COST_PRESET)
@@ -2291,7 +2328,7 @@ async def use_quick_reading(payload: dict, authorization: str = Header(None)):
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 1)
-        result_data = await generate_quick_reading(question, pre_selected)
+        result_data = await generate_quick_reading(question, pre_selected, await sky_line(user))
     except Exception as e:
         log(f"quick error: {e}")
         await refund(uid, mode, COST_QUICK)
@@ -2316,7 +2353,7 @@ async def use_spread(payload: dict, authorization: str = Header(None)):
     n = len(sp["positions"])
     try:
         pre_selected = random.sample(get_tarot_deck(), n)
-        result_data = await generate_spread_reading(spread_id, question, pre_selected)
+        result_data = await generate_spread_reading(spread_id, question, pre_selected, await sky_line(user))
     except Exception as e:
         log(f"spread {spread_id} error: {e}")
         await refund(uid, mode, sp["cost"])
@@ -2391,7 +2428,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 12)
-        result_data = await generate_dynamic_reading(question, pre_selected)
+        result_data = await generate_dynamic_reading(question, pre_selected, await sky_line(user))
     except Exception as e:
         log(f"ai reading error: {e}")
         await refund(uid, mode, COST_AI)
@@ -2451,7 +2488,8 @@ async def clarify_reading(reading_id: int, authorization: str = Header(None)):
         cards = json.loads(row["cards"] or "[]")
         taken = {c["name"] for c in cards} | {c["card"]["name"] for c in json.loads(row["clarifications"] or "[]")}
         new_card = random.choice([c for c in get_tarot_deck() if c["name"] not in taken])
-        text = await generate_clarification(row["question"] or "", row["kind"], cards, row["text"], new_card)
+        text = await generate_clarification(row["question"] or "", row["kind"], cards, row["text"], new_card,
+                                            await sky_line(user))
     except Exception as e:
         log(f"clarify error: {e}")
         await refund(uid, mode, cost)
@@ -2498,7 +2536,8 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
 
 
 CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
-                 "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open"}
+                 "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open",
+                 "sky_viewed", "horoscope_from_broadcast"}
 
 
 @app.post("/api/user/source")
@@ -3181,6 +3220,419 @@ def moon_info(now: datetime, tz_min: int) -> dict:
             "next": {"name": nxt_name, "date": f"{nxt_local.day} {MONTHS_GEN[nxt_local.month - 1]}"}}
 
 
+# =====================================================================
+# НЕБО: Луна, ретрограды, ближайшие события (релиз 3)
+# Считает skyfield по эфемеридам NASA JPL DE421 – только код, без ИИ. Результаты кэшируются на час.
+# =====================================================================
+SKY_EPH_FILE = "de421.bsp"   # 17 МБ: рядом с main.py, а если его нет – один раз скачивается с сайта JPL
+SKY_CACHE_SECONDS = 3600
+_sky_state: dict = {}
+_sky_cache: dict = {}        # ключ → (время расчёта, результат)
+_sky_lock = asyncio.Lock()
+
+PLANETS = [("mercury", "Меркурий", "mercury"), ("venus", "Венера", "venus"), ("mars", "Марс", "mars"),
+           ("jupiter", "Юпитер", "jupiter barycenter"), ("saturn", "Сатурн", "saturn barycenter")]
+RETRO_WORD = {"venus": "ретроградная"}   # остальные планеты – мужского рода
+RETRO_TIPS = {
+    "mercury": "Перепроверяй договорённости, сообщения и документы, а покупку техники лучше отложить.",
+    "venus": "Не время для резких решений в отношениях и крупных трат на себя. Хорошо вернуться к старым связям.",
+    "mars": "Силы приходят рывками: не форсируй споры и рекорды, лучше доделать начатое.",
+    "jupiter": "Рост идёт внутрь: пересмотри планы и цели, прежде чем расширяться.",
+    "saturn": "Время пересмотреть обязательства и правила: что держит, а что уже тяготит.",
+}
+# «Для чего хорош день» – одна строка на фазу
+MOON_GOOD_FOR = {
+    "new": "Загадать намерение и наметить планы, большие дела – через пару дней.",
+    "wax_crescent": "Начинать новое и делать первые шаги.",
+    "first_quarter": "Действовать и решать то, что откладывалось.",
+    "wax_gibbous": "Доводить начатое и укреплять результат.",
+    "full": "Подводить итоги, а в спорах – выдохнуть, прежде чем отвечать.",
+    "wan_gibbous": "Делиться, благодарить и разбирать сделанное.",
+    "last_quarter": "Отпускать лишнее: старые дела, вещи, обиды.",
+    "wan_crescent": "Отдыхать, восстанавливаться и не брать лишнего.",
+}
+SIGNS = [("aries", "Овен", "♈"), ("taurus", "Телец", "♉"), ("gemini", "Близнецы", "♊"), ("cancer", "Рак", "♋"),
+         ("leo", "Лев", "♌"), ("virgo", "Дева", "♍"), ("libra", "Весы", "♎"), ("scorpio", "Скорпион", "♏"),
+         ("sagittarius", "Стрелец", "♐"), ("capricorn", "Козерог", "♑"), ("aquarius", "Водолей", "♒"),
+         ("pisces", "Рыбы", "♓")]
+SIGN_KEYS = {k for k, _, _ in SIGNS}
+SIGN_BY_NAME = {name: k for k, name, _ in SIGNS}
+SIGNS_GEN = ["Овна", "Тельца", "Близнецов", "Рака", "Льва", "Девы", "Весов", "Скорпиона", "Стрельца", "Козерога",
+             "Водолея", "Рыб"]
+PHASE_EVENT = {0: ("🌑", "Новолуние"), 1: ("🌓", "Первая четверть"), 2: ("🌕", "Полнолуние"),
+               3: ("🌗", "Последняя четверть")}
+LUNAR_ECLIPSE = {0: "Полутеневое лунное затмение", 1: "Частичное лунное затмение", 2: "Полное лунное затмение"}
+# Где считать восход Луны (лунные сутки начинаются с восхода): город по часовому поясу,
+# для остальных – долгота по поясу и средняя широта
+SKY_PLACES = {300: (43.24, 76.89), 180: (55.75, 37.62), 120: (50.45, 30.52), 240: (53.20, 50.15),
+              360: (55.01, 82.93), 420: (56.01, 92.87), 600: (43.12, 131.89)}
+
+
+def _sky_load():
+    if "eph" not in _sky_state:
+        from skyfield.api import Loader
+        here = os.path.dirname(os.path.abspath(__file__))
+        folder = here if os.path.exists(os.path.join(here, SKY_EPH_FILE)) else os.getenv("SKY_DATA_DIR", "/tmp/skyfield")
+        load = Loader(folder, verbose=False)
+        _sky_state["ts"] = load.timescale(builtin=True)
+        _sky_state["eph"] = load(SKY_EPH_FILE)
+    return _sky_state["ts"], _sky_state["eph"]
+
+
+def _lon(eph, body, t):
+    """Видимая эклиптическая долгота тела с Земли, градусы (работает и для массива моментов)."""
+    return eph["earth"].at(t).observe(eph[body]).apparent().ecliptic_latlon("date")[1].degrees
+
+
+def _utc(t) -> datetime:
+    return t.utc_datetime().replace(microsecond=0)
+
+
+def _compute_sky(now: datetime) -> dict:
+    """Всё, что нужно на ближайшие 30 дней: фазы, ретрограды с датами окончания, события. Синхронно – в потоке."""
+    from skyfield import almanac, eclipselib
+    ts, eph = _sky_load()
+    t_now = ts.from_datetime(now)
+    t_back, t_30, t_year = ts.tt_jd(t_now.tt - 32), ts.tt_jd(t_now.tt + 30), ts.tt_jd(t_now.tt + 400)
+
+    # Фазы Луны с запасом назад (последнее новолуние) и вперёд
+    tp, yp = almanac.find_discrete(t_back, ts.tt_jd(t_now.tt + 36), almanac.moon_phases(eph))
+    phases = [(_utc(t), int(y)) for t, y in zip(tp, yp)]
+
+    # Ретрограды: долгота за полсуток убывает
+    retro, events = [], []
+    for key, name, body in PLANETS:
+        def is_retro(t, body=body):
+            d = (_lon(eph, body, ts.tt_jd(t.tt + 0.5)) - _lon(eph, body, t) + 540) % 360 - 180
+            return d < 0
+        is_retro.step_days = 1
+        now_retro = bool(is_retro(t_now))
+        tt, yy = almanac.find_discrete(t_now, t_year, is_retro)
+        changes = [(_utc(t), bool(y)) for t, y in zip(tt, yy)]
+        if now_retro:
+            until = next((at for at, val in changes if not val), None)
+            retro.append({"key": key, "name": name, "until": until,
+                          "label": f"{name} {RETRO_WORD.get(key, 'ретроградный')}"})
+        for at, val in changes:
+            if at > _utc(t_30):
+                break
+            events.append({"kind": "station", "at": at, "emoji": "↩️" if val else "↪️",
+                           "title": f"{name} {'начинает ретроградное движение' if val else 'выходит из ретроградности'}"})
+
+    # Новолуния и полнолуния; у новолуния у узла (широта Луны < 1,5°) – солнечное затмение
+    for at, y in phases:
+        if y in (0, 2) and _utc(t_now) < at <= _utc(t_30):
+            emoji, title = PHASE_EVENT[y]
+            events.append({"kind": "new" if y == 0 else "full", "at": at, "emoji": emoji, "title": title})
+            if y == 0:
+                lat = eph["earth"].at(ts.from_datetime(at)).observe(eph["moon"]).apparent().ecliptic_latlon("date")[0]
+                if abs(lat.degrees) < 1.5:
+                    events.append({"kind": "solar_eclipse", "at": at, "emoji": "🌒", "title": "Солнечное затмение"})
+    te, ye, _ = eclipselib.lunar_eclipses(t_now, t_30, eph)
+    for t, y in zip(te, ye):
+        events.append({"kind": "lunar_eclipse", "at": _utc(t), "emoji": "🌘", "title": LUNAR_ECLIPSE[int(y)]})
+
+    # Вход Солнца в новый знак
+    def sun_sign(t):
+        return (_lon(eph, "sun", t) // 30).astype(int)
+    sun_sign.step_days = 5
+    ti, yi = almanac.find_discrete(t_now, t_30, sun_sign)
+    for t, y in zip(ti, yi):
+        events.append({"kind": "ingress", "at": _utc(t), "emoji": SIGNS[int(y) % 12][2],
+                       "title": f"Солнце в знаке {SIGNS_GEN[int(y) % 12]}"})
+
+    events.sort(key=lambda e: e["at"])
+    illum = float(almanac.fraction_illuminated(eph, "moon", t_now)) * 100
+    angle = float(almanac.moon_phase(eph, t_now).degrees)
+    return {"at": now, "phases": phases, "retro": retro, "events": events, "illumination": round(illum),
+            "angle": angle}
+
+
+def _moon_now(sky: dict, now: datetime) -> dict:
+    """Фаза Луны по моменту: ±1 сутки от главной фазы – её название, иначе по четверти цикла."""
+    near = [(abs((at - now).total_seconds()), y) for at, y in sky["phases"]]
+    gap, y = min(near) if near else (10 ** 9, None)
+    if gap < 86400:
+        key = {0: "new", 1: "first_quarter", 2: "full", 3: "last_quarter"}[y]
+    else:
+        a = sky["angle"]
+        key = "wax_crescent" if a < 90 else "wax_gibbous" if a < 180 else "wan_gibbous" if a < 270 else "wan_crescent"
+    emoji, name, _ = MOON_PHASES[key]
+    return {"phase": key, "emoji": emoji, "name": name, "illumination": sky["illumination"],
+            "waxing": sky["angle"] < 180, "good_for": MOON_GOOD_FOR[key]}
+
+
+def _lunar_day(now: datetime, tz_min: int, prev_new: datetime) -> int:
+    """Лунный день по восходам Луны: 1-й – от новолуния до первого восхода, дальше каждый восход – новый день."""
+    from skyfield import almanac
+    from skyfield.api import wgs84
+    ts, eph = _sky_load()
+    lat, lon = SKY_PLACES.get(tz_min, (50.0, max(-180.0, min(180.0, tz_min / 4))))
+    place = eph["earth"] + wgs84.latlon(lat, lon)
+    t, rose = almanac.find_risings(place, eph["moon"], ts.from_datetime(prev_new), ts.from_datetime(now))
+    return min(30, 1 + int(sum(bool(r) for r in rose)))
+
+
+async def _sky_cached(key, fn, *args):
+    hit = _sky_cache.get(key)
+    if hit and time.time() - hit[0] < SKY_CACHE_SECONDS:
+        return hit[1]
+    async with _sky_lock:
+        hit = _sky_cache.get(key)
+        if hit and time.time() - hit[0] < SKY_CACHE_SECONDS:
+            return hit[1]
+        value = await asyncio.to_thread(fn, *args)
+        if len(_sky_cache) > 200:
+            _sky_cache.clear()
+        _sky_cache[key] = (time.time(), value)
+        return value
+
+
+async def sky_snapshot() -> Optional[dict]:
+    """Небо на ближайшие 30 дней, общий расчёт на час. None – если расчёт не удался (тогда Луна по Миусу)."""
+    try:
+        return await _sky_cached(("sky", int(time.time() // SKY_CACHE_SECONDS)), _compute_sky,
+                                 datetime.now(timezone.utc))
+    except Exception as e:
+        log(f"⚠️ Небо: расчёт не удался: {type(e).__name__}: {e}")
+        return None
+
+
+async def sky_moon(tz_min: int) -> dict:
+    """Луна сейчас для часового пояса человека: фаза, освещённость, лунный день."""
+    now = datetime.now(timezone.utc)
+    sky = await sky_snapshot()
+    if not sky:
+        m = moon_info(now, tz_min)
+        return {"phase": m["phase"], "emoji": m["emoji"], "name": m["name"], "illumination": m["illumination"],
+                "waxing": m["waxing"], "good_for": MOON_GOOD_FOR[m["phase"]], "lunar_day": m["lunar_day"]}
+    moon = _moon_now(sky, now)
+    prev_new = max((at for at, y in sky["phases"] if y == 0 and at <= now), default=None)
+    try:
+        moon["lunar_day"] = await _sky_cached(("lday", tz_min, int(time.time() // SKY_CACHE_SECONDS)),
+                                              _lunar_day, now, tz_min, prev_new) if prev_new else 1
+    except Exception as e:
+        log(f"⚠️ Небо: лунный день: {e}")
+        moon["lunar_day"] = moon_info(now, tz_min)["lunar_day"]
+    return moon
+
+
+def _local_date_str(at: datetime, tz_min: int) -> str:
+    d = at + timedelta(minutes=tz_min)
+    return f"{d.day} {MONTHS_GEN[d.month - 1]}"
+
+
+def _days_left(at: datetime, tz_min: int) -> int:
+    today = (datetime.now(timezone.utc) + timedelta(minutes=tz_min)).date()
+    return ((at + timedelta(minutes=tz_min)).date() - today).days
+
+
+def _countdown(days: int) -> str:
+    return "сегодня" if days <= 0 else "завтра" if days == 1 else f"через {days} {_plural(days, 'день', 'дня', 'дней')}"
+
+
+async def sky_line(user: dict) -> str:
+    """Одна строка для промптов раскладов: знак человека (если знаем дату) и Луна сейчас."""
+    parts = []
+    if user.get("birth_date"):
+        parts.append(f"знак зодиака человека – {zodiac(user['birth_date'])}")
+    try:
+        m = await sky_moon(user_tz_min(user))
+        parts.append(f"Луна сейчас – {m['name'].lower()}, {m['lunar_day']}-й лунный день")
+    except Exception:
+        pass
+    return ("Контекст (можно упомянуть одной фразой, если к месту): " + "; ".join(parts) + ".") if parts else ""
+
+
+@app.get("/api/sky")
+async def api_sky(authorization: str = Header(None)):
+    """Экран «Небо сегодня» и строка Луны в шапке."""
+    user, _ = await auth_user(authorization)
+    tz = user_tz_min(user)
+    moon = await sky_moon(tz)
+    sky = await sky_snapshot()
+    retro = [{"key": r["key"], "name": r["name"], "label": r["label"], "tip": RETRO_TIPS[r["key"]],
+              "until": _local_date_str(r["until"], tz) if r["until"] else None} for r in (sky or {}).get("retro", [])]
+    events = [{"emoji": e["emoji"], "title": e["title"], "date": _local_date_str(e["at"], tz),
+               "days": _days_left(e["at"], tz), "countdown": _countdown(_days_left(e["at"], tz))}
+              for e in (sky or {}).get("events", [])]
+    return {"moon": moon, "retro": retro, "events": events, "next": events[0] if events else None,
+            "ok": bool(sky)}
+
+
+
+# =====================================================================
+# ГОРОСКОП НА НЕДЕЛЮ (релиз 3): 12 текстов раз в неделю – в ночь на понедельник по Алматы.
+# ИИ пишет толкование, данные неба недели – из расчётов выше.
+# =====================================================================
+HORO_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+# Стихия знака задаёт главный фокус текста – так гороскопы разных знаков не повторяют друг друга
+SIGN_ELEMENT = {
+    "fire": ("огонь", "энергия, смелость, желание действовать и быть на виду"),
+    "earth": ("земля", "дела, деньги, тело и привычки, ощущение стабильности"),
+    "air": ("воздух", "общение, идеи, знакомства и лёгкость"),
+    "water": ("вода", "чувства, интуиция, близкие и внутреннее состояние"),
+}
+SIGN_ELEMENT_OF = {"aries": "fire", "leo": "fire", "sagittarius": "fire", "taurus": "earth", "virgo": "earth",
+                   "capricorn": "earth", "gemini": "air", "libra": "air", "aquarius": "air", "cancer": "water",
+                   "scorpio": "water", "pisces": "water"}
+HORO_PAUSE_SECONDS = 60      # между знаками – чтобы не упереться в минутный лимит Groq
+_horo_locks: dict = {}
+
+
+def week_start(day: date) -> date:
+    return day - timedelta(days=day.weekday())
+
+
+def week_title(ws: date) -> str:
+    end = ws + timedelta(days=6)
+    if ws.month == end.month:
+        return f"{ws.day}–{end.day} {MONTHS_GEN[end.month - 1]}"
+    return f"{ws.day} {MONTHS_GEN[ws.month - 1]} – {end.day} {MONTHS_GEN[end.month - 1]}"
+
+
+def user_sign(user: dict) -> Optional[str]:
+    """Знак для гороскопа: по дате рождения, иначе – выбранный в приложении."""
+    if user.get("birth_date"):
+        return SIGN_BY_NAME.get(zodiac(user["birth_date"]))
+    return user.get("horo_sign") if user.get("horo_sign") in SIGN_KEYS else None
+
+
+async def sky_week_facts(ws: date) -> str:
+    """Реальные данные неба на неделю (по Алматы) – для промпта гороскопа."""
+    tz = TZ_OFFSET_HOURS * 60
+    start = datetime(ws.year, ws.month, ws.day, tzinfo=timezone.utc) - timedelta(minutes=tz)
+    end = start + timedelta(days=7)
+    sky = await sky_snapshot()
+    lines = []
+    if sky:
+        for at, y in sky["phases"]:
+            if start <= at < end:
+                lines.append(f"Фаза Луны «{PHASE_EVENT[y][1].lower()}» – {_local_date_str(at, tz)}")
+        for r in sky["retro"]:
+            until = f" до {_local_date_str(r['until'], tz)}" if r["until"] else ""
+            lines.append(f"{r['label']}{until}")
+        for e in sky["events"]:
+            if start <= e["at"] < end and e["kind"] not in ("new", "full"):
+                lines.append(f"{e['title']} – {_local_date_str(e['at'], tz)}")
+    if not lines:
+        m = moon_info(start + timedelta(days=3), tz)
+        lines.append(f"Луна в середине недели – {m['name'].lower()}")
+    return "\n".join(f"• {x}" for x in lines)
+
+
+def _horo_validator(parsed: dict) -> Optional[dict]:
+    """80–140 слов, без шаблонного начала «Эта неделя» и подписи «Совет:»."""
+    text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
+    paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
+    if not 80 <= len(text.split()) <= 140:
+        return None
+    if text.lower().startswith("эта неделя") or "совет:" in text.lower():
+        return None
+    return {"text": "\n\n".join(paras)}
+
+
+async def _generate_horoscope(sign: str, ws: date) -> Optional[str]:
+    name = next(n for k, n, _ in SIGNS if k == sign)
+    system_prompt = (
+        "Ты астролог проекта «Послание Таро». Напиши гороскоп на неделю для одного знака зодиака.\n\n"
+        "Опирайся на реальные данные неба этой недели из сообщения: фазы Луны, ретроградные планеты, события. "
+        "Не придумывай других астрологических событий и дат.\n"
+        "Структура: 2–3 абзаца через пустую строку, всего 90–120 слов. Как неделя ощущается именно для этого "
+        "знака, где будет легче, на что обратить внимание, и одна бытовая подсказка.\n"
+        "Сферы жизни: чувства и настроение; отношения и близкие; дела и деньги; отдых и забота о себе. "
+        "Возьми две-три из них, главная – та, что ближе стихии знака (она указана в сообщении). "
+        "Не начинай с работы, и пусть работа не будет главной темой, если стихия не земля.\n"
+        "Пиши от характера знака (стихия, сильные стороны, типичные слабые места), чтобы текст нельзя было "
+        "переставить другому знаку. Не заканчивай каждый текст советом на вечер – подсказка может быть о любом времени.\n"
+        "Без предсказаний судьбы, событий и поведения других людей, без обещаний (денег, любви, здоровья) "
+        "и пугающих формулировок. Не привязывай планеты к времени суток. Без вопроса в конце.\n"
+        "Не начинай со слов «Эта неделя» и с названия знака. Без подписей вроде «Совет:».\n\n"
+        + FATE_STYLE + "\n\n"
+        'ФОРМАТ – строго JSON: {"text": "..."}'
+    )
+    element, focus = SIGN_ELEMENT[SIGN_ELEMENT_OF[sign]]
+    user_prompt = (f"Знак: {name}, стихия – {element} (главный фокус: {focus}). Неделя: {week_title(ws)}.\n"
+                   f"Небо недели:\n{await sky_week_facts(ws)}")
+    res = await call_ai(system_prompt, user_prompt, max_tokens=1400, schema=HORO_SCHEMA, validate=_horo_validator)
+    if not res:
+        return None
+    new = (await humanize_fields({"text": res["text"]}, {"text": f"Гороскоп на неделю для знака {name}"}, ""))["text"]
+    checked = _horo_validator({"text": new})
+    return checked["text"] if checked else res["text"]
+
+
+async def get_horoscope(sign: str, ws: date, generate: bool = True) -> Optional[str]:
+    """Гороскоп знака на неделю из базы; если его ещё нет – пишем один раз (параллельные запросы ждут)."""
+    p = await db()
+    text = await p.fetchval("SELECT text FROM horoscopes WHERE week_start = $1 AND sign = $2", ws, sign)
+    if text or not generate:
+        return text
+    if len(_horo_locks) > 40:
+        _horo_locks.clear()
+    async with _horo_locks.setdefault((ws, sign), asyncio.Lock()):
+        text = await p.fetchval("SELECT text FROM horoscopes WHERE week_start = $1 AND sign = $2", ws, sign)
+        if text:
+            return text
+        text = await _generate_horoscope(sign, ws)
+        if text:
+            await p.execute("INSERT INTO horoscopes (week_start, sign, text) VALUES ($1, $2, $3) "
+                            "ON CONFLICT DO NOTHING", ws, sign, text)
+        return text
+
+
+async def horoscope_loop():
+    """Каждые 10 минут: если у текущей недели (по Алматы) нет каких-то знаков – пишем их по одному.
+    Новая неделя начинается в полночь на понедельник – тексты готовы к утренней рассылке."""
+    await pool_ready.wait()
+    await asyncio.sleep(120)
+    while True:
+        try:
+            ws = week_start(local_now().date())
+            p = await db()
+            have = {r["sign"] for r in await p.fetch("SELECT sign FROM horoscopes WHERE week_start = $1", ws)}
+            for sign, _, _ in SIGNS:
+                if sign in have:
+                    continue
+                if not await get_horoscope(sign, ws):
+                    log(f"⚠️ Гороскоп {sign}: ИИ не ответил, попробуем позже")
+                    break
+                log(f"🔭 Гороскоп {sign} на неделю {ws} готов")
+                await asyncio.sleep(HORO_PAUSE_SECONDS)
+        except Exception as e:
+            log(f"⚠️ horoscope_loop: {e}")
+        await asyncio.sleep(600)
+
+
+@app.get("/api/horoscope")
+async def api_horoscope(sign: str = "", authorization: str = Header(None)):
+    """Гороскоп на неделю: знак из запроса, иначе – знак человека. Знака нет – приложение покажет выбор."""
+    user, _ = await auth_user(authorization)
+    own = user_sign(user)
+    sign = sign if sign in SIGN_KEYS else own
+    ws = week_start(user_now(user).date())
+    base = {"week": week_title(ws), "own_sign": own, "has_birth_date": bool(user.get("birth_date"))}
+    if not sign:
+        return {**base, "need_sign": True}
+    text = await get_horoscope(sign, ws)
+    if not text:
+        return {**base, "sign": sign, "pending": True}
+    track(user["telegram_id"], "horoscope_viewed", {"sign": sign, "own": sign == own})
+    return {**base, "sign": sign, "text": text}
+
+
+@app.post("/api/user/horo-sign")
+async def api_horo_sign(payload: dict, authorization: str = Header(None)):
+    """Знак, выбранный вручную (пока нет даты рождения), – для гороскопа и кнопки в рассылке."""
+    user, _ = await auth_user(authorization)
+    sign = str(payload.get("sign") or "")
+    if sign not in SIGN_KEYS:
+        raise HTTPException(status_code=400, detail="bad sign")
+    p = await db()
+    await p.execute("UPDATE users SET horo_sign = $2 WHERE telegram_id = $1", user["telegram_id"], sign)
+    return {"ok": True}
+
+
 @app.get("/api/user/today")
 async def api_today(authorization: str = Header(None)):
     """Блок «Сегодня» на главном экране: личное (или общее) число дня с толкованием и Луна."""
@@ -3192,7 +3644,7 @@ async def api_today(authorization: str = Header(None)):
         "date": day.strftime("%d.%m.%Y"),
         "number": {"value": num, "word": DAY_NUMBER_WORDS[num], "personal": bool(birth),
                    "text": await day_number_text(num, day)},
-        "moon": moon_info(datetime.now(timezone.utc), user_tz_min(user)),
+        "moon": await sky_moon(user_tz_min(user)),
     }
 
 
