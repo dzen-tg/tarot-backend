@@ -131,6 +131,7 @@ PACKS = {
     "pack_450": (450, 383, 383, "+450 Энергии (скидка 15%)", PACK_DESC),
     "pack_750": (750, 600, 600, "+750 Энергии (скидка 20%)", PACK_DESC),
     "pack_1500": (1500, 1125, 1125, "+1500 Энергии (скидка 25%)", PACK_DESC),
+    "pack_3000": (3000, 2100, 2100, "+3000 Энергии (скидка 30%)", PACK_DESC),   # релиз 5: самая большая скидка
 }
 
 # Оплата картой через Tribute (Shop API). Без TRIBUTE_API_KEY кнопка «Картой» скрыта.
@@ -446,6 +447,8 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS horo_sign VARCHAR(16) DEFAULT NULL",
             # Релиз 4: местная дата последнего бесплатного толкования сна (1 сон в день бесплатно)
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_dream_date VARCHAR(10) DEFAULT NULL",
+            # Релиз 5: имя, как человек его пишет, – для нумерологического портрета
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS numerology_name VARCHAR(64) DEFAULT NULL",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -501,6 +504,26 @@ async def init_schema():
             );
         """)
         await c.execute("CREATE INDEX IF NOT EXISTS dreams_user_idx ON dreams (telegram_id, created_at DESC)")
+        # Релиз 5: купленные разборы (матрица, совместимость и её превью, нумерология, прогнозы)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS paid_products (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                kind VARCHAR(16) NOT NULL,
+                title TEXT NOT NULL,
+                params TEXT NOT NULL DEFAULT '{}',
+                data TEXT NOT NULL DEFAULT '{}',
+                sections TEXT,
+                cost INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(10) NOT NULL DEFAULT 'pending',
+                request_id VARCHAR(40) UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await c.execute("CREATE INDEX IF NOT EXISTS paid_products_user_idx ON paid_products (telegram_id, created_at DESC)")
+        # Один разбор одного вида в работе на человека: второе нажатие «Оплатить» не создаст второй и не спишет дважды
+        await c.execute("CREATE UNIQUE INDEX IF NOT EXISTS paid_products_pending_uidx ON paid_products (telegram_id, kind) "
+                        "WHERE status = 'pending'")
         # Релиз 4: марафон «7 дней знаков Вселенной» – одна строка на человека
         await c.execute("""
             CREATE TABLE IF NOT EXISTS marathons (
@@ -611,6 +634,8 @@ def source_from_start(param: Optional[str]) -> Optional[str]:
     low = param.lower()
     if low.startswith("ref_"):
         return "ref"
+    if low.startswith("compat_"):  # пришёл по кнопке «Отправить партнёру» из совместимости
+        return "compat"
     if low.startswith("_tgr_"):  # партнёрская программа Telegram
         return "tg_partner"
     if low.startswith("src_"):
@@ -2307,6 +2332,7 @@ async def get_user_profile(authorization: str = Header(None)):
     out["daily_available"] = is_admin(user) or not today_row
     out["marathon"] = marathon_state(await marathon_row(uid), user)
     out["dream"] = {"free": is_admin(user) or dream_free_today(user), "cost": COST_DREAM}
+    out["paid"] = paid_profile(user)
     return out
 
 
@@ -2600,7 +2626,8 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
 
 CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
                  "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open",
-                 "sky_viewed", "horoscope_from_broadcast", "marathon_cta_clicked"}
+                 "sky_viewed", "horoscope_from_broadcast", "marathon_cta_clicked",
+                 "compat_shared", "paid_open"}
 
 
 @app.post("/api/user/source")
@@ -2791,6 +2818,8 @@ async def tribute_webhook(request: Request):
             log(f"Tribute: оплатил {uid}, но его нет в users – энергия не зачислена, проверь вручную")
             return {"ok": True}
         track(uid, "payment", {"pack": pack, "method": "card"})
+        if pack == "pack_3000":
+            track(uid, "pack_3000_paid", {"method": "card"})
         asyncio.create_task(credit_referrer_if_due(uid))
         try:
             await bot.send_message(uid, f"💳 Оплата картой прошла! Зачислено +{energy} Энергии ✨",
@@ -4519,6 +4548,8 @@ async def process_successful_payment(message: Message):
             await c.execute("UPDATE users SET balance = balance + $2, purchases = purchases + 1 WHERE telegram_id = $1", uid, energy)
             if is_sub:
                 await c.execute("UPDATE users SET sub_until = $2 WHERE telegram_id = $1", uid, sub_until)
+    if pack == "pack_3000":
+        track(uid, "pack_3000_paid", {"method": "stars"})
     track(uid, "payment", {"pack": pack, "method": "stars", "stars": pay.total_amount,
                            "renewal": bool(getattr(pay, "is_recurring", False) and not getattr(pay, "is_first_recurring", False))})
     asyncio.create_task(credit_referrer_if_due(uid))
@@ -5538,3 +5569,741 @@ async def send_marathon_reminders() -> int:
                 sent += 1
             await asyncio.sleep(0.05)
     return sent
+
+
+# =====================================================================
+# РЕЛИЗ 5: ПЛАТНЫЕ РАЗБОРЫ – матрица судьбы, совместимость, нумерология, прогнозы на месяц и год
+# Все числа считает код (формулы согласованы с владельцем 2026-11-08, сверены с примерами Mind University),
+# ИИ получает только готовые арканы и числа и пишет текст. Результат хранится в paid_products,
+# повторный просмотр – из базы, без оплаты и генерации.
+# =====================================================================
+PRODUCT_COST = {
+    "matrix": int(os.getenv("COST_MATRIX", "450")),
+    "compat": int(os.getenv("COST_COMPAT", "300")),
+    "numerology": int(os.getenv("COST_NUMEROLOGY", "300")),
+    "month": int(os.getenv("COST_FORECAST_MONTH", "150")),
+    "year": int(os.getenv("COST_FORECAST_YEAR", "450")),
+}
+PRODUCT_TITLE = {"matrix": "Матрица судьбы", "compat": "Совместимость", "compat_preview": "Совместимость (превью)",
+                 "numerology": "Нумерологический портрет", "month": "Прогноз на месяц", "year": "Прогноз на год"}
+PRODUCT_EMOJI = {"matrix": "🔯", "compat": "💞", "compat_preview": "💞", "numerology": "🔢", "month": "🗓", "year": "📅"}
+PRODUCT_EVENT = {"matrix": "matrix_paid", "compat": "compat_paid", "numerology": "numerology_paid",
+                 "month": "forecast_month_paid", "year": "forecast_year_paid"}
+MATRIX_SECTIONS = [("purpose", "Предназначение"), ("money", "Деньги и работа"), ("love", "Любовь и отношения"),
+                   ("tail", "Кармический хвост"), ("ages", "Задачи по возрастам")]
+COMPAT_SECTIONS = [("overview", "Что вас связывает"), ("strengths", "Сильные стороны пары"),
+                   ("tensions", "Точки напряжения"), ("advice", "Советы паре")]
+NUMEROLOGY_SECTIONS = [("fate", "Число судьбы"), ("name", "Число имени"), ("soul", "Число души"),
+                       ("personality", "Число личности"), ("karmic", "Кармические числа"), ("year", "Личный год")]
+COMPAT_PREVIEWS_PER_DAY = 10
+MONTHS_NOM = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь",
+              "Ноябрь", "Декабрь"]
+SPIRIT_VALID = {3, 6, 9, 12, 15, 18, 21}   # духовное предназначение бывает только таким – иначе ошибка в расчёте
+
+
+def arc(n: int) -> str:
+    return f"{n} {ARCANA[n]}"
+
+
+# ── Матрица судьбы (Ладини). r = reduce22: больше 22 – сумма цифр ──────────
+def matrix_points(d: date) -> dict:
+    r = reduce22
+    A, B, C = r(d.day), d.month, r(sum(int(x) for x in str(d.year)))
+    D = r(A + B + C)
+    E = r(A + B + C + D)
+    F, G, H, I = r(A + B), r(B + C), r(C + D), r(D + A)     # родовые углы: ЛВ, ПВ, ПН, ЛН
+
+    def ray(X):            # от края к центру: X → X2 → X1 → центр
+        x1 = r(X + E)
+        return [X, r(X + x1), x1]
+    C1, D1 = r(C + E), r(D + E)
+    balance = r(C1 + D1)                                      # точка баланса денег и отношений
+    sky, earth = r(B + D), r(A + C)
+    personal = r(sky + earth)
+    father, mother = r(F + H), r(G + I)
+    social = r(father + mother)
+    spiritual = r(personal + social)
+    planetary = r(social + spiritual)
+    if spiritual not in SPIRIT_VALID:
+        log(f"⚠️ Матрица {d}: духовное предназначение {spiritual} – проверь расчёт")
+    ring = [A, F, B, G, C, H, D, I]                           # 0, 10, 20 … 70 лет
+    ages = {}
+    for i, v in enumerate(ring):
+        ages[i * 10] = v
+        ages[i * 10 + 5] = r(v + ring[(i + 1) % 8])
+    return {
+        "A": A, "B": B, "C": C, "D": D, "E": E, "F": F, "G": G, "H": H, "I": I,
+        "rays": {"A": ray(A), "B": ray(B), "C": ray(C), "D": ray(D)},
+        "tail": [D1, r(D + D1), D],                           # кармический хвост: от центра к краю
+        "money_entry": C1, "rel_entry": D1, "balance": balance,
+        "money": r(C1 + balance), "rel_mid": r(D1 + balance),
+        "sky": sky, "earth": earth, "personal": personal, "father": father, "mother": mother,
+        "social": social, "spiritual": spiritual, "planetary": planetary,
+        "ages": ages,
+    }
+
+
+def matrix_facts(m: dict) -> list:
+    return [
+        ["Личность", arc(m["A"])], ["Главная энергия (центр)", arc(m["E"])],
+        ["Духовная линия (небо)", arc(m["sky"])], ["Материальная линия (земля)", arc(m["earth"])],
+        ["Личное предназначение", arc(m["personal"])], ["Социальное предназначение", arc(m["social"])],
+        ["Духовное предназначение", arc(m["spiritual"])],
+        ["Род по отцу", f"{arc(m['F'])} · {arc(m['H'])}"], ["Род по матери", f"{arc(m['G'])} · {arc(m['I'])}"],
+        ["Деньги: вход и точка", f"{arc(m['money_entry'])} · {arc(m['money'])}"],
+        ["Отношения: вход и середина", f"{arc(m['rel_entry'])} · {arc(m['rel_mid'])}"],
+        ["Точка баланса", arc(m["balance"])],
+        ["Кармический хвост", "-".join(str(x) for x in m["tail"])],
+    ]
+
+
+# ── Совместимость: каналы отношений обоих (как описано у Mind University) ─
+def pair_points(d1: date, d2: date) -> dict:
+    m1, m2 = matrix_points(d1), matrix_points(d2)
+
+    def line(m):
+        return [m["rel_entry"], m["rel_mid"], m["balance"]]
+    return {
+        "me": {"zodiac": zodiac(d1), "life_path": life_path(d1), "A": m1["A"], "E": m1["E"], "rel": line(m1)},
+        "partner": {"zodiac": zodiac(d2), "life_path": life_path(d2), "A": m2["A"], "E": m2["E"], "rel": line(m2)},
+        "common": reduce22(m1["rel_mid"] + m2["rel_mid"]),     # общая задача пары
+        "me_on_partner": m1["A"] in line(m2),                  # признак совместимости
+        "partner_on_me": m2["A"] in line(m1),
+    }
+
+
+def pair_facts(pp: dict, partner: str) -> list:
+    me, pa = pp["me"], pp["partner"]
+    sign = ("в обе стороны" if pp["me_on_partner"] and pp["partner_on_me"] else
+            "есть" if pp["me_on_partner"] or pp["partner_on_me"] else "нет")
+    return [
+        ["Ты", f"{me['zodiac']} · число судьбы {me['life_path']}"],
+        [partner, f"{pa['zodiac']} · число судьбы {pa['life_path']}"],
+        ["Твоя главная энергия", arc(me["E"])], [f"Главная энергия: {partner}", arc(pa["E"])],
+        ["Общая задача пары", arc(pp["common"])],
+        ["Твой канал отношений", " · ".join(str(x) for x in me["rel"])],
+        [f"Канал отношений: {partner}", " · ".join(str(x) for x in pa["rel"])],
+        ["Признак совместимости", sign],
+    ]
+
+
+# ── Нумерология имени: пифагорейская таблица для кириллицы ─────────────────
+NUM_TABLE = {ch: v for v, letters in enumerate(
+    ["АИСЪ", "БЙТЫ", "ВКУЬ", "ГЛФЭ", "ДМХЮ", "ЕНЦЯ", "ЁОЧ", "ЖПШ", "ЗРЩ"], start=1) for ch in letters}
+NUM_VOWELS = set("АЕЁИОУЫЭЮЯ")
+KARMIC_DEBTS = {13, 14, 16, 19}
+
+
+def reduce9(n: int, master: bool = True) -> int:
+    while n > 9 and not (master and n in (11, 22)):
+        n = sum(int(x) for x in str(n))
+    return n
+
+
+def name_words(name: str) -> list:
+    return [w for w in re.findall(r"[А-ЯЁ]+", (name or "").upper()) if w]
+
+
+def _name_number(words: list, mode: str, debts: set) -> int:
+    """Каждое слово имени сворачивается отдельно, потом сумма (метод, где мастер-числа 11 и 22 сохраняются)."""
+    parts = []
+    for w in words:
+        s = sum(NUM_TABLE[ch] for ch in w
+                if mode == "all" or (mode == "vowels") == (ch in NUM_VOWELS))
+        if s in KARMIC_DEBTS:
+            debts.add(s)
+        if s:
+            parts.append(reduce9(s))
+    total = sum(parts)
+    if total in KARMIC_DEBTS:
+        debts.add(total)
+    return reduce9(total)
+
+
+def personal_year(d: date, year: int) -> int:
+    return reduce9(reduce9(d.month, False) + reduce9(d.day, False) + reduce9(year, False), False)
+
+
+def personal_month(d: date, year: int, month: int) -> int:
+    return reduce9(personal_year(d, year) + month, False)
+
+
+def numerology(name: str, d: date, year: int) -> dict:
+    words = name_words(name)
+    debts: set = set()
+    fate_total = sum(int(x) for x in d.strftime("%d%m%Y"))
+    if fate_total in KARMIC_DEBTS:
+        debts.add(fate_total)
+    full = "".join(words)
+    present = {NUM_TABLE[ch] for ch in full}
+    return {
+        "name": " ".join(w.capitalize() for w in words),
+        "fate": life_path(d),
+        "name_num": _name_number(words, "all", debts),
+        "soul": _name_number(words, "vowels", debts),
+        "personality": _name_number(words, "consonants", debts),
+        "debts": sorted(debts),
+        "lessons": [n for n in range(1, 10) if n not in present],
+        "year": year, "personal_year": personal_year(d, year),
+    }
+
+
+def numerology_facts(n: dict) -> list:
+    return [
+        ["Имя", n["name"]], ["Число судьбы", str(n["fate"])], ["Число имени", str(n["name_num"])],
+        ["Число души", str(n["soul"])], ["Число личности", str(n["personality"])],
+        ["Кармические долги", ", ".join(map(str, n["debts"])) or "нет"],
+        ["Кармические уроки", ", ".join(map(str, n["lessons"])) or "нет"],
+        [f"Личный год {n['year']}", str(n["personal_year"])],
+    ]
+
+
+def validate_name(name: str) -> Optional[str]:
+    """Имя для нумерологии: только русские буквы, 2–60 символов. None – не подходит."""
+    name = re.sub(r"\s+", " ", (name or "").strip())
+    if not 2 <= len(name) <= 60 or not re.fullmatch(r"[А-Яа-яЁё\- ]+", name) or len("".join(name_words(name))) < 2:
+        return None
+    return name
+
+
+# ── Астрособытия периода (для прогнозов) ──────────────────────────────────
+def _compute_period(start: datetime, end: datetime) -> dict:
+    """Фазы Луны, ретрограды (с полными датами периода), затмения, вход Солнца в знак – за [start, end)."""
+    from skyfield import almanac, eclipselib
+    ts, eph = _sky_load()
+    t0, t1 = ts.from_datetime(start), ts.from_datetime(end)
+    out = {"phases": [], "retro": [], "eclipses": [], "ingress": []}
+    tp, yp = almanac.find_discrete(t0, t1, almanac.moon_phases(eph))
+    out["phases"] = [(_utc(t), int(y)) for t, y in zip(tp, yp)]
+    for key, name, body in PLANETS:
+        def is_retro(t, body=body):
+            dlt = (_lon(eph, body, ts.tt_jd(t.tt + 0.5)) - _lon(eph, body, t) + 540) % 360 - 180
+            return dlt < 0
+        is_retro.step_days = 1
+        back, fwd = ts.tt_jd(t0.tt - 200), ts.tt_jd(t1.tt + 200)
+        tt, yy = almanac.find_discrete(back, fwd, is_retro)
+        changes = [(_utc(t), bool(y)) for t, y in zip(tt, yy)]
+        state, since = bool(is_retro(back)), None
+        for at, val in changes:
+            if val:
+                since = at
+            elif since is not None or state:
+                a, b = since, at
+                if (a is None or a < end) and b > start:
+                    out["retro"].append({"key": key, "name": name, "from": a, "to": b})
+                since = None
+            state = val
+        if since is not None and since < end:
+            out["retro"].append({"key": key, "name": name, "from": since, "to": None})
+    for at, y in out["phases"]:
+        if y == 0:
+            lat = eph["earth"].at(ts.from_datetime(at)).observe(eph["moon"]).apparent().ecliptic_latlon("date")[0]
+            if abs(lat.degrees) < 1.5:
+                out["eclipses"].append((at, "Солнечное затмение"))
+    te, ye, _ = eclipselib.lunar_eclipses(t0, t1, eph)
+    out["eclipses"] += [(_utc(t), LUNAR_ECLIPSE[int(y)]) for t, y in zip(te, ye)]
+    out["eclipses"].sort()
+
+    def sun_sign(t):
+        return (_lon(eph, "sun", t) // 30).astype(int)
+    sun_sign.step_days = 5
+    ti, yi = almanac.find_discrete(t0, t1, sun_sign)
+    out["ingress"] = [(_utc(t), f"Солнце в знаке {SIGNS_GEN[int(y) % 12]}") for t, y in zip(ti, yi)]
+    return out
+
+
+async def period_events(start: datetime, end: datetime) -> dict:
+    return await _sky_cached(("period", start.isoformat(), end.isoformat()), _compute_period, start, end)
+
+
+def _d(at: Optional[datetime], tz: int) -> str:
+    return _local_date_str(at, tz) if at else "…"
+
+
+def _retro_line(r: dict, tz: int) -> str:
+    word = RETRO_WORD.get(r["key"], "ретроградный")
+    return f"{r['name']} {word}: {_d(r['from'], tz)} – {_d(r['to'], tz)}"
+
+
+def _period_bounds(year: int, month: Optional[int], tz: int) -> tuple:
+    """Границы местного месяца или года в UTC."""
+    if month:
+        a = datetime(year, month, 1)
+        b = datetime(year + (month == 12), month % 12 + 1, 1)
+    else:
+        a, b = datetime(year, 1, 1), datetime(year + 1, 1, 1)
+    shift = timedelta(minutes=tz)
+    return (a - shift).replace(tzinfo=timezone.utc), (b - shift).replace(tzinfo=timezone.utc)
+
+
+def forecast_targets(user: dict) -> dict:
+    """Какой месяц и год прогнозируем: с 25-го числа – следующий месяц, с ноября – следующий год."""
+    now = user_now(user)
+    y, m = now.year, now.month
+    if now.day >= 25:
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    yy = now.year + (1 if now.month >= 11 else 0)   # с ноября прогноз уже на следующий год
+    return {"month": (y, m), "month_title": f"{MONTHS_NOM[m - 1]} {y}", "year": yy, "year_title": str(yy)}
+
+
+async def month_data(user: dict, d: date, year: int, month: int) -> dict:
+    tz = user_tz_min(user)
+    a, b = _period_bounds(year, month, tz)
+    ev = await period_events(a, b)
+    last_day = (b - timedelta(minutes=1) + timedelta(minutes=tz)).day
+    weeks = [(1, 7), (8, 14), (15, 21), (22, last_day)]
+
+    def local_day(at):
+        return (at + timedelta(minutes=tz)).day
+    items = []   # (день месяца, текст)
+    for at, y in ev["phases"]:
+        items.append((local_day(at), f"{PHASE_EVENT[y][1]} – {_d(at, tz)}"))
+    for at, title in ev["eclipses"] + ev["ingress"]:
+        items.append((local_day(at), f"{title} – {_d(at, tz)}"))
+    for r in ev["retro"]:
+        for at, word in ((r["from"], "начинает ретроградное движение"), (r["to"], "выходит из ретроградности")):
+            if at and a <= at < b:
+                items.append((local_day(at), f"{r['name']} {word} – {_d(at, tz)}"))
+    items.sort()
+    pm = personal_month(d, year, month)
+    return {
+        "year": year, "month": month, "title": f"{MONTHS_NOM[month - 1]} {year}", "personal_month": pm,
+        "personal_year": personal_year(d, year),
+        "weeks": [{"from": w0, "to": w1, "events": [t for day, t in items if w0 <= day <= w1]} for w0, w1 in weeks],
+        "retro": [_retro_line(r, tz) for r in ev["retro"]],
+    }
+
+
+async def year_data(user: dict, d: date, year: int) -> dict:
+    tz = user_tz_min(user)
+    a, b = _period_bounds(year, None, tz)
+    ev = await period_events(a, b)
+    key = [f"{t} – {_d(at, tz)}" for at, t in ev["eclipses"]] + [_retro_line(r, tz) for r in ev["retro"]
+                                                                   if r["key"] in ("mercury", "venus", "mars")]
+    ingress = {(at + timedelta(minutes=tz)).month: f"{t} – {_d(at, tz)}" for at, t in ev["ingress"]}
+    return {
+        "year": year, "title": str(year), "personal_year": personal_year(d, year),
+        "months": [{"month": m, "name": MONTHS_NOM[m - 1], "personal_month": personal_month(d, year, m),
+                    "ingress": ingress.get(m, "")} for m in range(1, 13)],
+        "key_events": key,
+    }
+
+
+# ── Тексты ИИ ─────────────────────────────────────────────────────────────
+PRODUCT_RULES = (
+    "ПРАВИЛА:\n"
+    "• Опирайся только на числа и арканы, которые даны. Ничего не пересчитывай и не придумывай другие числа.\n"
+    "• Без предсказаний судьбы. Никаких обещаний про здоровье, деньги, беременность, возврат партнёра. "
+    "Не пиши, что что-то точно случится: говори о склонностях, темах и том, на что человек может повлиять.\n"
+    "• Не придумывай события и обстоятельства из жизни человека.\n"
+    "• Каждая часть – обычные абзацы без заголовков, списков и жирного шрифта. Абзацы раздели пустой строкой.\n"
+    "• Номера арканов в тексте не повторяй, называй арканы по названию. Каждый аркан называй только там, "
+    "где он стоит в данных: не приписывай точке чужой аркан.\n"
+    "• Не утверждай, что с человеком что-то уже происходило в прошлом: говори о темах и задачах.\n"
+    "• Пол человека неизвестен. Не используй слова с родом (ощущал/ощущала, готов/готова, способен/способна): "
+    "перестраивай фразу – «тебе хочется», «ты в силах», «у тебя получается».\n"
+    "• Даты пиши ровно так, как в данных (например, «2 ноября»), не меняй и не сдвигай их.\n"
+)
+
+
+def soft_rule(nums) -> str:
+    soft = sorted(set(nums) & FATE_SOFT_ARCANA)
+    if not soft:
+        return ""
+    return ("\nАРКАНЫ ПЕРЕМЕН: " + " и ".join(f"{n} ({ARCANA[n]})" for n in soft)
+            + ". Где о них говоришь, объясни, что это арканы перемен и обновления. Без пугающих слов: никаких "
+              "«гибели», «разрушения», «краха», «катастрофы», «конца».\n")
+
+
+SCARY_RE = re.compile(r"(гибел|разрушени|крах|катастроф|смертельн|болезн|диагноз|обязательно разбогате|"
+                      r"точно (?:будет|случится|встретишь))", re.IGNORECASE)
+
+
+def _sections_validator(keys: list, lo: int, hi: int):
+    def validate(parsed: dict) -> Optional[dict]:
+        out = {}
+        for k in keys:
+            text = clean_ai_text(str(parsed.get(k) or "")).strip()
+            n = len(text.split())
+            if not lo <= n <= hi or SCARY_RE.search(text):
+                log(f"⚠️ Разбор: часть {k} – {n} слов{' или пугающие слова' if SCARY_RE.search(text) else ''}")
+                return None
+            out[k] = text
+        return out
+    return validate
+
+
+async def _write_sections(system: str, data_prompt: str, sections: list, lo: int, hi: int,
+                          max_tokens: int, question: str = "") -> Optional[list]:
+    keys = [k for k, _ in sections]
+    schema = {"type": "object", "properties": {k: {"type": "string"} for k in keys}, "required": keys}
+    res = await call_ai(system, data_prompt, max_tokens=max_tokens, schema=schema,
+                        validate=_sections_validator(keys, lo, hi))
+    if not res:
+        return None
+    new = await humanize_fields(res, dict(sections), question)
+    out = []
+    for k, title in sections:
+        text = new.get(k) or res[k]
+        # Редактор заметно сократил (ниже нормы или на 10% от исходника) или испортил – оставляем исходник
+        if len(text.split()) < max(lo, 0.9 * len(res[k].split())) or SCARY_RE.search(text):
+            text = res[k]
+        out.append({"title": title, "text": text})
+    return out
+
+
+def _json_hint(sections: list) -> str:
+    return "ФОРМАТ: строго JSON {" + ", ".join(f"\"{k}\": \"…\"" for k, _ in sections) + "}"
+
+
+async def gen_matrix(user: dict, m: dict) -> Optional[list]:
+    age = (user_now(user).date() - user["birth_date"]).days // 365
+    ages = ", ".join(f"{k} лет – {arc(v)}" for k, v in sorted(m["ages"].items()))
+    system = (
+        "Ты таролог проекта «Послание Таро» и знаешь матрицу судьбы по методу Натальи Ладини. Напиши человеку "
+        "разбор его матрицы по разделам. Каждый раздел 100–150 слов (не меньше 90).\n"
+        "• purpose – Предназначение: личное (до 40 лет, через линии неба и земли), социальное (40–60, род), "
+        "духовное.\n"
+        "• money – Деньги и работа: вход в денежный канал, точка денег, материальная линия; в каком деле человеку "
+        "легче, что помогает и что мешает. Без обещаний дохода.\n"
+        "• love – Любовь и отношения: вход в канал отношений, середина канала, точка баланса; какой партнёр и какие "
+        "отношения ему подходят, в чём его урок.\n"
+        "• tail – Кармический хвост: три аркана от центра к краю; какой урок, как он проявляется в характере "
+        "и в событиях, как его прожить в плюсе. Бережно, без пугания.\n"
+        f"• ages – Задачи по возрастам: по точкам возраста опиши крупные периоды (до 20, 20–40, 40–60, после 60) "
+        "как темы и задачи периода, а не как события. "
+        f"Человеку сейчас {age}: о его текущем периоде скажи подробнее.\n\n"
+        + PRODUCT_RULES + soft_rule([m["A"], m["E"], *m["tail"], m["personal"], m["social"], m["money"],
+                                     m["rel_mid"]]) + "\n" + FATE_STYLE + "\n\n" + _json_hint(MATRIX_SECTIONS)
+    )
+    data = (
+        f"Личность (день): {arc(m['A'])}. Месяц: {arc(m['B'])}. Год: {arc(m['C'])}. Нижняя точка: {arc(m['D'])}. "
+        f"Центр (главная энергия): {arc(m['E'])}.\n"
+        f"Небо (духовная линия): {arc(m['sky'])}. Земля (материальная линия): {arc(m['earth'])}.\n"
+        f"Личное предназначение (до 40 лет, небо + земля): {arc(m['personal'])}.\n"
+        f"Род по отцу: {arc(m['father'])}, по матери: {arc(m['mother'])}. "
+        f"Социальное предназначение (40–60 лет, род): {arc(m['social'])}.\n"
+        f"Духовное предназначение (после 60 лет): {arc(m['spiritual'])}.\n"
+        f"Вход в денежный канал: {arc(m['money_entry'])}. Точка денег: {arc(m['money'])}.\n"
+        f"Вход в канал отношений: {arc(m['rel_entry'])}. Середина канала отношений: {arc(m['rel_mid'])}. "
+        f"Точка баланса: {arc(m['balance'])}.\n"
+        f"Кармический хвост (от центра к краю): {', '.join(arc(x) for x in m['tail'])}.\n"
+        f"Точки возраста: {ages}."
+    )
+    return await _write_sections(system, data, MATRIX_SECTIONS, 70, 175, 4000)
+
+
+async def gen_compat(pp: dict, partner: str, preview: bool = False):
+    me, pa = pp["me"], pp["partner"]
+    sign = ("арканы личности обоих стоят на линии отношений друг друга" if pp["me_on_partner"] and pp["partner_on_me"]
+            else "аркан личности одного стоит на линии отношений другого" if pp["me_on_partner"] or pp["partner_on_me"]
+            else "признака совместимости нет – это не плохо, просто связь строится сознательно")
+    data = (
+        f"Человек: {me['zodiac']}, число судьбы {me['life_path']}, аркан личности {arc(me['A'])}, главная энергия "
+        f"{arc(me['E'])}, канал отношений {', '.join(arc(x) for x in me['rel'])}.\n"
+        f"Партнёр ({partner}): {pa['zodiac']}, число судьбы {pa['life_path']}, аркан личности {arc(pa['A'])}, "
+        f"главная энергия {arc(pa['E'])}, канал отношений {', '.join(arc(x) for x in pa['rel'])}.\n"
+        f"Общая задача пары: {arc(pp['common'])}. Признак совместимости: {sign}."
+    )
+    nums = [me["A"], me["E"], pa["A"], pa["E"], pp["common"]]
+    if preview:
+        system = (
+            "Ты таролог проекта «Послание Таро». По матрицам двух людей напиши короткий вывод о паре: "
+            "2–3 предложения, 35–70 слов. Только общее впечатление о том, что связывает пару и какая у неё общая "
+            "задача. Не раскрывай сильные стороны, точки напряжения и советы по отдельности: они в полной версии.\n"
+            f"Партнёра называй «{partner}».\n\n" + PRODUCT_RULES + soft_rule(nums) + "\n" + FATE_STYLE
+            + "\n\nФОРМАТ: строго JSON {\"text\": \"…\"}"
+        )
+        res = await call_ai(system, data, max_tokens=700, schema={"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}, validate=_sections_validator(["text"], 25, 90))
+        if not res:
+            return None
+        new = await humanize_fields(res, {"text": "Короткий вывод о совместимости пары"}, "")
+        text = new["text"] if 20 <= len(new["text"].split()) <= 95 else res["text"]
+        return text
+    system = (
+        "Ты таролог проекта «Послание Таро» и знаешь матрицу судьбы по методу Натальи Ладини. Напиши полный разбор "
+        f"совместимости человека и партнёра (партнёра называй «{partner}»). Каждая часть 100–150 слов (не меньше 90).\n"
+        "• overview – что связывает пару: главные энергии обоих, знаки, числа судьбы, общая задача пары.\n"
+        "• strengths – сильные стороны пары: где они дополняют друг друга.\n"
+        "• tensions – точки напряжения: где возможны споры и непонимание, сказано мягко и честно.\n"
+        "• advice – советы паре: что помогает договариваться и беречь связь.\n"
+        "О чувствах и мыслях партнёра говори только как о склонностях по матрице, не утверждай, что знаешь их.\n\n"
+        + PRODUCT_RULES + soft_rule(nums) + "\n" + FATE_STYLE + "\n\n" + _json_hint(COMPAT_SECTIONS)
+    )
+    return await _write_sections(system, data, COMPAT_SECTIONS, 70, 175, 3500)
+
+
+async def gen_numerology(n: dict) -> Optional[list]:
+    system = (
+        "Ты нумеролог проекта «Послание Таро» (пифагорейская нумерология). Напиши нумерологический портрет. "
+        "Каждая часть 60–120 слов.\n"
+        "• fate – число судьбы: главная линия жизни.\n• name – число имени: как человек проявляет себя.\n"
+        "• soul – число души (гласные): чего человек хочет внутри.\n"
+        "• personality – число личности (согласные): каким его видят.\n"
+        "• karmic – кармические долги и уроки: если долгов нет, так и скажи и расскажи об уроках (недостающих "
+        "цифрах). Бережно, без пугания.\n"
+        f"• year – личный год {n['year']}: тема года и на что направить силы.\n"
+        "Мастер-числа 11 и 22, если есть, объясни как усиленные вибрации 2 и 4.\n\n"
+        + PRODUCT_RULES + "\n" + FATE_STYLE + "\n\n" + _json_hint(NUMEROLOGY_SECTIONS)
+    )
+    data = (f"Имя: {n['name']}. Число судьбы: {n['fate']}. Число имени: {n['name_num']}. Число души: {n['soul']}. "
+            f"Число личности: {n['personality']}. Кармические долги: {', '.join(map(str, n['debts'])) or 'нет'}. "
+            f"Кармические уроки (цифры, которых нет в имени): {', '.join(map(str, n['lessons'])) or 'нет'}. "
+            f"Личный год {n['year']}: {n['personal_year']}.")
+    return await _write_sections(system, data, NUMEROLOGY_SECTIONS, 50, 150, 4000)
+
+
+async def gen_month(md: dict) -> Optional[list]:
+    secs = [("intro", f"{md['title']}: личный месяц {md['personal_month']}")] + [
+        (f"week{i + 1}", f"{w['from']}–{w['to']} число") for i, w in enumerate(md["weeks"])]
+    system = (
+        f"Ты нумеролог и астролог проекта «Послание Таро». Напиши прогноз на месяц ({md['title']}).\n"
+        "• intro – тема личного месяца по нумерологии и общий фон неба: 50–90 слов.\n"
+        "• week1…week4 – по неделям: 70–110 слов каждая. Привяжи к событиям неба этой недели (фазы Луны, "
+        "ретрограды, вход Солнца в знак), если они есть, и к теме личного месяца. Дай практичные подсказки: "
+        "что начинать, что завершать, где быть внимательнее.\n"
+        "Даты событий бери только из данных.\n\n" + PRODUCT_RULES + "\n" + FATE_STYLE + "\n\n" + _json_hint(secs)
+    )
+    weeks = "\n".join(f"Неделя {i + 1} ({w['from']}–{w['to']}): " + ("; ".join(w["events"]) or "без особых событий")
+                      for i, w in enumerate(md["weeks"]))
+    data = (f"Личный год: {md['personal_year']}. Личный месяц: {md['personal_month']}.\n"
+            f"Ретрограды месяца: {'; '.join(md['retro']) or 'нет'}.\n{weeks}")
+    return await _write_sections(system, data, secs, 50, 135, 3500)
+
+
+async def gen_year(yd: dict) -> Optional[list]:
+    secs = [("intro", f"{yd['title']}: личный год {yd['personal_year']}")] + [
+        (f"m{mm['month']}", f"{mm['name']} · личный месяц {mm['personal_month']}") for mm in yd["months"]]
+    system = (
+        f"Ты нумеролог и астролог проекта «Послание Таро». Напиши прогноз на {yd['title']} год.\n"
+        "• intro – тема личного года и ключевые события неба года: 80–140 слов.\n"
+        "• m1…m12 – по месяцам: 40–80 слов каждый, по теме личного месяца и событиям неба этого месяца. "
+        "Практично: на что направить силы, где быть внимательнее.\n"
+        "Даты событий бери только из данных.\n\n" + PRODUCT_RULES + "\n" + FATE_STYLE + "\n\n" + _json_hint(secs)
+    )
+    months = "\n".join(f"{mm['name']}: личный месяц {mm['personal_month']}" + (f"; {mm['ingress']}" if mm["ingress"] else "")
+                       for mm in yd["months"])
+    data = (f"Личный год: {yd['personal_year']}.\nКлючевые события года: {'; '.join(yd['key_events']) or 'нет'}.\n"
+            f"{months}")
+    return await _write_sections(system, data, secs, 32, 160, 5000)
+
+
+# ── Входные данные, покупка, генерация в фоне ─────────────────────────────
+def _need_birth(user: dict):
+    if not user.get("birth_date"):
+        raise HTTPException(status_code=400, detail="Сначала введи дату рождения в «Коде судьбы».")
+
+
+async def product_inputs(user: dict, kind: str, payload: dict) -> tuple:
+    """(title, params, data) – всё посчитано кодом до списания. Ошибка ввода – 400."""
+    uid = user["telegram_id"]
+    if kind == "matrix":
+        _need_birth(user)
+        m = matrix_points(user["birth_date"])
+        return PRODUCT_TITLE[kind], {"birth": user["birth_date"].isoformat()}, {"points": m, "facts": matrix_facts(m)}
+    if kind == "compat":
+        p = await db()
+        row = await p.fetchrow("SELECT params FROM paid_products WHERE id = $1 AND telegram_id = $2 "
+                               "AND kind = 'compat_preview'", int(payload.get("preview_id") or 0), uid)
+        if not row:
+            raise HTTPException(status_code=400, detail="Сначала посмотри бесплатное превью совместимости.")
+        params = json.loads(row["params"])
+        pp = pair_points(date.fromisoformat(params["me"]), date.fromisoformat(params["partner_date"]))
+        return (f"Совместимость: {params['partner_name']}", params,
+                {"pair": pp, "facts": pair_facts(pp, params["partner_name"])})
+    if kind == "numerology":
+        _need_birth(user)
+        name = validate_name(payload.get("name") or user.get("numerology_name") or "")
+        if not name:
+            raise HTTPException(status_code=400, detail="Напиши имя русскими буквами, например «Анна Иванова».")
+        p = await db()
+        await p.execute("UPDATE users SET numerology_name = $2 WHERE telegram_id = $1", uid, name)
+        year = user_now(user).year
+        n = numerology(name, user["birth_date"], year)
+        return PRODUCT_TITLE[kind], {"name": name, "year": year}, {"num": n, "facts": numerology_facts(n)}
+    if kind == "month":
+        _need_birth(user)
+        y, mo = forecast_targets(user)["month"]
+        md = await month_data(user, user["birth_date"], y, mo)
+        facts = [["Личный месяц", str(md["personal_month"])], ["Личный год", str(md["personal_year"])]]
+        facts += [[f"{w['from']}–{w['to']}", "; ".join(w["events"])] for w in md["weeks"] if w["events"]]
+        facts += [["Ретроград", x] for x in md["retro"]]
+        return f"Прогноз на месяц: {md['title']}", {"year": y, "month": mo}, {"month": md, "facts": facts}
+    if kind == "year":
+        _need_birth(user)
+        y = forecast_targets(user)["year"]
+        yd = await year_data(user, user["birth_date"], y)
+        facts = [["Личный год", str(yd["personal_year"])]] + [["Событие года", x] for x in yd["key_events"]]
+        return f"Прогноз на {y} год", {"year": y}, {"year": yd, "facts": facts}
+    raise HTTPException(status_code=400, detail="Неизвестный разбор.")
+
+
+async def generate_product(user: dict, kind: str, params: dict, data: dict) -> Optional[list]:
+    if kind == "matrix":
+        return await gen_matrix(user, data["points"])
+    if kind == "compat":
+        return await gen_compat(data["pair"], params["partner_name"])
+    if kind == "numerology":
+        return await gen_numerology(data["num"])
+    if kind == "month":
+        return await gen_month(data["month"])
+    if kind == "year":
+        return await gen_year(data["year"])
+    return None
+
+
+async def _run_product(pid: int, user: dict, kind: str, params: dict, data: dict, cost: int):
+    """Фоновая генерация. Не получилось – энергия возвращается, разбор помечается failed."""
+    uid = user["telegram_id"]
+    p = await db()
+    try:
+        sections = await generate_product(user, kind, params, data)
+    except Exception as e:
+        log(f"product {kind} {uid}: {type(e).__name__}: {e}")
+        sections = None
+    if sections:
+        await p.execute("UPDATE paid_products SET sections = $2, status = 'ready' WHERE id = $1",
+                        pid, json.dumps(sections, ensure_ascii=False))
+        track(uid, PRODUCT_EVENT[kind], {"cost": cost, "id": pid})
+        return
+    async with p.acquire() as c:
+        async with c.transaction():
+            failed = await c.fetchval("UPDATE paid_products SET status = 'failed' WHERE id = $1 AND status = 'pending' "
+                                      "RETURNING 1", pid)
+            if failed and cost > 0:
+                await c.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, cost)
+    track(uid, "product_failed", {"kind": kind, "id": pid})
+
+
+def product_payload(row) -> dict:
+    data = json.loads(row["data"] or "{}")
+    return {
+        "id": row["id"], "kind": row["kind"], "title": row["title"], "status": row["status"],
+        "emoji": PRODUCT_EMOJI.get(row["kind"], "✨"), "created_at": row["created_at"].isoformat(),
+        "facts": data.get("facts") or [],
+        "sections": json.loads(row["sections"]) if row["sections"] and row["status"] == "ready" else [],
+    }
+
+
+@app.post("/api/products/buy")
+async def api_product_buy(payload: dict, authorization: str = Header(None)):
+    """Покупка разбора после экрана подтверждения. request_id с клиента – повторное нажатие не спишет второй раз."""
+    user, admin = await auth_user(authorization)
+    uid = user["telegram_id"]
+    kind = str(payload.get("kind") or "")
+    if kind not in PRODUCT_COST:
+        raise HTTPException(status_code=400, detail="Неизвестный разбор.")
+    req = re.sub(r"[^A-Za-z0-9-]", "", str(payload.get("request_id") or ""))[:40]
+    if len(req) < 8:
+        raise HTTPException(status_code=400, detail="Обнови приложение и попробуй ещё раз.")
+    p = await db()
+    # Повтор того же нажатия или уже идущий разбор того же вида – отдаём его, не списываем
+    row = await p.fetchrow("""
+        SELECT id, status FROM paid_products WHERE telegram_id = $1 AND (request_id = $2
+            OR (kind = $3 AND status = 'pending' AND created_at > NOW() - INTERVAL '5 minutes'))
+        ORDER BY id DESC LIMIT 1
+    """, uid, req, kind)
+    if row:
+        return {"id": row["id"], "status": row["status"], "repeat": True, "new_balance": 99999 if admin else
+                await p.fetchval("SELECT balance FROM users WHERE telegram_id = $1", uid)}
+    title, params, data = await product_inputs(user, kind, payload)
+    cost = 0 if admin else PRODUCT_COST[kind]
+    pid = await p.fetchval("""
+        INSERT INTO paid_products (telegram_id, kind, title, params, data, cost, request_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING RETURNING id
+    """, uid, kind, title, json.dumps(params, ensure_ascii=False), json.dumps(data, ensure_ascii=False), cost, req)
+    if pid is None:   # параллельное нажатие успело раньше (тот же request_id или этот разбор уже в работе)
+        row = await p.fetchrow("""
+            SELECT id, status FROM paid_products WHERE telegram_id = $1 AND (request_id = $2
+                OR (kind = $3 AND status = 'pending')) ORDER BY id DESC LIMIT 1
+        """, uid, req, kind)
+        if not row:
+            raise HTTPException(status_code=409, detail="Попробуй ещё раз.")
+        return {"id": row["id"], "status": row["status"], "repeat": True}
+    try:
+        await charge(uid, cost)
+    except HTTPException:
+        await p.execute("DELETE FROM paid_products WHERE id = $1", pid)
+        bal = await p.fetchval("SELECT balance FROM users WHERE telegram_id = $1", uid)
+        raise HTTPException(status_code=402, detail=f"Не хватает Энергии: нужно {cost}, на балансе {bal}.")
+    asyncio.create_task(_run_product(pid, user, kind, params, data, cost))
+    return {"id": pid, "status": "pending", "new_balance": 99999 if admin else
+            await p.fetchval("SELECT balance FROM users WHERE telegram_id = $1", uid)}
+
+
+@app.get("/api/products")
+async def api_products(authorization: str = Header(None)):
+    """«Мои разборы»: купленные матрицы, совместимости, портреты и прогнозы."""
+    user, _ = await auth_user(authorization)
+    p = await db()
+    rows = await p.fetch("""
+        SELECT * FROM paid_products WHERE telegram_id = $1 AND kind <> 'compat_preview' AND status <> 'failed'
+        ORDER BY created_at DESC LIMIT 100
+    """, user["telegram_id"])
+    return {"products": [{k: v for k, v in product_payload(r).items() if k not in ("facts", "sections")} for r in rows]}
+
+
+@app.get("/api/products/{pid}")
+async def api_product(pid: int, authorization: str = Header(None)):
+    user, _ = await auth_user(authorization)
+    p = await db()
+    row = await p.fetchrow("SELECT * FROM paid_products WHERE id = $1 AND telegram_id = $2", pid, user["telegram_id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="Разбор не найден.")
+    out = product_payload(row)
+    if row["status"] == "failed":
+        out["detail"] = "Не получилось написать разбор. Энергия возвращена на баланс."
+    return out
+
+
+@app.get("/api/matrix/preview")
+async def api_matrix_preview(authorization: str = Header(None)):
+    """Бесплатно: аркан личности и главная энергия + список закрытых разделов. Платные арканы не отдаём."""
+    user, _ = await auth_user(authorization)
+    _need_birth(user)
+    m = matrix_points(user["birth_date"])
+    p = await db()
+    owned = await p.fetchval("SELECT id FROM paid_products WHERE telegram_id = $1 AND kind = 'matrix' "
+                             "AND status IN ('ready', 'pending') ORDER BY id DESC LIMIT 1", user["telegram_id"])
+    track(user["telegram_id"], "matrix_preview", {"owned": bool(owned)})
+    return {"personality": {"num": m["A"], "name": ARCANA[m["A"]]}, "main": {"num": m["E"], "name": ARCANA[m["E"]]},
+            "locked": [t for _, t in MATRIX_SECTIONS], "cost": PRODUCT_COST["matrix"], "owned_id": owned}
+
+
+@app.post("/api/compat/preview")
+async def api_compat_preview(payload: dict, authorization: str = Header(None)):
+    """Бесплатное превью: 2–3 предложения о паре. Сохраняем, чтобы полная версия считалась по тем же данным."""
+    user, _ = await auth_user(authorization)
+    uid = user["telegram_id"]
+    _need_birth(user)
+    name = re.sub(r"\s+", " ", str(payload.get("name") or "")).strip()[:40]
+    if len(name) < 2 or not re.search(r"[A-Za-zА-Яа-яЁё]", name):
+        raise HTTPException(status_code=400, detail="Напиши, как зовут партнёра.")
+    d2 = parse_birth_date(str(payload.get("date") or ""))
+    if not d2:
+        raise HTTPException(status_code=400, detail=BIRTH_ERROR_TEXT)
+    p = await db()
+    n = await p.fetchval("SELECT COUNT(*) FROM paid_products WHERE telegram_id = $1 AND kind = 'compat_preview' "
+                         "AND created_at > NOW() - INTERVAL '1 day'", uid)
+    if n >= COMPAT_PREVIEWS_PER_DAY:
+        raise HTTPException(status_code=429, detail="На сегодня превью закончились. Загляни завтра 🌙")
+    pp = pair_points(user["birth_date"], d2)
+    text = await gen_compat(pp, name, preview=True)
+    if not text:
+        raise HTTPException(status_code=503, detail="Не получилось посчитать совместимость. Попробуй через минуту.")
+    params = {"me": user["birth_date"].isoformat(), "partner_name": name, "partner_date": d2.isoformat()}
+    pid = await p.fetchval("""
+        INSERT INTO paid_products (telegram_id, kind, title, params, data, sections, cost, status)
+        VALUES ($1, 'compat_preview', $2, $3, '{}', $4, 0, 'ready') RETURNING id
+    """, uid, f"Совместимость: {name}", json.dumps(params, ensure_ascii=False),
+        json.dumps([{"title": "Коротко о паре", "text": text}], ensure_ascii=False))
+    track(uid, "compat_preview", {"id": pid})
+    return {"preview_id": pid, "partner_name": name, "text": text, "cost": PRODUCT_COST["compat"],
+            "share_link": f"https://t.me/{(await bot.me()).username}?start=compat_{uid}"}
+
+
+def paid_profile(user: dict) -> dict:
+    t = forecast_targets(user)
+    return {"costs": PRODUCT_COST, "month_title": t["month_title"], "year_title": t["year_title"],
+            "numerology_name": user.get("numerology_name")}
