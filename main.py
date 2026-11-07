@@ -5634,6 +5634,8 @@ def matrix_points(d: date) -> dict:
     return {
         "A": A, "B": B, "C": C, "D": D, "E": E, "F": F, "G": G, "H": H, "I": I,
         "rays": {"A": ray(A), "B": ray(B), "C": ray(C), "D": ray(D)},
+        # Родовые углы тоже с точками к центру: угол → ближняя к углу → ближняя к центру (для рисунка)
+        "corner_rays": {"F": ray(F), "G": ray(G), "H": ray(H), "I": ray(I)},
         "tail": [D1, r(D + D1), D],                           # кармический хвост: от центра к краю
         "money_entry": C1, "rel_entry": D1, "balance": balance,
         "money": r(C1 + balance), "rel_mid": r(D1 + balance),
@@ -5900,6 +5902,7 @@ PRODUCT_RULES = (
     "• Номера арканов в тексте не повторяй, называй арканы по названию. Каждый аркан называй только там, "
     "где он стоит в данных: не приписывай точке чужой аркан.\n"
     "• Не утверждай, что с человеком что-то уже происходило в прошлом: говори о темах и задачах.\n"
+    "• Не упоминай авторов методик и названия школ.\n"
     "• Пол человека неизвестен. Не используй слова с родом (ощущал/ощущала, готов/готова, способен/способна): "
     "перестраивай фразу – «тебе хочется», «ты в силах», «у тебя получается».\n"
     "• Даты пиши ровно так, как в данных (например, «2 ноября»), не меняй и не сдвигай их.\n"
@@ -6182,6 +6185,7 @@ def product_payload(row) -> dict:
         "id": row["id"], "kind": row["kind"], "title": row["title"], "status": row["status"],
         "emoji": PRODUCT_EMOJI.get(row["kind"], "✨"), "created_at": row["created_at"].isoformat(),
         "facts": data.get("facts") or [],
+        "points": data.get("points") if row["kind"] == "matrix" else None,   # для рисунка матрицы
         "sections": json.loads(row["sections"]) if row["sections"] and row["status"] == "ready" else [],
     }
 
