@@ -16,6 +16,7 @@ import os
 import json
 import base64
 import hmac
+import html as _html
 import hashlib
 import math
 import random
@@ -443,6 +444,8 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_bot_msg_at TIMESTAMP DEFAULT NULL",
             # Релиз 3: знак, выбранный в приложении для гороскопа (если даты рождения нет)
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS horo_sign VARCHAR(16) DEFAULT NULL",
+            # Релиз 4: местная дата последнего бесплатного толкования сна (1 сон в день бесплатно)
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_dream_date VARCHAR(10) DEFAULT NULL",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -479,6 +482,35 @@ async def init_schema():
                 text TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (week_start, sign)
+            );
+        """)
+        # Релиз 4: сны – что рассказал человек (текст или расшифровка голоса), толкование и карта-совет
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS dreams (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                source VARCHAR(8) NOT NULL,
+                dream_text TEXT NOT NULL,
+                summary TEXT,
+                interpretation TEXT NOT NULL,
+                card TEXT NOT NULL,
+                card_advice TEXT,
+                paid BOOLEAN DEFAULT FALSE,
+                local_date VARCHAR(10),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await c.execute("CREATE INDEX IF NOT EXISTS dreams_user_idx ON dreams (telegram_id, created_at DESC)")
+        # Релиз 4: марафон «7 дней знаков Вселенной» – одна строка на человека
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS marathons (
+                telegram_id BIGINT PRIMARY KEY,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                day_done SMALLINT NOT NULL DEFAULT 0,
+                last_date VARCHAR(10),
+                reading_id BIGINT,
+                remind_date VARCHAR(10),
+                finished_at TIMESTAMP
             );
         """)
         # Релиз 2: толкования «Числа дня» – одно на число в день, общее для всех
@@ -1721,6 +1753,8 @@ async def setup_bot():
         await bot.set_my_commands([
             BotCommand(command="start", description="🔮 Открыть Послание Таро"),
             BotCommand(command="code", description="🔢 Мой Код судьбы"),
+            BotCommand(command="dream", description="🌙 Толкователь снов"),
+            BotCommand(command="marathon", description="🗓 Марафон «7 дней знаков Вселенной»"),
             BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
             BotCommand(command="daily", description="🌅 Карта Дня каждое утро: вкл/выкл"),
             BotCommand(command="subscription", description="🌟 Подписка «Послание+»"),
@@ -1848,7 +1882,12 @@ async def send_daily_push() -> int:
                    AND created_at < NOW() - make_interval(days => $5)
                    AND (last_bot_msg_at IS NULL OR last_bot_msg_at < NOW() - make_interval(hours => $6))))
               AND last_push_date IS DISTINCT FROM to_char(local_ts, 'YYYY-MM-DD')
-              AND (last_daily_date IS NULL OR last_daily_date < to_char(day_ts, 'YYYY-MM-DD'))
+              AND NOT EXISTS (SELECT 1 FROM readings rd WHERE rd.telegram_id = t.telegram_id AND rd.kind = 'daily'
+                   AND rd.created_at > (NOW() AT TIME ZONE 'UTC') - INTERVAL '2 days'
+                   AND to_char(rd.created_at + (t.day_ts - (NOW() AT TIME ZONE 'UTC')), 'YYYY-MM-DD')
+                       >= to_char(t.day_ts, 'YYYY-MM-DD'))
+              AND NOT EXISTS (SELECT 1 FROM marathons m WHERE m.telegram_id = t.telegram_id
+                              AND m.remind_date = to_char(t.day_ts, 'YYYY-MM-DD'))
             LIMIT 200
         """, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS, NEW_USER_QUIET_DAYS, QUIET_HOURS)
         if not rows:
@@ -2032,6 +2071,10 @@ async def push_loop():
             now = local_now()
             # Карта Дня: у каждого своё время (см. send_daily_push). last_push_date – местный день человека,
             # не даёт отправить повторно в тот же день.
+            # Марафон – раньше Карты Дня: кому пришло напоминание о дне марафона, Карту Дня в этот день не шлём
+            n = await send_marathon_reminders()
+            if n:
+                log(f"📬 Марафон: {n}")
             n = await send_daily_push()
             if n:
                 log(f"📬 Пуш Карты Дня отправлен: {n}")
@@ -2209,7 +2252,7 @@ def card_price(pack: str, user: dict) -> int:
     return CARD_PRICES[pack]
 
 
-READING_KINDS = {"daily": "🃏 Карта дня", "quick": "⚡ Быстрый ответ", "preset": "🎴 Расклад на ситуацию", "ai": "🔮 Индивидуальный",
+READING_KINDS = {"daily": "🃏 Карта дня", "marathon": "🗓 Марафон", "quick": "⚡ Быстрый ответ", "preset": "🎴 Расклад на ситуацию", "ai": "🔮 Индивидуальный",
                  **{f"sp_{k}": f"{v['emoji']} {v['title']}" for k, v in SPREADS.items()}}
 
 
@@ -2259,12 +2302,11 @@ async def get_user_profile(authorization: str = Header(None)):
     out = profile_payload(user, is_admin(user))
     p = await db()
     out["ref_invited"] = await p.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
-    out["today_daily_id"] = None
-    if daily_taken(user):
-        p = await db()
-        out["today_daily_id"] = await p.fetchval("""
-            SELECT id FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
-        """, uid)
+    today_row = await today_daily_reading(uid, user)
+    out["today_daily_id"] = today_row["id"] if today_row else None
+    out["daily_available"] = is_admin(user) or not today_row
+    out["marathon"] = marathon_state(await marathon_row(uid), user)
+    out["dream"] = {"free": is_admin(user) or dream_free_today(user), "cost": COST_DREAM}
     return out
 
 
@@ -2362,6 +2404,33 @@ async def use_spread(payload: dict, authorization: str = Header(None)):
                                  result_data.get("reading", ""))
 
 
+daily_busy: set = set()   # Карта Дня генерируется – второй запрос не запускает вторую карту
+
+
+async def today_daily_reading(uid: int, user: dict):
+    """Сегодняшняя (по местной дате человека) Карта Дня из истории или None."""
+    p = await db()
+    row = await p.fetchrow("""
+        SELECT * FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
+    """, uid)
+    if row and (row["created_at"] + timedelta(minutes=user_tz_min(user))).strftime("%Y-%m-%d") >= user_today(user):
+        return row
+    return None
+
+
+async def claim_daily_streak(uid: int, user: dict) -> Optional[int]:
+    """Засчитать сегодняшний день в серию: Карта Дня или день марафона – что открыто первым.
+    last_daily_date – последний засчитанный день серии. None – сегодня уже засчитано."""
+    p = await db()
+    return await p.fetchval("""
+        UPDATE users SET
+            streak = CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END,
+            best_streak = GREATEST(best_streak, CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END),
+            last_daily_date = $2
+        WHERE telegram_id = $1 AND (last_daily_date IS NULL OR last_daily_date < $2) RETURNING streak
+    """, uid, user_today(user), user_yesterday(user))
+
+
 async def _streak_reward(uid: int, streak: int) -> Optional[str]:
     """Награда за серию Карт Дня. Возвращает текст для показа или None."""
     p = await db()
@@ -2383,38 +2452,32 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
     Повторный запрос в тот же день возвращает уже полученную карту, а не ошибку."""
     user, admin = await auth_user(authorization)
     uid = user["telegram_id"]
-    today = user_today(user)
-    p = await db()
-    streak = user.get("streak") or 0
     if not admin:
-        streak = await p.fetchval("""
-            UPDATE users SET
-                streak = CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END,
-                best_streak = GREATEST(best_streak, CASE WHEN last_daily_date = $3 THEN streak + 1 ELSE 1 END),
-                last_daily_date = $2
-            WHERE telegram_id = $1 AND (last_daily_date IS NULL OR last_daily_date < $2) RETURNING streak
-        """, uid, today, user_yesterday(user))
-        if streak is None:
-            row = await p.fetchrow("""
-                SELECT * FROM readings WHERE telegram_id = $1 AND kind = 'daily' ORDER BY created_at DESC LIMIT 1
-            """, uid)
-            if row and row["created_at"] > datetime.utcnow() - timedelta(hours=26):
-                fresh = await get_user(uid)
-                out = reading_payload(row, fresh)
-                out.update({"success": True, "repeat": True, "reading_id": row["id"],
-                            "new_balance": fresh["balance"], "streak": fresh.get("streak") or 0})
-                return out
+        row = await today_daily_reading(uid, user)
+        if row:   # сегодняшняя карта уже открыта – показываем её же
+            fresh = await get_user(uid)
+            out = reading_payload(row, fresh)
+            out.update({"success": True, "repeat": True, "reading_id": row["id"],
+                        "new_balance": fresh["balance"], "streak": fresh.get("streak") or 0})
+            return out
+        if uid in daily_busy:
             raise HTTPException(status_code=429, detail="Карта дня ещё готовится. Загляни через минуту 🌙")
-
-    pre_selected = random.sample(get_tarot_deck(), 1)
+    daily_busy.add(uid)
     try:
-        result_data = await generate_daily_reading(pre_selected)
-    except Exception as e:  # день уже отмечен – карта должна прийти в любом случае
-        log(f"daily error: {e}")
-        result_data = generate_local_tarot_reading("", pre_selected, reading_type="daily")
-    reward = None if admin else await _streak_reward(uid, streak)
-    out = await _finish_reading(uid, admin, "free", "daily", "", [pre_selected[0]], result_data.get("reading", ""))
-    out.update({"streak": streak, "streak_reward": reward})
+        # Серия общая с марафоном: если сегодня уже открыт день марафона, день засчитан – серия не растёт второй раз
+        streak = None if admin else await claim_daily_streak(uid, user)
+        pre_selected = random.sample(get_tarot_deck(), 1)
+        try:
+            result_data = await generate_daily_reading(pre_selected)
+        except Exception as e:  # карта должна прийти в любом случае
+            log(f"daily error: {e}")
+            result_data = generate_local_tarot_reading("", pre_selected, reading_type="daily")
+        reward = await _streak_reward(uid, streak) if streak else None
+        out = await _finish_reading(uid, admin, "free", "daily", "", [pre_selected[0]], result_data.get("reading", ""))
+    finally:
+        daily_busy.discard(uid)
+    fresh = await get_user(uid)
+    out.update({"streak": fresh.get("streak") or 0, "streak_reward": reward})
     return out
 
 
@@ -2537,7 +2600,7 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
 
 CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
                  "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open",
-                 "sky_viewed", "horoscope_from_broadcast"}
+                 "sky_viewed", "horoscope_from_broadcast", "marathon_cta_clicked"}
 
 
 @app.post("/api/user/source")
@@ -3008,6 +3071,13 @@ async def cmd_start(message: Message, command: CommandObject):
             asyncio.create_task(notify_referrer(referrer, u.first_name))
         return
 
+    if command.args in ("dream", "marathon"):   # ссылки t.me/<бот>?start=dream / =marathon
+        if command.args == "dream":
+            await send_dream_prompt(message.chat.id, u.id)
+        else:
+            await send_marathon_status(message.chat.id, u.id)
+        return
+
     lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
              "Это Послание Таро. Задай вопрос – и карты ответят.", ""]
     if user.get("_move_gift"):
@@ -3020,7 +3090,9 @@ async def cmd_start(message: Message, command: CommandObject):
     lines += ["🃏 Карта Дня – бесплатно каждый день.",
               f"⚡ Быстрый ответ одной картой на любой вопрос – {COST_QUICK} Энергии.",
               "🎴 Расклад на ситуацию и 🔮 Индивидуальный разбор – за Энергию.",
-              "🔢 Твой Код судьбы по дате рождения – /code", "",
+              "🔢 Твой Код судьбы по дате рождения – /code",
+              "🌙 Толкование сна голосом или текстом – /dream",
+              f"🗓 Марафон «{MARATHON_TITLE}» – /marathon", "",
               "Жми кнопку ниже 👇"]
     await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
 
@@ -4048,6 +4120,8 @@ def _awaiting_birth_date(message: Message) -> bool:
         return False
     if feedback_waiting.get(message.from_user.id, 0) > time.time():
         return False
+    if dream_waiting.get(message.from_user.id, 0) > time.time():  # ждём сон
+        return False
     if message.reply_to_message and _is_admin_msg(message):  # ответ админа на отзыв
         return False
     return birth_waiting.get(message.from_user.id, 0) > time.time() or bool(BIRTH_DATE_RE.match(message.text))
@@ -4476,6 +4550,7 @@ async def cmd_feedback(message: Message, command: CommandObject):
             await message.answer(e.detail)
         return
     feedback_waiting[u.id] = time.time() + 600
+    dream_waiting.pop(u.id, None)
     await message.answer(
         "✍️ Напишите одним сообщением отзыв, идею или что работает не так – мы прочитаем всё.\n\n"
         "Передумали? Просто отправьте /start.")
@@ -4704,3 +4779,762 @@ async def cmd_news(message: Message, command: CommandObject):
     await message.answer(f"Получателей: {left}. Рассылка {status}.\n\n"
                          "/news at 13:00 – запланировать\n/news go – отправить сейчас\n/news cancel – отменить план")
 
+
+
+# =====================================================================
+# РЕЛИЗ 4: ТОЛКОВАТЕЛЬ СНОВ
+# Вход – кнопка в мини-аппе (бот присылает подсказку) или /dream. Сон – голосом или текстом.
+# Голос: Telegram voice (OGG/Opus) → Groq Whisper large-v3 → (запасной) Gemini. Длиннее 3 минут – просим короче.
+# Карту-совет выбирает код, ИИ пишет толкование сна и смысл карты под этот сон.
+# 1 сон в день бесплатно по местной дате человека (users.last_dream_date), дальше COST_DREAM с подтверждением.
+# =====================================================================
+COST_DREAM = int(os.getenv("COST_DREAM", "75"))
+DREAM_MAX_SECONDS = 180           # голосовое длиннее – просим рассказать короче
+DREAM_MIN_WORDS = 4
+DREAM_MAX_CHARS = 3000
+DREAM_WAIT_SECONDS = 3600         # после подсказки час ждём текст сна
+DREAM_PENDING_SECONDS = 3 * 3600  # платный сон ждёт подтверждения (или пополнения) 3 часа
+GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
+GEMINI_STT_MODEL = os.getenv("GEMINI_STT_MODEL", "gemini-2.5-flash")
+
+dream_waiting: dict = {}   # telegram_id → до какого времени ждём текст сна
+dream_pending: dict = {}   # telegram_id → {"text", "source", "duration", "until"} – ждёт оплаты
+dream_busy: set = set()    # уже толкуем – второй сон параллельно не берём
+
+DREAM_ASK_TEXT = "🌙 Расскажи сон голосом или текстом. Голосовое – до 3 минут."
+DREAM_FAIL_TEXT = "Не получилось разобрать слова 🙏 Попробуй записать ещё раз в тихом месте или напиши сон текстом."
+
+# Whisper на тишине и шуме иногда «слышит» титры из обучающих видео – такие куски выбрасываем
+WHISPER_JUNK_RE = re.compile(r"(субтитр|продолжение следует|спасибо за просмотр|подписывайтесь на канал|"
+                             r"ставьте лайк|dimatorzok|amara\.org|редактор[а-я]* субтитров|до новых встреч)",
+                             re.IGNORECASE)
+WHISPER_NO_SPEECH = 0.6   # сегменты, где модель уверена, что речи нет, – пропускаем
+
+
+def dream_free_today(user: dict) -> bool:
+    """Бесплатный сон сегодня ещё не потрачен. Дата из «будущего» (сменился пояс) – считаем потраченным."""
+    return (user.get("last_dream_date") or "") < user_today(user)
+
+
+def _h(text: str) -> str:
+    return _html.escape(text or "", quote=False)
+
+
+def md_to_html(text: str) -> str:
+    """**жирный** из наших текстов → HTML для сообщений бота."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", _h(text))
+
+
+async def _download_voice(file_id: str) -> bytes:
+    f = await bot.get_file(file_id)
+    buf = await bot.download_file(f.file_path)
+    return buf.read()
+
+
+def _clean_transcript(text: str) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return "" if WHISPER_JUNK_RE.fullmatch(text.strip(" .!…")) else text
+
+
+async def _groq_transcribe(data: bytes) -> Optional[str]:
+    """None – сервис не ответил (пробуем запасной), "" – речи не слышно."""
+    if not GROQ_API_KEY:
+        return None
+    t0 = time.monotonic()
+    try:
+        r = await http.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            data={"model": GROQ_STT_MODEL, "language": "ru", "response_format": "verbose_json", "temperature": "0"},
+            files={"file": ("voice.ogg", data, "audio/ogg")},
+            timeout=60.0,
+        )
+        if r.status_code != 200:
+            log(f"⚠️ Groq STT ошибка {r.status_code}: {r.text[:200]}")
+            return None
+        j = r.json()
+        segs = j.get("segments")
+        if segs:
+            parts = [s.get("text", "") for s in segs
+                     if (s.get("no_speech_prob") or 0) < WHISPER_NO_SPEECH and not WHISPER_JUNK_RE.search(s.get("text", ""))]
+            text = " ".join(x.strip() for x in parts)
+        else:
+            text = j.get("text") or ""
+        log(f"Groq STT {time.monotonic() - t0:.1f}s, {len(text)} симв.")
+        return _clean_transcript(text)
+    except Exception as e:
+        log(f"⚠️ Groq STT исключение: {type(e).__name__}: {e}")
+        return None
+
+
+async def _gemini_transcribe(data: bytes) -> Optional[str]:
+    if not GEMINI_API_KEY:
+        return None
+    payload = {
+        "contents": [{"parts": [
+            {"inlineData": {"mimeType": "audio/ogg", "data": base64.b64encode(data).decode()}},
+            {"text": "Запиши дословно, что говорит человек на этой аудиозаписи, по-русски. Ничего не добавляй, "
+                     "не сокращай и не пересказывай, только расставь знаки препинания. Если речи не слышно, "
+                     "ответь пустой строкой."},
+        ]}],
+        "generationConfig": {"temperature": 0, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_STT_MODEL}:generateContent"
+    try:
+        r = await http.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=90.0)
+        if r.status_code != 200:
+            log(f"⚠️ Gemini STT ошибка {r.status_code}: {r.text[:150]}")
+            return None
+        parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        return _clean_transcript(" ".join(p.get("text", "") for p in parts).strip().strip('"«»'))
+    except Exception as e:
+        log(f"⚠️ Gemini STT исключение: {type(e).__name__}: {e}")
+        return None
+
+
+async def transcribe_audio(data: bytes) -> Optional[str]:
+    """Текст голосового. "" – речи не слышно, None – распознавание недоступно."""
+    text = await _groq_transcribe(data)
+    if text is None:
+        text = await _gemini_transcribe(data)
+    return text
+
+
+DREAM_SCHEMA = {"type": "object", "properties": {
+    "summary": {"type": "string"}, "interpretation": {"type": "string"}, "card_advice": {"type": "string"}},
+    "required": ["summary", "interpretation", "card_advice"]}
+DREAM_HEAVY_RE = re.compile(r"(смерт|умер|умира|мёртв|мертв|похорон|гроб|труп|убий|убива|убил|насил|изнасил|"
+                            r"болезн|болел|болен|больн|кров|авари|катастроф|войн|взрыв|пожар|тонул|утон)", re.IGNORECASE)
+DREAM_HEAVY_NOTE = "Такой сон не значит, что это случится наяву: он говорит о чувствах, а не о будущем."
+DREAM_OMEN_RE = re.compile(r"(\bк деньгам|\bк болезни|\bк смерти|\bк беде|\bк несчасть|предвещает|сулит|"
+                           r"плохой знак|плохая примета|дурной знак)", re.IGNORECASE)
+
+
+def _dream_prompt(card_name: str, heavy: bool) -> str:
+    return (
+        "Ты – толкователь снов в «Послании Таро». Человек рассказал свой сон. Сон – язык образов: помоги увидеть, "
+        "о чём эти образы могут говорить в его жизни сейчас – о чувствах, желаниях, усталости, переменах.\n\n"
+        "ПРАВИЛА:\n"
+        "• Толкуй образы, а не предсказывай. Никаких «это к деньгам», «к болезни», «скоро случится», примет и "
+        "сонников. Сон не сообщает о будущем.\n"
+        "• Никаких пугающих формулировок и диагнозов.\n"
+        "• Опирайся только на то, что есть в рассказе. Не придумывай события и людей из жизни человека. "
+        "Говори осторожно: «возможно», «может отражать», «такой образ часто связан с…».\n"
+        "• Возьми самые яркие образы сна и объясни их. Не пересказывай сон целиком.\n"
+        + ("• В этом сне есть тяжёлые образы (смерть, болезнь, насилие или беда). Толкуй их мягко и только как "
+           "символы: конец одного этапа, усталость, давление, сильные чувства. Одной фразой спокойно скажи, что такой "
+           "сон не означает, что это случится наяву. Не описывай подробности.\n" if heavy else "")
+        + "• Если рассказ короткий или путаный, бережно поработай с тем, что есть.\n\n"
+        "ЧАСТИ ОТВЕТА:\n"
+        "• summary – пересказ сна в 1–2 коротких предложениях, до 30 слов, только главные образы, во втором лице "
+        "и настоящем времени, без толкования. Пример: «Ты идёшь по ночному вокзалу и не можешь найти свой поезд».\n"
+        "• interpretation – толкование сна: 150–200 слов (не меньше 140), три абзаца, без заголовков и списков. "
+        "Первый абзац – о главном образе сна, второй – о остальных образах, третий – что сон может значить для "
+        "человека сейчас. Абзацы раздели пустой строкой.\n"
+        f"• card_advice – карта-совет «{card_name}»: что она советует человеку в связке с этим сном. "
+        "2–3 предложения, 30–60 слов, мягкий совет на ближайшие дни. Без предсказаний и обещаний вроде «всё "
+        "уладится». Название карты не повторяй в начале.\n\n"
+        + HUMAN_STYLE + "\n\n"
+        "Формат ответа – строго JSON: {\"summary\": \"…\", \"interpretation\": \"…\", \"card_advice\": \"…\"}"
+    )
+
+
+def _dream_validator(parsed: dict) -> Optional[dict]:
+    out = {k: clean_ai_text(str(parsed.get(k) or "")).strip() for k in ("summary", "interpretation", "card_advice")}
+    s, i, a = (len(out[k].split()) for k in ("summary", "interpretation", "card_advice"))
+    if not (3 <= s <= 45 and 115 <= i <= 240 and 15 <= a <= 85):
+        log(f"⚠️ Сон: слов {s}/{i}/{a}")
+        return None
+    if DREAM_OMEN_RE.search(out["interpretation"] + " " + out["card_advice"]):
+        log("⚠️ Сон: предсказание или примета в тексте")
+        return None
+    return out
+
+
+async def generate_dream(dream: str, card: dict) -> Optional[dict]:
+    name = card["name"].replace("Старший Аркан: ", "")
+    res = await call_ai(_dream_prompt(name, bool(DREAM_HEAVY_RE.search(dream))), f"Сон:\n«{dream}»",
+                        max_tokens=2000, schema=DREAM_SCHEMA, validate=_dream_validator)
+    if not res:
+        return None
+    new = await humanize_fields({"interpretation": res["interpretation"], "card_advice": res["card_advice"]},
+                                {"interpretation": "Толкование сна", "card_advice": f"Совет карты «{name}» к этому сну"},
+                                "")
+    # Редактор иногда сильно сокращает – тогда оставляем исходный текст нужной длины
+    if len(new["interpretation"].split()) >= 115 and not DREAM_OMEN_RE.search(new["interpretation"]):
+        res["interpretation"] = new["interpretation"]
+    if len(new["card_advice"].split()) >= 15 and not DREAM_OMEN_RE.search(new["card_advice"]):
+        res["card_advice"] = new["card_advice"]
+    # Тяжёлый сон: фраза «это не случится наяву» – обязательно, даже если модель её пропустила
+    if DREAM_HEAVY_RE.search(dream) and "наяву" not in res["interpretation"].lower():
+        res["interpretation"] = res["interpretation"].rstrip() + "\n\n" + DREAM_HEAVY_NOTE
+    return res
+
+
+async def dream_offer_text(user: dict, admin: bool) -> str:
+    if admin or dream_free_today(user):
+        return DREAM_ASK_TEXT + "\n\nСегодня толкование бесплатное."
+    return (DREAM_ASK_TEXT + f"\n\nБесплатный сон на сегодня уже растолкован. Этот будет стоить {COST_DREAM} Энергии, "
+            "а завтра снова бесплатно.")
+
+
+async def send_dream_prompt(chat_id: int, uid: int):
+    user = await get_user(uid) or {}
+    dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
+    feedback_waiting.pop(uid, None)
+    birth_waiting.pop(uid, None)
+    await bot.send_message(chat_id, await dream_offer_text(user, is_admin(user) if user else False))
+
+
+def _dream_pay_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✨ Растолковать – {COST_DREAM}", callback_data="dr:pay")],
+        [InlineKeyboardButton(text="Не сейчас", callback_data="dr:cancel")],
+    ])
+
+
+def _dream_topup_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Пополнить Энергию",
+                              web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=store&from=dream"))],
+        [InlineKeyboardButton(text=f"✨ Растолковать – {COST_DREAM}", callback_data="dr:pay")],
+    ])
+
+
+def _dream_topup_text(balance: int) -> str:
+    return (f"Толкование стоит {COST_DREAM} Энергии, а на балансе {balance}. Пополни баланс – сон я сохраню на 3 часа. "
+            "После пополнения нажми «Растолковать».")
+
+
+async def handle_dream(message: Message, text: str, source: str, duration: Optional[int] = None):
+    """Сон получен (текст или расшифровка). Бесплатный сегодня – толкуем сразу, иначе спрашиваем про оплату."""
+    uid = message.from_user.id
+    text = re.sub(r"[ \t]+", " ", (text or "")).strip()[:DREAM_MAX_CHARS]
+    if len(text.split()) < DREAM_MIN_WORDS:
+        dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
+        await message.answer("Расскажи чуть подробнее: что происходило во сне, кто там был, что ты чувствовал(а)?")
+        return
+    if uid in dream_busy:
+        await message.answer("Толкую предыдущий сон, это займёт меньше минуты 🌙")
+        return
+    dream_waiting.pop(uid, None)
+    user = await get_user(uid)
+    if not user:
+        u = message.from_user
+        user, _, _ = await ensure_user({"id": u.id, "first_name": u.first_name, "username": u.username})
+    admin = is_admin(user)
+    track(uid, "dream_voice" if source == "voice" else "dream_text",
+          {"free": admin or dream_free_today(user), "seconds": duration, "words": len(text.split())})
+    if admin:
+        await run_dream(message.chat.id, uid, text, source, "admin", None)
+        return
+    prev = user.get("last_dream_date")
+    today = user_today(user)
+    p = await db()
+    got = await p.fetchval("""
+        UPDATE users SET last_dream_date = $2
+        WHERE telegram_id = $1 AND (last_dream_date IS NULL OR last_dream_date < $2) RETURNING 1
+    """, uid, today)
+    if got:
+        await run_dream(message.chat.id, uid, text, source, "free", prev)
+        return
+    dream_pending[uid] = {"text": text, "source": source, "duration": duration,
+                          "until": time.time() + DREAM_PENDING_SECONDS}
+    balance = user.get("balance") or 0
+    head = "Бесплатный сон на сегодня уже растолкован, следующий бесплатный – завтра."
+    if balance >= COST_DREAM:
+        await message.answer(f"{head}\n\nРастолковать этот сон за {COST_DREAM} Энергии? На балансе {balance}.",
+                             reply_markup=_dream_pay_kb())
+    else:
+        await message.answer(f"{head}\n\n{_dream_topup_text(balance)}", reply_markup=_dream_topup_kb())
+
+
+async def run_dream(chat_id: int, uid: int, text: str, source: str, mode: str, prev_date: Optional[str]):
+    """Толкование + сохранение. Если ИИ не ответил – возвращаем бесплатный сон или Энергию."""
+    dream_busy.add(uid)
+    try:
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+        card = random.choice(get_tarot_deck())
+        try:
+            res = await generate_dream(text, card)
+        except Exception as e:
+            log(f"dream error: {e}")
+            res = None
+        if not res:
+            p = await db()
+            if mode == "free":
+                await p.execute("UPDATE users SET last_dream_date = $2 WHERE telegram_id = $1", uid, prev_date)
+                note = "Бесплатный сон остаётся за тобой."
+            elif mode == "paid":
+                await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, COST_DREAM)
+                note = "Энергия возвращена."
+            else:
+                note = ""
+            dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
+            await bot.send_message(chat_id, f"Не получилось растолковать сон 🙏 {note} Пришли его ещё раз "
+                                            "через пару минут.")
+            return
+        name = card["name"].replace("Старший Аркан: ", "")
+        await bot.send_message(chat_id, f"💭 Ты рассказал(а):\n{_h(res['summary'])}", parse_mode="HTML")
+        body = (f"🌙 <b>Толкование сна</b>\n\n{_h(res['interpretation'])}\n\n"
+                f"🃏 <b>Карта-совет: {_h(name)}</b>\n{_h(res['card_advice'])}")
+        if mode == "free":
+            body += f"\n\nСледующий сон – завтра бесплатно или сегодня за {COST_DREAM} Энергии."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌙 Рассказать ещё сон", callback_data="dr:new")],
+            [InlineKeyboardButton(text="🔮 Открыть Послание Таро", web_app=WebAppInfo(url=FRONTEND_URL))],
+        ])
+        await bot.send_message(chat_id, body, parse_mode="HTML", reply_markup=kb)
+        try:
+            user = await get_user(uid) or {}
+            p = await db()
+            await p.execute("""
+                INSERT INTO dreams (telegram_id, source, dream_text, summary, interpretation, card, card_advice,
+                                    paid, local_date)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, uid, source, text, res["summary"], res["interpretation"], card["name"], res["card_advice"],
+                mode == "paid", user_today(user) if user else get_today_str())
+        except Exception as e:
+            log(f"dream save {uid}: {e}")
+    finally:
+        dream_busy.discard(uid)
+
+
+@dp.message(Command("dream"))
+async def cmd_dream(message: Message):
+    await send_dream_prompt(message.chat.id, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("dr:"))
+async def dream_callback(q: CallbackQuery):
+    uid = q.from_user.id
+    action = q.data[3:]
+    await q.answer()
+    if action == "new":
+        await send_dream_prompt(q.message.chat.id, uid)
+        return
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if action == "cancel":
+        dream_pending.pop(uid, None)
+        await q.message.answer("Хорошо 🌙 Завтра толкование снова бесплатное.")
+        return
+    if action != "pay":
+        return
+    pend = dream_pending.get(uid)
+    if not pend or pend["until"] < time.time():
+        dream_pending.pop(uid, None)
+        dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
+        await q.message.answer("Сон не сохранился 🙏 Пришли его ещё раз голосом или текстом.")
+        return
+    user = await get_user(uid) or {}
+    if is_admin(user):
+        dream_pending.pop(uid, None)
+        await run_dream(q.message.chat.id, uid, pend["text"], pend["source"], "admin", None)
+        return
+    try:
+        await charge(uid, COST_DREAM)
+    except HTTPException:
+        await q.message.answer(_dream_topup_text(user.get("balance") or 0), reply_markup=_dream_topup_kb())
+        return
+    dream_pending.pop(uid, None)
+    track(uid, "dream_paid", {"source": pend["source"], "cost": COST_DREAM})
+    await run_dream(q.message.chat.id, uid, pend["text"], pend["source"], "paid", None)
+
+
+@dp.message(F.voice)
+async def dream_voice(message: Message):
+    """Голосовое – всегда сон: другого голосового сценария в боте нет."""
+    v = message.voice
+    uid = message.from_user.id
+    if (v.duration or 0) > DREAM_MAX_SECONDS:
+        track(uid, "dream_voice_long", {"seconds": v.duration})
+        await message.answer("Это голосовое длиннее 3 минут 🙏 Расскажи сон покороче, только главное, что запомнилось, "
+                             "или напиши его текстом.")
+        return
+    if uid in dream_busy:
+        await message.answer("Толкую предыдущий сон, это займёт меньше минуты 🌙")
+        return
+    try:
+        await bot.send_chat_action(message.chat.id, "typing")
+        text = await transcribe_audio(await _download_voice(v.file_id))
+    except Exception as e:
+        log(f"voice {uid}: {e}")
+        text = None
+    if text is None:
+        await message.answer("Сейчас не получается распознать голосовое 🙏 Напиши сон текстом, пожалуйста.")
+        dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
+        return
+    if len(text.split()) < DREAM_MIN_WORDS:
+        track(uid, "dream_voice_empty", {"seconds": v.duration})
+        dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
+        await message.answer(DREAM_FAIL_TEXT)
+        return
+    await handle_dream(message, text, "voice", v.duration)
+
+
+def _awaiting_dream(message: Message) -> bool:
+    return (bool(message.text) and not message.text.startswith("/")
+            and dream_waiting.get(message.from_user.id, 0) > time.time())
+
+
+@dp.message(F.text, _awaiting_dream)
+async def dream_text(message: Message):
+    await handle_dream(message, message.text, "text")
+
+
+@app.post("/api/dream/start")
+async def api_dream_start(authorization: str = Header(None)):
+    """Кнопка «Толкователь снов» в мини-аппе: бот присылает подсказку, мини-апп открывает чат."""
+    user, admin = await auth_user(authorization)
+    uid = user["telegram_id"]
+    try:
+        await send_dream_prompt(uid, uid)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        raise HTTPException(status_code=400, detail="Сначала открой бота и нажми «Старт», потом вернись сюда.")
+    me = await bot.me()
+    track(uid, "dream_open", {"via": "app"})
+    return {"ok": True, "bot": me.username, "free": admin or dream_free_today(user), "cost": COST_DREAM}
+
+
+# =====================================================================
+# РЕЛИЗ 4: МАРАФОН «7 ДНЕЙ ЗНАКОВ ВСЕЛЕННОЙ»
+# Каждый день – задание из словаря + своя карта по теме (толкование пишет ИИ, через гуманизатор).
+# Отдельный продукт от Карты Дня, но серия общая: день засчитан, если открыто хоть одно из двух (один раз).
+# Пропустил день – продолжаем с того же дня, без сброса. Таблица marathons, одна строка на человека.
+# =====================================================================
+MARATHON_TITLE = "7 дней знаков Вселенной"
+MARATHON_IDLE_DAYS = 3   # после 3 дней без марафона утренние напоминания о нём прекращаются
+MARATHON_DAYS = [
+    {"theme": "Внимание к знакам", "emoji": "👁",
+     "task": "Сегодня просто замечай. Повторяющиеся числа, случайная фраза из чужого разговора, песня, которая "
+             "звучит второй раз за день. Вечером запиши одно совпадение, которое зацепило, и подумай, о чём оно "
+             "тебе напомнило."},
+    {"theme": "Отношения", "emoji": "💞",
+     "task": "Вспомни человека, о котором думаешь чаще, чем говоришь с ним. Что хочется ему сказать, но ты "
+             "откладываешь? Запиши эту фразу в заметки. Отправлять её не обязательно."},
+    {"theme": "Деньги", "emoji": "🪙",
+     "task": "Посмотри на свои последние траты. Какая из них порадовала, а какая была по привычке? Заметь, что "
+             "ты чувствуешь, когда думаешь о деньгах: спокойствие или напряжение."},
+    {"theme": "Отложенное решение", "emoji": "⏳",
+     "task": "Назови одной фразой решение, которое лежит у тебя на полке уже не первую неделю. Что изменится, "
+             "если принять его сегодня? А что будет, если отложить ещё на месяц?"},
+    {"theme": "Благодарность", "emoji": "🙏",
+     "task": "Перед сном вспомни моменты дня, за которые хочется сказать спасибо. Мелочи тоже считаются: горячий "
+             "чай, сообщение от друга, свободная минута. Если хочется, поблагодари одного человека сообщением."},
+    {"theme": "Страх", "emoji": "🌒",
+     "task": "Какой страх сейчас чаще всего тебя останавливает? Запиши его как есть, без оценки. Потом спроси "
+             "себя, что он пытается защитить."},
+    {"theme": "Итог недели", "emoji": "✨",
+     "task": "Перечитай свои заметки за эти семь дней. Какая мысль или знак повторялись чаще других? "
+             "Сформулируй один главный вопрос, который у тебя остался."},
+]
+MARATHON_LEN = len(MARATHON_DAYS)
+MARATHON_FINAL = "За неделю ты многое заметил(а). Хочешь разобрать главный вопрос с картами?"
+MARATHON_INTRO = (
+    f"🗓 Марафон «{MARATHON_TITLE}»\n\n"
+    "Семь дней – семь тем: внимание к знакам, отношения, деньги, отложенное решение, благодарность, страх и итог "
+    "недели. Каждый день – короткое задание и карта по теме. Дни марафона идут в твою серию Карт Дня.\n\n"
+    "Это бесплатно. Пропустишь день – продолжим с того же места."
+)
+
+
+def marathon_dots(done: int) -> str:
+    return "●" * done + "○" * (MARATHON_LEN - done)
+
+
+async def marathon_row(uid: int) -> Optional[dict]:
+    p = await db()
+    row = await p.fetchrow("SELECT * FROM marathons WHERE telegram_id = $1", uid)
+    return dict(row) if row else None
+
+
+def marathon_state(m: Optional[dict], user: dict) -> dict:
+    """status: none – не начинал, ready – можно открыть день, done_today – сегодняшний пройден, finished – все 7."""
+    if not m:
+        return {"status": "none", "day_done": 0, "next_day": 1, "total": MARATHON_LEN,
+                "theme": MARATHON_DAYS[0]["theme"], "title": MARATHON_TITLE}
+    done = m.get("day_done") or 0
+    last = m.get("last_date") or ""
+    today = user_today(user)
+    if m.get("finished_at"):
+        status = "finished"
+    elif last and last >= today:
+        status = "done_today"
+    else:
+        status = "ready"
+    nxt = min(done + 1, MARATHON_LEN)
+    return {
+        "status": status, "day_done": done, "next_day": nxt, "total": MARATHON_LEN,
+        "theme": MARATHON_DAYS[nxt - 1]["theme"], "title": MARATHON_TITLE,
+        "skipped": status == "ready" and done > 0 and bool(last) and last < user_yesterday(user),
+        "today_reading_id": m.get("reading_id") if status in ("done_today", "finished") else None,
+    }
+
+
+async def marathon_start(uid: int) -> bool:
+    """Начать (или начать заново после финиша). Идёт сейчас – ничего не меняем."""
+    p = await db()
+    row = await p.fetchval("""
+        INSERT INTO marathons (telegram_id) VALUES ($1)
+        ON CONFLICT (telegram_id) DO UPDATE SET started_at = NOW(), day_done = 0, last_date = NULL,
+            finished_at = NULL, reading_id = NULL, remind_date = NULL
+        WHERE marathons.finished_at IS NOT NULL
+        RETURNING telegram_id
+    """, uid)
+    if row:
+        track(uid, "marathon_started")
+    return bool(row)
+
+
+MARATHON_CARD_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+
+
+def _marathon_card_validator(parsed: dict) -> Optional[dict]:
+    text = clean_ai_text(str(parsed.get("text") or "")).strip()
+    n = len(text.split())
+    if not 50 <= n <= 140:
+        log(f"⚠️ Марафон: {n} слов")
+        return None
+    return {"text": text}
+
+
+async def generate_marathon_card(day: int, card: dict) -> str:
+    info = MARATHON_DAYS[day - 1]
+    name = card["name"].replace("Старший Аркан: ", "")
+    system = (
+        f"Ты – таролог в «Послании Таро». Человек проходит марафон «{MARATHON_TITLE}». Сегодня день {day} "
+        f"из {MARATHON_LEN}, тема дня – «{info['theme']}». Задание дня: «{info['task']}».\n\n"
+        f"Напиши толкование карты «{name}» как карты марафона по этой теме: что карта подсвечивает в теме "
+        f"«{info['theme']}» и на что обратить внимание сегодня. 60–100 слов, один-два абзаца, без заголовков "
+        "и списков. Не пересказывай задание. Без предсказаний и обещаний.\n\n"
+        + NO_INVENT_RULE + "\n\n" + HUMAN_STYLE + "\n\n"
+        "Формат ответа – строго JSON: {\"text\": \"…\"}"
+    )
+    res = await call_ai(system, f"Карта марафона: {card['name']} ({card['type']}). Тема: {info['theme']}.",
+                        max_tokens=900, schema=MARATHON_CARD_SCHEMA, validate=_marathon_card_validator)
+    if res:
+        new = await humanize_fields({"text": res["text"]}, {"text": f"Толкование карты марафона по теме «{info['theme']}»"}, "")
+        return new["text"]
+    return (f"{name} сегодня выпадает к теме «{info['theme']}». Посмотри, какое место в этой теме карта "
+            "подсвечивает в твоей жизни прямо сейчас и что из этого хочется заметить внимательнее. Вечером вернись "
+            "к заданию дня и запиши, что получилось увидеть: к концу недели эти заметки сложатся в общую картину.")
+
+
+def marathon_text(day: int, card: dict, card_text: str) -> str:
+    info = MARATHON_DAYS[day - 1]
+    name = card["name"].replace("Старший Аркан: ", "")
+    text = (f"**День {day} из {MARATHON_LEN} · {info['emoji']} {info['theme']}**\n\n"
+            f"**Задание дня**\n{info['task']}\n\n"
+            f"**Карта марафона: {name}**\n{card_text}")
+    return text
+
+
+async def marathon_open_day(user: dict, admin: bool) -> dict:
+    """Открыть сегодняшний день марафона. Второй раз в тот же день – тот же текст."""
+    uid = user["telegram_id"]
+    today = user_today(user)
+    p = await db()
+    m = await marathon_row(uid)
+    if not m or (m.get("finished_at") and not (m.get("last_date") or "") >= today):
+        raise HTTPException(status_code=400, detail="Марафон ещё не начат.")
+    day = await p.fetchval("""
+        UPDATE marathons SET day_done = day_done + 1, last_date = $2
+        WHERE telegram_id = $1 AND finished_at IS NULL AND day_done < $3
+          AND (last_date IS NULL OR last_date < $2)
+        RETURNING day_done
+    """, uid, today, MARATHON_LEN)
+    if day is None:   # сегодняшний день уже открыт
+        row = None
+        for _ in range(20):   # параллельный запрос ещё пишет текст
+            m = await marathon_row(uid)
+            if m and m.get("reading_id"):
+                row = await p.fetchrow("SELECT * FROM readings WHERE id = $1", m["reading_id"])
+                break
+            await asyncio.sleep(1.5)
+        if not row:
+            raise HTTPException(status_code=429, detail="День марафона ещё готовится. Загляни через минуту 🌙")
+        out = reading_payload(row, user)
+        out.update({"success": True, "repeat": True, "reading_id": row["id"], "day": m["day_done"],
+                    "marathon": marathon_state(m, user)})
+        return out
+
+    # Своя карта марафона – отдельно от Карты Дня (её человек открывает сам, когда хочет)
+    card = random.choice(get_tarot_deck())
+    try:
+        card_text = await generate_marathon_card(day, card)
+    except Exception as e:
+        log(f"marathon card {uid}: {e}")
+        card_text = "Посмотри на эту карту как на подсказку к теме дня и вечером вернись к заданию."
+    text = marathon_text(day, card, card_text)
+    streak = None if admin else await claim_daily_streak(uid, user)
+    reward = await _streak_reward(uid, streak) if streak else None   # серия общая с Картой Дня
+    rid = await save_reading(uid, "marathon", f"Марафон, день {day}: {MARATHON_DAYS[day - 1]['theme']}", [card], text)
+    finished = day >= MARATHON_LEN
+    await p.execute(f"UPDATE marathons SET reading_id = $2{', finished_at = NOW()' if finished else ''} "
+                    "WHERE telegram_id = $1", uid, rid)
+    track(uid, f"marathon_day_{day}")
+    if finished:
+        track(uid, "marathon_finished")
+    fresh = await get_user(uid)
+    return {
+        "success": True, "repeat": False, "reading_id": rid, "day": day, "cards": [card], "text": text,
+        "streak": streak, "streak_reward": reward, "new_balance": 99999 if admin else fresh["balance"],
+        "clarify_left": MAX_CLARIFY, "clarify_cost": 0 if sub_active(fresh) else COST_CLARIFY,
+        "marathon": marathon_state(await marathon_row(uid), fresh),
+    }
+
+
+def marathon_cta_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⚡ Быстрый ответ – {COST_QUICK}",
+                              web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=quick&from=marathon"))],
+        [InlineKeyboardButton(text=f"🎴 Расклад на ситуацию – {COST_PRESET}",
+                              web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=preset&from=marathon"))],
+    ])
+
+
+def _marathon_day_kb(day: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=f"🗓 Открыть день {day} из {MARATHON_LEN}", callback_data="mr:day")]])
+
+
+async def send_marathon_day(chat_id: int, uid: int):
+    user = await get_user(uid)
+    if not user:
+        return
+    try:
+        await bot.send_chat_action(chat_id, "typing")
+    except Exception:
+        pass
+    try:
+        res = await marathon_open_day(user, is_admin(user))
+    except HTTPException as e:
+        await bot.send_message(chat_id, e.detail)
+        return
+    day = res["day"]
+    head = f"🗓 Марафон «{MARATHON_TITLE}»\n{marathon_dots(day)} день {day} из {MARATHON_LEN}\n\n"
+    body = head + md_to_html(res["text"])
+    if res.get("streak_reward"):
+        body += "\n\n" + _h(res["streak_reward"])
+    if day >= MARATHON_LEN:   # в мини-аппе финал – отдельным блоком с кнопками, в боте – текстом над кнопками
+        body += f"\n\n<b>Финал марафона</b>\n{_h(MARATHON_FINAL)}"
+        kb = marathon_cta_kb()
+    else:
+        body += f"\n\nДень {day + 1} откроется завтра."
+        kb = webapp_kb("🔮 Открыть Послание Таро")
+    await bot.send_message(chat_id, body, parse_mode="HTML", reply_markup=kb)
+
+
+async def send_marathon_status(chat_id: int, uid: int):
+    user = await get_user(uid) or {"telegram_id": uid}
+    st = marathon_state(await marathon_row(uid), user)
+    if st["status"] in ("none", "finished"):
+        intro = MARATHON_INTRO + ("\n\nТы уже проходил(а) марафон – можно начать заново." if st["status"] == "finished" else "")
+        await bot.send_message(chat_id, intro, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🚀 Начать марафон", callback_data="mr:start")]]))
+    elif st["status"] == "ready":
+        lead = "Прошлый день пропущен – ничего страшного, прогресс сохранён.\n" if st.get("skipped") else ""
+        await bot.send_message(chat_id, f"🗓 {lead}{marathon_dots(st['day_done'])} День {st['next_day']} из "
+                                        f"{MARATHON_LEN}: «{st['theme']}».",
+                               reply_markup=_marathon_day_kb(st["next_day"]))
+    else:
+        await bot.send_message(chat_id, f"✅ {marathon_dots(st['day_done'])} День {st['day_done']} из {MARATHON_LEN} "
+                                        f"пройден. День {st['next_day']} откроется завтра.",
+                               reply_markup=webapp_kb("🔮 Открыть Послание Таро"))
+
+
+@dp.message(Command("marathon"))
+async def cmd_marathon(message: Message):
+    await send_marathon_status(message.chat.id, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("mr:"))
+async def marathon_callback(q: CallbackQuery):
+    uid = q.from_user.id
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if q.data == "mr:start":
+        await marathon_start(uid)
+        st = marathon_state(await marathon_row(uid), await get_user(uid) or {"telegram_id": uid})
+        if st["status"] == "ready":
+            await send_marathon_day(q.message.chat.id, uid)
+        else:
+            await send_marathon_status(q.message.chat.id, uid)
+    elif q.data == "mr:day":
+        await send_marathon_day(q.message.chat.id, uid)
+
+
+@app.post("/api/marathon/start")
+async def api_marathon_start(authorization: str = Header(None)):
+    user, admin = await auth_user(authorization)
+    await marathon_start(user["telegram_id"])
+    return await marathon_open_day(await get_user(user["telegram_id"]), admin)
+
+
+@app.post("/api/marathon/day")
+async def api_marathon_day(authorization: str = Header(None)):
+    user, admin = await auth_user(authorization)
+    return await marathon_open_day(user, admin)
+
+
+async def send_marathon_reminders() -> int:
+    """Утром – одно сообщение: день марафона + кнопка Карты Дня (отдельное напоминание о Карте Дня в этот день
+    не шлём, чтобы не было двух сообщений подряд). Пропустил – зовём продолжить с того же дня.
+    3 дня без марафона – молчим."""
+    p = await db()
+    sent = 0
+    while True:
+        rows = await p.fetch("""
+            WITH t AS (
+                SELECT m.telegram_id, m.day_done, m.last_date, m.started_at, m.remind_date, u.last_daily_date,
+                       COALESCE(u.push_hour, $1) AS hour,
+                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN u.push_hour IS NULL THEN $2
+                           ELSE COALESCE(u.tz_offset_min, $2) END) AS local_ts,
+                       (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(u.tz_offset_min, $2)) AS day_ts
+                FROM marathons m JOIN users u ON u.telegram_id = m.telegram_id
+                WHERE m.finished_at IS NULL AND u.notify AND NOT u.blocked
+            )
+            SELECT *, to_char(day_ts, 'YYYY-MM-DD') AS local_day,
+                   to_char(day_ts - INTERVAL '1 day', 'YYYY-MM-DD') AS day_yesterday,
+                   NOT EXISTS (SELECT 1 FROM readings rd WHERE rd.telegram_id = t.telegram_id AND rd.kind = 'daily'
+                   AND rd.created_at > (NOW() AT TIME ZONE 'UTC') - INTERVAL '2 days'
+                   AND to_char(rd.created_at + (t.day_ts - (NOW() AT TIME ZONE 'UTC')), 'YYYY-MM-DD')
+                       >= to_char(t.day_ts, 'YYYY-MM-DD')) AS daily_open FROM t
+            WHERE EXTRACT(HOUR FROM local_ts) >= hour AND EXTRACT(HOUR FROM local_ts) < hour + $3
+              AND (last_date IS NULL OR last_date < to_char(day_ts, 'YYYY-MM-DD'))
+              AND remind_date IS DISTINCT FROM to_char(day_ts, 'YYYY-MM-DD')
+              AND COALESCE(to_date(last_date, 'YYYY-MM-DD'), started_at::date) >= day_ts::date - $4::int
+            LIMIT 200
+        """, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS, MARATHON_IDLE_DAYS)
+        if not rows:
+            break
+        for r in rows:
+            uid = r["telegram_id"]
+            await p.execute("UPDATE marathons SET remind_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
+            done = r["day_done"] or 0
+            nxt = min(done + 1, MARATHON_LEN)
+            theme = MARATHON_DAYS[nxt - 1]["theme"]
+            if r["last_date"] and r["last_date"] < r["day_yesterday"]:
+                text = (f"🗓 Вчера день марафона пропущен – ничего страшного, прогресс сохранён.\n"
+                        f"{marathon_dots(done)} Продолжим с дня {nxt} из {MARATHON_LEN}: «{theme}».")
+            else:
+                text = (f"🗓 Марафон «{MARATHON_TITLE}»\n{marathon_dots(done)} День {nxt} из {MARATHON_LEN}: "
+                        f"«{theme}». Задание и карта ждут.")
+            kb = _marathon_day_kb(nxt)
+            if r["daily_open"]:   # Карта Дня сегодня не открыта – вторая кнопка в том же сообщении
+                text += "\n\n🃏 И твоя Карта Дня тоже ждёт."
+                kb.inline_keyboard.append([InlineKeyboardButton(text="🃏 Открыть Карту Дня",
+                                                                web_app=WebAppInfo(url=FRONTEND_URL))])
+            if await _send_safe(uid, text, kb):
+                sent += 1
+            await asyncio.sleep(0.05)
+    return sent
