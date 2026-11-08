@@ -524,6 +524,25 @@ async def init_schema():
         # Один разбор одного вида в работе на человека: второе нажатие «Оплатить» не создаст второй и не спишет дважды
         await c.execute("CREATE UNIQUE INDEX IF NOT EXISTS paid_products_pending_uidx ON paid_products (telegram_id, kind) "
                         "WHERE status = 'pending'")
+        # Релиз 6: коллекция колоды и одноразовые бонусы за собранные группы
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS deck_cards (
+                telegram_id BIGINT NOT NULL,
+                card_id SMALLINT NOT NULL,
+                source VARCHAR(16),
+                opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (telegram_id, card_id)
+            );
+        """)
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS deck_bonuses (
+                telegram_id BIGINT NOT NULL,
+                kind VARCHAR(16) NOT NULL,
+                energy INTEGER NOT NULL,
+                granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (telegram_id, kind)
+            );
+        """)
         # Релиз 4: марафон «7 дней знаков Вселенной» – одна строка на человека
         await c.execute("""
             CREATE TABLE IF NOT EXISTS marathons (
@@ -755,6 +774,7 @@ async def save_reading(uid: int, kind: str, question: str, cards: list, text: st
             INSERT INTO readings (telegram_id, kind, question, cards, text)
             VALUES ($1, $2, $3, $4, $5) RETURNING id
         """, uid, kind, question or "", json.dumps(cards, ensure_ascii=False), text or "")
+        await open_cards(uid, cards, "daily" if kind == "daily" else kind[:16])   # коллекция колоды (релиз 6)
         return rid
     except Exception as e:
         log(f"save_reading {uid}: {e}")
@@ -2133,6 +2153,7 @@ async def lifespan(_app: FastAPI):
         asyncio.create_task(horoscope_loop()),
         asyncio.create_task(load_tribute_products()),
         asyncio.create_task(news_scheduler()),
+        asyncio.create_task(deck_backfill()),
     ]
     yield
     for t in tasks:
@@ -2329,6 +2350,8 @@ async def get_user_profile(authorization: str = Header(None)):
     out["ref_invited"] = await p.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
     today_row = await today_daily_reading(uid, user)
     out["today_daily_id"] = today_row["id"] if today_row else None
+    out["today_daily"] = daily_summary(today_row) if today_row else None
+    out["deck_opened"] = await p.fetchval("SELECT COUNT(*) FROM deck_cards WHERE telegram_id = $1", uid)
     out["daily_available"] = is_admin(user) or not today_row
     out["marathon"] = marathon_state(await marathon_row(uid), user)
     out["dream"] = {"free": is_admin(user) or dream_free_today(user), "cost": COST_DREAM}
@@ -2442,6 +2465,18 @@ async def today_daily_reading(uid: int, user: dict):
     if row and (row["created_at"] + timedelta(minutes=user_tz_min(user))).strftime("%Y-%m-%d") >= user_today(user):
         return row
     return None
+
+
+def daily_summary(row) -> dict:
+    """Для карточки на главной: карта, номер и первый абзац толкования."""
+    cards = json.loads(row["cards"] or "[]")
+    card = cards[0] if cards and isinstance(cards[0], dict) else {}
+    paras = [x.strip() for x in re.split(r"\n\s*\n", row["text"] or "") if x.strip()]
+    body = next((x for x in paras if not x.startswith("**")), paras[0] if paras else "")
+    body = re.sub(r"\*\*", "", body)
+    short = body if len(body) <= 170 else body[:170].rsplit(" ", 1)[0].rstrip(",.;:–") + "…"
+    return {"id": row["id"], "card_id": card.get("id"), "name": str(card.get("name", "")).replace("Старший Аркан: ", ""),
+            "short": short}
 
 
 async def claim_daily_streak(uid: int, user: dict) -> Optional[int]:
@@ -2585,6 +2620,7 @@ async def clarify_reading(reading_id: int, authorization: str = Header(None)):
         raise HTTPException(status_code=500, detail="Не получилось вытянуть карту. Энергия возвращена.")
 
     item = {"card": new_card, "text": text, "at": datetime.utcnow().isoformat()}
+    await open_cards(uid, [new_card], "clarify")
     async with p.acquire() as c:
         async with c.transaction():
             cur = await c.fetchval("SELECT clarifications FROM readings WHERE id = $1 FOR UPDATE", reading_id)
@@ -5130,6 +5166,7 @@ async def run_dream(chat_id: int, uid: int, text: str, source: str, mode: str, p
                 mode == "paid", user_today(user) if user else get_today_str())
         except Exception as e:
             log(f"dream save {uid}: {e}")
+        await open_cards(uid, [card], "dream")
     finally:
         dream_busy.discard(uid)
 
@@ -6334,3 +6371,214 @@ def paid_profile(user: dict) -> dict:
     t = forecast_targets(user)
     return {"costs": PRODUCT_COST, "month_title": t["month_title"], "year_title": t["year_title"],
             "numerology_name": user.get("numerology_name")}
+
+
+# =====================================================================
+# РЕЛИЗ 6: КОЛЛЕКЦИЯ КОЛОДЫ
+# Карта открывается, когда выпадает человеку: Карта дня, любой расклад, уточняющая карта, марафон, карта-совет сна.
+# id карты – как в get_tarot_deck(): 0–21 Старшие, 22–35 Кубки, 36–49 Мечи, 50–63 Жезлы, 64–77 Пентакли.
+# Бонус за собранную масть / все Старшие / всю колоду – один раз (первичный ключ deck_bonuses).
+# =====================================================================
+DECK_GROUPS = {   # ключ → (название, диапазон id, бонус)
+    "major": ("Старшие арканы", range(0, 22), int(os.getenv("DECK_BONUS_MAJOR", "150"))),
+    "cups": ("Кубки", range(22, 36), int(os.getenv("DECK_BONUS_SUIT", "75"))),
+    "wands": ("Жезлы", range(50, 64), int(os.getenv("DECK_BONUS_SUIT", "75"))),
+    "swords": ("Мечи", range(36, 50), int(os.getenv("DECK_BONUS_SUIT", "75"))),
+    "pentacles": ("Пентакли", range(64, 78), int(os.getenv("DECK_BONUS_SUIT", "75"))),
+}
+DECK_BONUS_ALL = int(os.getenv("DECK_BONUS_ALL", "300"))
+DECK_BACKFILL_KEY = "deck_backfill_v1"
+
+# Короткие значения для шторки коллекции: тема карты и совет, без рода и без пугающих слов
+CARD_SHORT = {
+    0: "Новое начало и доверие к жизни. Сделай шаг, даже если весь путь пока не виден.",
+    1: "Всё нужное уже у тебя в руках. Сосредоточься на цели и начни действовать.",
+    2: "Ответ знает интуиция. Помолчи, прислушайся к себе и не торопи события.",
+    3: "Время роста и заботы. Дай место творчеству, красоте и тому, что тебя наполняет.",
+    4: "Порядок и опора. Расставь границы и выстрой понятный план.",
+    5: "Опыт, традиции и учителя. Опирайся на проверенное и ищи наставника.",
+    6: "Выбор сердцем. Признайся себе, чего хочешь по-настоящему.",
+    7: "Движение к цели. Держи курс и собери силы в одну сторону.",
+    8: "Честность и равновесие. Взвесь решение и прими его спокойно.",
+    9: "Тишина и поиск ответа внутри. Возьми паузу, чтобы услышать себя.",
+    10: "Перемены по своему ритму. Замечай возможности и лови удачный момент.",
+    11: "Мягкая сила. Спокойствие и терпение помогут больше, чем напор.",
+    12: "Пауза и новый взгляд. Посмотри на ситуацию с другой стороны.",
+    13: "Карта перемен и обновления. Отпусти отжившее, чтобы освободить место новому.",
+    14: "Мера и баланс. Соединяй крайности и действуй без спешки.",
+    15: "Привязанности и соблазны. Заметь, что тебя держит, и верни себе свободу выбора.",
+    16: "Карта перемен и обновления. Старое уступает место новому, и это шанс начать честнее.",
+    17: "Надежда и вдохновение. Верь в себя и мечтай смело.",
+    18: "Чувства и интуиция. Не всё видно сразу: дай ситуации проясниться.",
+    19: "Радость и ясность. Делись теплом и не прячь свои успехи.",
+    20: "Пробуждение и подведение итогов. Пора сделать выводы и двигаться дальше.",
+    21: "Завершение цикла и цельность. Порадуйся пройденному пути.",
+    22: "Новое чувство и открытость. Позволь себе принимать любовь и вдохновение.",
+    23: "Взаимность и союз. Хорошее время для договорённостей и близости.",
+    24: "Праздник и дружба. Раздели радость с близкими людьми.",
+    25: "Скука и отстранённость. Присмотрись к тому, что уже предлагает жизнь.",
+    26: "Грусть о потерянном. Посмотри и на то, что осталось с тобой.",
+    27: "Тёплые воспоминания и простые радости. Вспомни, что радовало тебя в детстве.",
+    28: "Много мечтаний и вариантов. Выбери один и сделай его реальным.",
+    29: "Уход от того, что не наполняет. Не бойся искать своё.",
+    30: "Исполнение желаний. Позволь себе насладиться результатом.",
+    31: "Гармония в семье и с близкими. Береги то, что вас объединяет.",
+    32: "Нежность и новые идеи. Прислушайся к тихим чувствам.",
+    33: "Романтика и порыв. Следуй за мечтой, но проверяй её реальностью.",
+    34: "Забота и чуткость. Береги свои чувства так же, как чужие.",
+    35: "Эмоциональная зрелость. Сохраняй спокойствие в бурных ситуациях.",
+    36: "Ясность и правда. Хорошее время, чтобы принять решение и сказать прямо.",
+    37: "Колебания и выбор. Перестань откладывать и посмотри фактам в глаза.",
+    38: "Боль, которую важно прожить. Дай себе время и не держи всё внутри.",
+    39: "Отдых и восстановление. Сделай паузу, прежде чем идти дальше.",
+    40: "Спор и выигрыш любой ценой. Подумай, стоит ли победа отношений.",
+    41: "Переход к спокойным водам. Оставь трудное позади.",
+    42: "Хитрость и недосказанность. Действуй честно и проверяй детали.",
+    43: "Ограничения, которые во многом в голове. Ищи выход: он ближе, чем кажется.",
+    44: "Тревожные мысли. Поделись ими: со стороны всё выглядит проще.",
+    45: "Конец тяжёлого цикла. Худшее позади, впереди восстановление.",
+    46: "Любопытство и наблюдательность. Задавай вопросы и учись.",
+    47: "Быстрые решения и напор. Действуй, но не руби с плеча.",
+    48: "Ясный ум и независимость. Говори честно и с уважением.",
+    49: "Логика и справедливость. Решай на основе фактов.",
+    50: "Новая идея и энергия. Начни то, что давно хотелось.",
+    51: "Планы и выбор пути. Смотри дальше привычных границ.",
+    52: "Ожидание результатов. Твои усилия начинают приносить плоды.",
+    53: "Праздник и стабильность. Отметь успех с близкими.",
+    54: "Соперничество и споры. Используй их как тренировку, а не войну.",
+    55: "Признание и успех. Не стесняйся своих побед.",
+    56: "Отстаивание своего. Держись своей позиции спокойно и уверенно.",
+    57: "Быстрые новости и движение. Действуй, пока поток на твоей стороне.",
+    58: "Стойкость после испытаний. Осталось совсем немного.",
+    59: "Перегрузка. Отпусти часть дел, чтобы не надорваться.",
+    60: "Вдохновение и новые начинания. Пробуй, учись и играй.",
+    61: "Порыв и смелость. Направь энергию в одно дело.",
+    62: "Уверенность и обаяние. Вдохновляй других своим примером.",
+    63: "Лидерство и видение. Бери ответственность за большое дело.",
+    64: "Новая материальная возможность. Вложи силы сейчас, и это окупится.",
+    65: "Гибкость и баланс. Распредели силы между делами.",
+    66: "Мастерство и командная работа. Учись у других и делись своим.",
+    67: "Стремление удержать. Беречь хорошо, но не закрывайся от нового.",
+    68: "Трудности и нехватка. Не стесняйся просить о помощи.",
+    69: "Щедрость и обмен. Отдавай и принимай с лёгким сердцем.",
+    70: "Терпение и оценка результатов. Урожай созревает не сразу.",
+    71: "Усердие и мастерство. Шаг за шагом ты становишься лучше.",
+    72: "Достаток и самостоятельность. Наслаждайся плодами своего труда.",
+    73: "Благополучие и семья. Думай о том, что останется надолго.",
+    74: "Учёба и практичные цели. Начни с малого, но всерьёз.",
+    75: "Надёжность и постоянство. Медленно, но верно к цели.",
+    76: "Забота и практичность. Создай уют и стабильность вокруг себя.",
+    77: "Достаток и опыт. Управляй ресурсами мудро и спокойно.",
+}
+_CARD_ID_BY_NAME = {c["name"]: c["id"] for c in get_tarot_deck()}
+
+
+def card_ids(cards) -> list:
+    """id карт из списка словарей колоды (или названий)."""
+    out = []
+    for c in cards or []:
+        if isinstance(c, dict):
+            cid = c.get("id") if isinstance(c.get("id"), int) else _CARD_ID_BY_NAME.get(c.get("name"))
+        else:
+            cid = _CARD_ID_BY_NAME.get(str(c))
+        if isinstance(cid, int) and 0 <= cid < 78:
+            out.append(cid)
+    return out
+
+
+async def open_cards(uid: int, cards, source: str):
+    """Отметить карты открытыми в коллекции. Ошибка не должна ломать расклад."""
+    ids = list(dict.fromkeys(card_ids(cards)))
+    if not ids:
+        return
+    try:
+        p = await db()
+        await p.executemany("INSERT INTO deck_cards (telegram_id, card_id, source) VALUES ($1, $2, $3) "
+                            "ON CONFLICT DO NOTHING", [(uid, cid, source) for cid in ids])
+    except Exception as e:
+        log(f"deck open {uid}: {e}")
+
+
+async def deck_backfill():
+    """Один раз: открыть карты из истории раскладов, уточнений и снов (релизы 2 и 4)."""
+    await pool_ready.wait()
+    p = await db()
+    try:
+        if await p.fetchval("SELECT value FROM bot_settings WHERE key = $1", DECK_BACKFILL_KEY):
+            return
+        n1 = await p.execute("""
+            INSERT INTO deck_cards (telegram_id, card_id, source, opened_at)
+            SELECT r.telegram_id, (c->>'id')::int, 'backfill', MIN(r.created_at)
+            FROM readings r, jsonb_array_elements(CASE WHEN r.cards LIKE '[%' THEN r.cards::jsonb ELSE '[]'::jsonb END) c
+            WHERE jsonb_typeof(c) = 'object' AND (c->>'id') ~ '^[0-9]+$' AND (c->>'id')::int BETWEEN 0 AND 77
+            GROUP BY 1, 2 ON CONFLICT DO NOTHING
+        """)
+        n2 = await p.execute("""
+            INSERT INTO deck_cards (telegram_id, card_id, source, opened_at)
+            SELECT r.telegram_id, (x->'card'->>'id')::int, 'backfill', MIN(r.created_at)
+            FROM readings r, jsonb_array_elements(CASE WHEN r.clarifications LIKE '[%' THEN r.clarifications::jsonb
+                                                       ELSE '[]'::jsonb END) x
+            WHERE (x->'card'->>'id') ~ '^[0-9]+$' AND (x->'card'->>'id')::int BETWEEN 0 AND 77
+            GROUP BY 1, 2 ON CONFLICT DO NOTHING
+        """)
+        rows = await p.fetch("SELECT telegram_id, card, MIN(created_at) AS at FROM dreams GROUP BY 1, 2")
+        dream_rows = [(r["telegram_id"], _CARD_ID_BY_NAME[r["card"]], r["at"]) for r in rows
+                      if r["card"] in _CARD_ID_BY_NAME]
+        if dream_rows:
+            await p.executemany("INSERT INTO deck_cards (telegram_id, card_id, source, opened_at) "
+                                "VALUES ($1, $2, 'backfill', $3) ON CONFLICT DO NOTHING", dream_rows)
+        await p.execute("INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE "
+                        "SET value = EXCLUDED.value", DECK_BACKFILL_KEY, datetime.utcnow().isoformat())
+        log(f"🃏 Коллекция заполнена из истории: расклады {n1}, уточнения {n2}, сны {len(dream_rows)}")
+    except Exception as e:
+        log(f"⚠️ deck backfill: {e}")
+
+
+async def deck_grant_bonuses(uid: int, opened: set) -> list:
+    """Начислить бонусы за собранные группы. Только новые: повторно не начисляется (PRIMARY KEY)."""
+    due = [(k, bonus) for k, (_, ids, bonus) in DECK_GROUPS.items() if all(i in opened for i in ids)]
+    if len(opened) >= 78:
+        due.append(("all", DECK_BONUS_ALL))
+    granted = []
+    if not due:
+        return granted
+    p = await db()
+    async with p.acquire() as c:
+        async with c.transaction():
+            for kind, energy in due:
+                got = await c.fetchval("INSERT INTO deck_bonuses (telegram_id, kind, energy) VALUES ($1, $2, $3) "
+                                       "ON CONFLICT DO NOTHING RETURNING 1", uid, kind, energy)
+                if got:
+                    await c.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, energy)
+                    granted.append({"kind": kind, "energy": energy,
+                                    "title": DECK_GROUPS[kind][0] if kind in DECK_GROUPS else "Вся колода"})
+    for g in granted:
+        track(uid, "deck_bonus_granted", {"kind": g["kind"], "energy": g["energy"]})
+    return granted
+
+
+@app.get("/api/deck")
+async def api_deck(authorization: str = Header(None)):
+    """Коллекция: открытые карты, прогресс по группам, последняя открытая карта, новые бонусы."""
+    user, admin = await auth_user(authorization)
+    uid = user["telegram_id"]
+    p = await db()
+    rows = await p.fetch("SELECT card_id, opened_at FROM deck_cards WHERE telegram_id = $1 ORDER BY opened_at", uid)
+    opened = {r["card_id"] for r in rows}
+    granted = await deck_grant_bonuses(uid, opened)
+    got = {r["kind"] for r in await p.fetch("SELECT kind FROM deck_bonuses WHERE telegram_id = $1", uid)}
+    deck = get_tarot_deck()
+    last = rows[-1]["card_id"] if rows else None
+    track(uid, "deck_opened", {"opened": len(opened)})
+    return {
+        "total": 78, "opened_count": len(opened),
+        "cards": [{"id": c["id"], "name": c["name"].replace("Старший Аркан: ", ""), "opened": c["id"] in opened,
+                   "meaning": CARD_SHORT.get(c["id"]) if c["id"] in opened else None} for c in deck],
+        "groups": [{"key": k, "title": t, "total": len(ids), "opened": sum(1 for i in ids if i in opened),
+                    "bonus": b, "bonus_got": k in got} for k, (t, ids, b) in DECK_GROUPS.items()],
+        "bonus_all": DECK_BONUS_ALL, "bonus_all_got": "all" in got,
+        "last": {"id": last, "name": deck[last]["name"].replace("Старший Аркан: ", ""), "meaning": CARD_SHORT[last]}
+                if last is not None else None,
+        "granted": granted,
+        "new_balance": 99999 if admin else await p.fetchval("SELECT balance FROM users WHERE telegram_id = $1", uid),
+    }
