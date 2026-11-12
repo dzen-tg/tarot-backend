@@ -1227,8 +1227,11 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
         if choice.get("finish_reason") == "length":
             log("⚠️ Groq: ответ оборван по лимиту токенов")
             return None
-        parsed = extract_json_from_text(choice["message"]["content"])
+        content = choice["message"].get("content") or ""
+        parsed = extract_json_from_text(content)
         log(f"Groq {time.monotonic() - t0:.1f}s, json={'ok' if parsed else 'fail'}")
+        if not parsed:
+            log(f"Groq: не разобрали ответ ({len(content)} симв., finish={choice.get('finish_reason')}): {content[:200]!r}")
         return parsed
     except Exception as e:
         log(f"⚠️ Groq исключение: {type(e).__name__}: {e}")
@@ -4717,6 +4720,7 @@ def fate_leads() -> tuple:
 FATE_SIGN_PLURAL_RE = re.compile(r"\b(Овнам|Тельцам|Близнецам|Ракам|Львам|Девам|Весам|Скорпионам|Стрельцам|"
                                  r"Козерогам|Водолеям|Рыбам|другим [А-Я][а-я]+ам)\b")
 FATE_MAIN_LEAD = "Твоя главная энергия"
+FATE_MIN_WORDS = 40    # в промпте просим 55–75 слов; модель часто пишет чуть короче – это не брак
 FATE_MAX_CHARS = 680   # «до 600 знаков» плюс подписи абзацев («Твой аркан личности – …»), которые ставит код
 
 # Слова из названий арканов для проверки опечаток («Иерерафант» вместо «Иерофант»)
@@ -4724,8 +4728,11 @@ _ARCANA_WORDS = sorted({w.replace("ё", "е") for n in ARCANA.values() for w in 
 # Прошедшее время и краткие прилагательные в мужском роде, обращённые к «ты»: «ты готов», «ты устал»
 FATE_MASC_RE = re.compile(
     r"(?<![а-яё])ты\s+((бы|уже|не|сам|давно|раньше)\s+)?[а-яё]{2,}(?<!ы)л(?![а-яё])"   # «ты устал», «ты бы хотел»
-    r"|(?<![а-яё])тебя\s+(как\s+)?[а-яё]{3,}(ого|его|ым|им)(?![а-яё])"                  # «видят тебя как отстранённого»
-    r"|(?<![а-яё])(хотел|мог|смог|сумел|готов|уверен|рад|сам|должен|способен|открыт|свободен|над[её]жен|практичен|сил[её]н|упрям|"
+    # «видят тебя как отстранённого» – только в конце фразы, чтобы не ловить «как тёплого собеседника»
+    r"|(?<![а-яё])тебя\s+как\s+[а-яё]{3,}(ого|его|ым|им)(?=\s*(?:[.,;:!?–—]|$))"
+    # краткие формы – только сразу после «ты»: «ты готов», «ты не уверен». Без «ты» это про другое слово
+    # («мир готов», «шаг должен», «ум занят») и ошибкой не считается
+    r"|(?<![а-яё])ты\s+((бы|уже|не|сам|давно|раньше|всегда|часто|очень|слишком|так|ещё|еще)\s+)?(хотел|мог|смог|сумел|готов|уверен|рад|сам|должен|способен|открыт|свободен|над[её]жен|практичен|сил[её]н|упрям|"
     r"чест[её]н|спокоен|терпелив|внимателен|настойчив|решителен|чуток|щедр|прав|склонен|счастлив|одинок|занят|"
     r"независим|ум[её]н|смел|горд|влюбл[её]н|осторожен|честолюбив|амбициозен|целеустремл[её]н|трудолюбив|"
     r"общителен|скромен|верен|предан|талантлив|интересен|заметен|убедителен|надеж[её]н)(?![а-яё])",
@@ -4756,14 +4763,19 @@ def _fate_validator(parsed: dict) -> Optional[dict]:
     text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
     paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
     lead1, lead2 = fate_leads()
-    if len(paras) < 3 or not paras[0].startswith(lead1) or not paras[1].startswith(lead2):
-        return None
-    if FATE_SIGN_PLURAL_RE.search(text) or not paras[-1].rstrip().endswith("?"):
-        return None
-    if arcana_typos(text) or FATE_MASC_RE.search(text):
-        return None
     words = len(text.split())
-    return {"text": "\n\n".join(paras)} if 50 <= words <= 120 and len(text) <= FATE_MAX_CHARS else None
+    masc = FATE_MASC_RE.search(text)
+    why = ("абзацы или подписи" if len(paras) < 3 or not paras[0].startswith(lead1) or not paras[1].startswith(lead2)
+           else "«Овнам…»" if FATE_SIGN_PLURAL_RE.search(text)
+           else "нет вопроса в конце" if not paras[-1].rstrip().endswith("?")
+           else f"опечатка в аркане: {arcana_typos(text)}" if arcana_typos(text)
+           else f"мужской род: «{masc.group(0)}»" if masc
+           else f"длина: {words} слов, {len(text)} знаков" if not (FATE_MIN_WORDS <= words <= 120 and len(text) <= FATE_MAX_CHARS)
+           else "")
+    if why:
+        log(f"Код судьбы не прошёл проверку – {why}")
+        return None
+    return {"text": "\n\n".join(paras)} if FATE_MIN_WORDS <= words <= 120 and len(text) <= FATE_MAX_CHARS else None
 
 
 async def _humanize_fate(text: str) -> str:
@@ -4940,6 +4952,7 @@ FATE_REFRESH_BATCH = 30    # текстов за проход, по одному
 FATE_REFRESH_PAUSE = int(os.getenv("FATE_REFRESH_PAUSE", "30"))  # секунд между текстами: лимит Groq общий с раскладами
 _fate_scan_done = False    # проверка старых текстов на мужской род и опечатки – один раз после запуска
 FATE_MAX_TRIES = 3         # столько неудачных проходов на один старый текст, потом оставляем прежний до перезапуска
+FATE_MAX_TRIES_PENDING = 12   # для тех, кто ждёт текст в чате: дольше, но тоже не бесконечно
 _fate_fails: dict = {}     # telegram_id → сколько раз не удалось переписать
 
 
@@ -4980,7 +4993,8 @@ async def refresh_fate_codes() -> int:
         ORDER BY fate_pending DESC, random() LIMIT $1
     """, FATE_REFRESH_BATCH * 3)
     # кто ждёт текст в чате – всегда; остальные – пока не исчерпали попытки (иначе ИИ дёргается каждые 10 минут)
-    rows = [r for r in rows if r["fate_pending"] or _fate_fails.get(r["telegram_id"], 0) < FATE_MAX_TRIES]
+    rows = [r for r in rows if _fate_fails.get(r["telegram_id"], 0)
+            < (FATE_MAX_TRIES_PENDING if r["fate_pending"] else FATE_MAX_TRIES)]
     rows = rows[:FATE_REFRESH_BATCH]
     done, fails = 0, 0
     for r in rows:
@@ -4994,6 +5008,7 @@ async def refresh_fate_codes() -> int:
             await asyncio.sleep(FATE_REFRESH_PAUSE)
             continue
         fails = 0
+        _fate_fails.pop(r["telegram_id"], None)
         await save_fate_code(r["telegram_id"], r["birth_date"], text)
         await deliver_pending_fate(r["telegram_id"])
         done += 1
