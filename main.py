@@ -31,6 +31,8 @@ from typing import Optional
 
 import asyncpg
 import httpx
+import config
+from texts import tr
 import secrets
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +43,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Update, LabeledPrice, PreCheckoutQuery, Message, BotCommand, CallbackQuery, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, MenuButtonWebApp, MenuButtonDefault, LinkPreviewOptions,
+    BufferedInputFile,
 )
 
 # =====================================================================
@@ -91,8 +94,8 @@ STREAK_ENERGY = int(os.getenv("STREAK_ENERGY", "25"))
 STREAK_QUICK_EVERY = 7
 STREAK_WEEK_ENERGY = int(os.getenv("STREAK_WEEK_ENERGY", "75"))
 # «Сбылось?» – через сколько дней после расклада спросить, и возврат «спящих» с балансом
-FOLLOWUP_DAYS = int(os.getenv("FOLLOWUP_DAYS", "3"))
-WINBACK_IDLE_DAYS = int(os.getenv("WINBACK_IDLE_DAYS", "5"))
+FOLLOWUP_DAYS = config.FOLLOWUP_DAYS
+WINBACK_IDLE_DAYS = config.WINBACK_IDLE_DAYS
 WINBACK_REPEAT_DAYS = int(os.getenv("WINBACK_REPEAT_DAYS", "14"))
 # Подписка через Telegram Stars (30 дней, продлевается автоматически)
 SUB_PRICE = int(os.getenv("SUB_PRICE", "349"))  # 0,70 ⭐ за Энергию – на ~18% выгоднее пакета 450
@@ -449,6 +452,19 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_dream_date VARCHAR(10) DEFAULT NULL",
             # Релиз 5: имя, как человек его пишет, – для нумерологического портрета
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS numerology_name VARCHAR(64) DEFAULT NULL",
+            # Этап 1: тестовые аккаунты – не считаются в воронке и когортах
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT FALSE",
+            # Этапы 2–7: шаг знакомства (NULL – старые пользователи), язык, подарки серии, 18+, счётчик сообщений бота,
+            # дата вечернего вопроса о карте дня, ждёт ли человек Код судьбы в чате
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboard_step SMALLINT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang VARCHAR(8) DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_clarify INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS adult_confirmed BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_msgs_total INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS evening_ask_date VARCHAR(10) DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_pending BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS return_sent VARCHAR(16) DEFAULT NULL",
+            "CREATE INDEX IF NOT EXISTS users_created_idx ON users (created_at)",
         ]:
             await c.execute(ddl)
         # История раскладов: можно перечитать и добавить уточняющую карту, в том числе после пополнения
@@ -466,6 +482,9 @@ async def init_schema():
             );
         """)
         await c.execute("CREATE INDEX IF NOT EXISTS readings_user_idx ON readings (telegram_id, created_at DESC)")
+        # Этап 3: послание карты дня отдельно (превью, утреннее сообщение, картинка); открыта ли карта человеком
+        await c.execute("ALTER TABLE readings ADD COLUMN IF NOT EXISTS message TEXT DEFAULT NULL")
+        await c.execute("ALTER TABLE readings ADD COLUMN IF NOT EXISTS opened BOOLEAN DEFAULT TRUE")
         # События воронки: открыл → расклад → магазин → счёт → оплата
         await c.execute("""
             CREATE TABLE IF NOT EXISTS events (
@@ -477,6 +496,7 @@ async def init_schema():
             );
         """)
         await c.execute("CREATE INDEX IF NOT EXISTS events_name_idx ON events (name, created_at)")
+        await c.execute("CREATE INDEX IF NOT EXISTS events_user_idx ON events (telegram_id, created_at)")
         # Релиз 3: гороскопы на неделю – 12 текстов на неделю (week_start – понедельник)
         await c.execute("""
             CREATE TABLE IF NOT EXISTS horoscopes (
@@ -620,6 +640,64 @@ async def init_schema():
                     "ALTER TABLE feedback ADD COLUMN IF NOT EXISTS cards TEXT",
                     "ALTER TABLE tribute_orders ADD COLUMN IF NOT EXISTS reading_id BIGINT DEFAULT NULL"]:
             await c.execute(ddl)
+        await init_analytics(c)
+
+
+# Этап 1: старые имена событий → имена воронки (история до переименования не теряется)
+EVENT_ALIASES = {"reading": "reading_done", "payment": "payment_done", "pay_start": "payment_started",
+                 "daily_push_on": "daily_push_enabled", "share_click": "share_clicked",
+                 "story_share": "share_clicked", "compat_shared": "share_clicked",
+                 "followup_sent": "push_sent", "winback_sent": "push_sent"}
+# События, которые бот пишет сам, а не человек: не считаются «вернулся»
+BOT_EVENTS = ("push_sent", "followup_sent", "winback_sent", "bot_blocked", "ref_credited", "signup")
+
+
+async def init_analytics(c):
+    """Тестовые аккаунты, представления events_v и funnel_weekly. Только добавляет, ничего не удаляет."""
+    await c.execute("UPDATE users SET is_test = TRUE WHERE NOT COALESCE(is_test, FALSE) "
+                    "AND (telegram_id = ANY($1::bigint[]) OR username LIKE ANY($2::text[]))",
+                    list(config.TEST_USER_IDS), [p + "%" for p in config.TEST_USERNAME_PREFIXES])
+    # props в events хранится текстом; битый JSON не должен ронять запросы к представлению
+    await c.execute("""
+        CREATE OR REPLACE FUNCTION safe_jsonb(s TEXT) RETURNS JSONB LANGUAGE plpgsql IMMUTABLE AS $$
+        BEGIN RETURN s::jsonb; EXCEPTION WHEN others THEN RETURN NULL; END $$
+    """)
+    alias = " ".join(f"WHEN '{k}' THEN '{v}'" for k, v in EVENT_ALIASES.items())
+    await c.execute(f"""
+        CREATE OR REPLACE VIEW events_v AS
+        SELECT e.id, e.telegram_id AS user_id, CASE e.name {alias} ELSE e.name END AS event,
+               safe_jsonb(e.props) AS props, e.created_at, COALESCE(u.is_test, FALSE) AS is_test
+        FROM events e LEFT JOIN users u ON u.telegram_id = e.telegram_id
+    """)
+    bot_events = ", ".join(f"'{x}'" for x in BOT_EVENTS)
+    tz = f"make_interval(mins => COALESCE(u.tz_offset_min, {int(config.COHORT_TZ_MIN)}))"
+    # Неделя – по дате прихода; «вернулся на N-й день» – любое действие человека в N-й местный день после прихода
+    await c.execute(f"""
+        CREATE OR REPLACE VIEW funnel_weekly AS
+        WITH u AS (
+            SELECT u.telegram_id, u.blocked, COALESCE(u.purchases, 0) AS purchases, u.fate_code_text,
+                   (u.created_at + {tz})::date AS day0, {tz} AS tz
+            FROM users u WHERE NOT COALESCE(u.is_test, FALSE)
+        ), act AS (
+            SELECT DISTINCT e.telegram_id, (e.created_at + u.tz)::date AS day
+            FROM events e JOIN u ON u.telegram_id = e.telegram_id
+            WHERE e.name NOT IN ({bot_events})
+        )
+        SELECT date_trunc('week', u.day0)::date AS week,
+               COUNT(*) AS came,
+               COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM readings r WHERE r.telegram_id = u.telegram_id
+                                              AND r.kind = 'daily')) AS opened_card,
+               COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM readings r WHERE r.telegram_id = u.telegram_id
+                                              AND r.kind NOT IN ('daily', 'marathon'))) AS did_reading,
+               COUNT(*) FILTER (WHERE u.fate_code_text IS NOT NULL) AS did_fate_code,
+               COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM act a WHERE a.telegram_id = u.telegram_id
+                                              AND a.day = u.day0 + 1)) AS returned_d1,
+               COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM act a WHERE a.telegram_id = u.telegram_id
+                                              AND a.day = u.day0 + 7)) AS returned_d7,
+               COUNT(*) FILTER (WHERE u.purchases > 0) AS paid,
+               COUNT(*) FILTER (WHERE u.blocked) AS blocked
+        FROM u GROUP BY 1 ORDER BY 1 DESC
+    """)
 
 
 async def db() -> asyncpg.Pool:
@@ -646,11 +724,29 @@ START_SOURCES = {"tiktok": "tiktok", "tt": "tiktok", "threads": "threads", "inst
                  "ig": "insta"}
 
 
+def start_parts(param: Optional[str]) -> tuple:
+    """src_threads__code → ("threads", "code"); src_insta → ("insta", None); остальное → (источник, None).
+    Функция – то, что открыть сразу (code, dream, …), её обрабатывает /start."""
+    if not param:
+        return None, None
+    low = param.lower()
+    if low.startswith("src_") and "__" in low:
+        src, func = low[4:].split("__", 1)
+        return (re.sub(r"[^a-z0-9_]", "", src)[:32] or None), (re.sub(r"[^a-z0-9_]", "", func)[:32] or None)
+    return source_from_start(param), None
+
+
+def is_test_user(uid: int, username: Optional[str]) -> bool:
+    return uid in config.TEST_USER_IDS or any((username or "").startswith(p) for p in config.TEST_USERNAME_PREFIXES)
+
+
 def source_from_start(param: Optional[str]) -> Optional[str]:
     """Источник из start-параметра или None, если по нему не понять, откуда человек."""
     if not param:
         return None
     low = param.lower()
+    if low.startswith("src_") and "__" in low:
+        return start_parts(param)[0]
     if low.startswith("ref_"):
         return "ref"
     if low.startswith("compat_"):  # пришёл по кнопке «Отправить партнёру» из совместимости
@@ -671,6 +767,7 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
     p = await db()
     uid = int(tg_user["id"])
     first_name = (tg_user.get("first_name") or "Искатель")[:255]
+    lang = lang_of(tg_user.get("language_code")) if tg_user.get("language_code") is not None else None
     username = (tg_user.get("username") or None)
     referrer = None
     # Метка источника из ссылки вида t.me/<бот>?start=threads – сохраняется только для новых пользователей
@@ -684,16 +781,17 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
         async with c.transaction():
             row = await c.fetchrow("""
                 INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, free_readings,
-                                   free_preset, last_seen)
-                VALUES ($1, $2, $3, '', TRUE, 0, $4, $5, NOW())
+                                   free_preset, last_seen, lang)
+                VALUES ($1, $2, $3, '', TRUE, 0, $4, $5, NOW(), COALESCE($6, 'ru'))
                 ON CONFLICT (telegram_id) DO NOTHING
                 RETURNING *
-            """, uid, username, first_name, FREE_READINGS_ON_START, FREE_PRESET_ON_START)
+            """, uid, username, first_name, FREE_READINGS_ON_START, FREE_PRESET_ON_START, lang)
             created = row is not None
             credited_ref = None
-            if created and (source or ref_param):
-                row = await c.fetchrow("UPDATE users SET source = $2, start_param = $3 WHERE telegram_id = $1 RETURNING *",
-                                       uid, source, (ref_param or "")[:64] or None)
+            if created and (source or ref_param or is_test_user(uid, username)):
+                row = await c.fetchrow("UPDATE users SET source = $2, start_param = $3, is_test = $4 "
+                                       "WHERE telegram_id = $1 RETURNING *",
+                                       uid, source, (ref_param or "")[:64] or None, is_test_user(uid, username))
             if created and referrer:
                 # Другу бонус сразу, пригласившему – после первой покупки друга (credit_referrer_if_due).
                 # Так фейковые аккаунты не дают бесплатную Энергию.
@@ -709,12 +807,17 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
                 # Подарок за переезд, который не дошёл через старого бота, – начисляем при первом заходе в нового
                 move_gift = bool(await c.fetchval(
                     "SELECT move_gift_state = 'pending' FROM users WHERE telegram_id = $1 FOR UPDATE", uid))
+                # start_param и источник – если у старого пользователя их ещё нет (первая метка не теряется)
                 row = await c.fetchrow("""
                     UPDATE users SET username = $2, first_name = $3, last_seen = NOW(), blocked = FALSE,
                         balance = balance + $4,
-                        move_gift_state = CASE WHEN $5 THEN 'given' ELSE move_gift_state END
+                        move_gift_state = CASE WHEN $5 THEN 'given' ELSE move_gift_state END,
+                        start_param = COALESCE(start_param, $6), source = COALESCE(source, $7),
+                        lang = COALESCE($8, lang)
                     WHERE telegram_id = $1 RETURNING *
-                """, uid, username, first_name, MOVE_GIFT if move_gift else 0, move_gift)
+                """, uid, username, first_name, MOVE_GIFT if move_gift else 0, move_gift,
+                    (ref_param or "")[:64] or None, source if (ref_param or "").lower().startswith("src_") else None,
+                    lang)
     result = dict(row)
     result["_move_gift"] = move_gift
     return result, created, credited_ref
@@ -731,7 +834,7 @@ async def add_balance(uid: int, delta: int) -> Optional[int]:
     return await p.fetchval("UPDATE users SET balance = GREATEST(0, balance + $2) WHERE telegram_id = $1 RETURNING balance", uid, delta)
 
 
-FREE_FIELDS = {"quick": "free_readings", "preset": "free_preset"}
+FREE_FIELDS = {"quick": "free_readings", "preset": "free_preset", "clarify": "free_clarify"}
 
 
 async def charge(uid: int, cost: int, free: Optional[str] = None) -> str:
@@ -766,15 +869,18 @@ def sub_active(user: dict) -> bool:
 
 
 # ── История раскладов и события воронки ───────────────────────────────────
-async def save_reading(uid: int, kind: str, question: str, cards: list, text: str) -> Optional[int]:
-    """Сохраняет расклад. Ошибка сохранения не должна ломать сам расклад – тогда вернём None."""
+async def save_reading(uid: int, kind: str, question: str, cards: list, text: str,
+                       message: Optional[str] = None, opened: bool = True) -> Optional[int]:
+    """Сохраняет расклад. Ошибка сохранения не должна ломать сам расклад – тогда вернём None.
+    message – послание карты дня; opened=False – карту дня вытянул бот для утреннего сообщения, человек её ещё не открыл."""
     try:
         p = await db()
         rid = await p.fetchval("""
-            INSERT INTO readings (telegram_id, kind, question, cards, text)
-            VALUES ($1, $2, $3, $4, $5) RETURNING id
-        """, uid, kind, question or "", json.dumps(cards, ensure_ascii=False), text or "")
-        await open_cards(uid, cards, "daily" if kind == "daily" else kind[:16])   # коллекция колоды (релиз 6)
+            INSERT INTO readings (telegram_id, kind, question, cards, text, message, opened)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+        """, uid, kind, question or "", json.dumps(cards, ensure_ascii=False), text or "", message, opened)
+        if opened:
+            await open_cards(uid, cards, "daily" if kind == "daily" else kind[:16])   # коллекция колоды (релиз 6)
         return rid
     except Exception as e:
         log(f"save_reading {uid}: {e}")
@@ -788,6 +894,8 @@ def reading_payload(row, user: Optional[dict] = None) -> dict:
         "cards": json.loads(row["cards"] or "[]"), "text": row["text"],
         "clarifications": clar, "created_at": row["created_at"].isoformat(),
         "clarify_left": max(0, MAX_CLARIFY - len(clar)),
+        "message": row["message"] if "message" in row.keys() else None,
+        "followup": row["followup"],
     }
     if user is not None:
         out["clarify_cost"] = 0 if sub_active(user) else COST_CLARIFY
@@ -825,7 +933,7 @@ async def credit_referrer_if_due(uid: int):
                                 ref, REF_BONUS)
         track(ref, "ref_credited", {"friend": uid})
         try:
-            await bot.send_message(ref, f"🎁 {u['first_name'] or 'Твой друг'} сделал(а) первую покупку по твоей ссылке! "
+            await bot.send_message(ref, f"🎁 {u['first_name'] or 'Твой друг'} – первая покупка по твоей ссылке! "
                                         f"Тебе начислено +{REF_BONUS} Энергии ✨", reply_markup=webapp_kb())
         except Exception:
             pass
@@ -1170,6 +1278,8 @@ async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
     """Groq → (повтор Groq) → Gemini. validate(dict) -> dict|None отбраковывает неполные ответы.
     temperature=None – как раньше (Groq 0.8, Gemini по умолчанию); редактору передаём ниже, чтобы не менял смысл."""
     g_temp = 0.8 if temperature is None else temperature
+    if LANG.get() == "en":
+        system_prompt += EN_RULE
     attempts = [
         lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp),
         lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp),
@@ -1227,6 +1337,8 @@ HUMANIZER_PROMPT = (
     "Начала частей не должны быть одинаковыми.\n\n"
     "ОБРАЩЕНИЕ: к человеку только на «ты». Если к нему обращаются на «вы» (не про пару), переведи на «ты». "
     "Приветствия («Привет!», «Здравствуй») в начале части удали.\n\n"
+    "РОД: если в исходном тексте о человеке написано без мужского и женского рода, так и оставь. Не меняй "
+    "«тебе хочется» на «ты хочешь, готов» и не ставь глаголы прошедшего времени в мужском роде.\n\n"
     "ЖИВОЙ РИТМ: чередуй короткие и длинные предложения. Тепло и по-человечески. "
     "Длина каждой части – примерно как у исходной.\n\n"
     "ФОРМАТ: верни строго JSON с ТЕМИ ЖЕ ключами, значения – переписанный текст. Без markdown-блоков."
@@ -1310,7 +1422,11 @@ HUMAN_STYLE = (
     "• Конкретика вместо общих слов: привязывай толкование к вопросу и ситуации человека.\n"
     "• Без вопросов и предложений в конце («Хочешь узнать больше?»), без «Надеюсь, это поможет».\n"
     "• Без приветствий («Привет!», «Здравствуй») – это продолжение разговора, сразу к делу.\n"
-    "• К человеку только на «ты». «Вы» – только про пару или группу («вы с Сергеем», «вы оба»)."
+    "• К человеку только на «ты». «Вы» – только про пару или группу («вы с Сергеем», «вы оба»).\n"
+    "• Пол человека неизвестен, если он сам его не выдал (например, «мой муж», «я устала»). Тогда пиши "
+    "без рода: не «ты готов», «ты устал», «уверен ли ты», а «готов ли ты к…» → «есть ли у тебя силы на…», "
+    "«тебе хочется», «у тебя накопилась усталость». Скобки вроде «готов(а)» не используй. Если пол понятен "
+    "из вопроса – пиши в нужном роде."
 )
 
 # Во всех раскладах, не только в Быстром ответе: на эти темы карты не «предсказывают».
@@ -1434,10 +1550,18 @@ STRUCTURED_FORMAT = (
 )
 
 
+# «проявил(а)», «готов(а)» – скобки с окончанием рода в тексте расклада недопустимы
+PAREN_GENDER_RE = re.compile(r"[а-яё]\((а|ла|на|ая|ой)\)", re.IGNORECASE)
+
+
+def _has_paren_gender(parsed: dict) -> bool:
+    return bool(PAREN_GENDER_RE.search(json.dumps(parsed, ensure_ascii=False)))
+
+
 def _make_validator(pre_selected_cards: list, min_cards: int, max_cards: int):
     def validate(parsed: dict) -> Optional[dict]:
         raw_cards = parsed.get("cards")
-        if not isinstance(raw_cards, list):
+        if not isinstance(raw_cards, list) or _has_paren_gender(parsed):
             return None
         seen, cards = set(), []
         for c in raw_cards:
@@ -1468,6 +1592,8 @@ def _make_validator(pre_selected_cards: list, min_cards: int, max_cards: int):
 
 
 def _card_name(card: dict) -> str:
+    if LANG.get() == "en" and isinstance(card.get("id"), int):
+        return card_name_en(card["id"])
     return card["name"].replace("Старший Аркан: ", "")
 
 
@@ -1477,11 +1603,11 @@ def _build_structured(norm: dict, pre_selected_cards: list) -> dict:
         parts.append(norm["intro"])
     for idx, position, meaning in norm["cards"]:
         name = _card_name(pre_selected_cards[idx])
-        title = f"**{position} – {name}**" if position else f"**{name}**"
+        title = f"**{pos_title(position)} – {name}**" if position else f"**{name}**"
         parts.append(f"{title}\n{meaning}")
-    parts.append(f"**✨ Ответ на твой вопрос**\n{norm['answer']}")
-    parts.append("**🧭 Что делать**\n" + "\n".join(f"• {a}" for a in norm["advice"]))
-    parts.append(f"**🔮 Общая картина**\n{norm['synthesis']}")
+    parts.append(L("**✨ Ответ на твой вопрос**", "**✨ Answer to your question**") + f"\n{norm['answer']}")
+    parts.append(L("**🧭 Что делать**", "**🧭 What to do**") + "\n" + "\n".join(f"• {a}" for a in norm["advice"]))
+    parts.append(L("**🔮 Общая картина**", "**🔮 The bigger picture**") + f"\n{norm['synthesis']}")
     return {"cards_used_indices": [i for i, _, _ in norm["cards"]], "reading": "\n\n".join(parts)}
 
 
@@ -1626,7 +1752,7 @@ QUICK_SCHEMA = {
 def _quick_validator(pre_selected_cards: list):
     def validate(parsed: dict) -> Optional[dict]:
         raw_cards = parsed.get("cards")
-        if not isinstance(raw_cards, list):
+        if not isinstance(raw_cards, list) or _has_paren_gender(parsed):
             return None
         by_idx = {}
         for c in raw_cards:
@@ -1658,9 +1784,9 @@ def _build_quick(norm: dict, pre_selected_cards: list) -> dict:
     parts = [norm["intro"]] if norm.get("intro") else []
     for i, meaning in norm["cards"]:
         name = _card_name(pre_selected_cards[i])
-        title = f"**🃏 {name}**" if i == 0 else f"**🔎 Уточнение – {name}**"
+        title = f"**🃏 {name}**" if i == 0 else L("**🔎 Уточнение – ", "**🔎 Extra card – ") + f"{name}**"
         parts.append(f"{title}\n{meaning}")
-    parts.append(f"**✨ Ответ карт**\n{norm['answer']}")
+    parts.append(L("**✨ Ответ карт**", "**✨ The cards' answer**") + f"\n{norm['answer']}")
     return {"cards_used_indices": [i for i, _ in norm["cards"]], "reading": "\n\n".join(parts)}
 
 
@@ -1799,52 +1925,91 @@ def _clean_daily_text(text: str) -> str:
     return text.strip()
 
 
-async def generate_daily_reading(pre_selected_cards: list) -> dict:
-    """Карта дня – живое, детальное толкование одной карты (250-300 слов)."""
-    card = pre_selected_cards[0]
-    card_name = card["name"].replace("Старший Аркан: ", "")
-    card_str = f"[0] {card['name']} ({card['type']})"
+DAILY_SCHEMA = {"type": "object", "properties": {k: {"type": "string"} for k in
+                                                 ("message", "body", "attention", "advice", "question")},
+                "required": ["message", "body", "attention", "advice", "question"]}
+DAILY_MAX_CHARS = 600
+DAILY_PICTURE_RE = re.compile(r"изображ|нарисован|на картинке|на карте (видн|стоит|сидит)|фигур[аы] (в|на)", re.I)
 
+
+def _sentences(text: str) -> int:
+    return len([s for s in re.split(r"(?<=[.!?…])\s+", text.strip()) if s])
+
+
+def _daily_validator(card: dict):
+    words = [w.lower().replace("ё", "е") for w in card_title(card).split() if len(w) > 3]
+
+    def validate(parsed: dict) -> Optional[dict]:
+        f = {k: clean_ai_text(str(parsed.get(k) or "")).replace("**", "").replace("\n", " ").strip()
+             for k in DAILY_SCHEMA["required"]}
+        if not all(f.values()):
+            return None
+        msg = f["message"].lower().replace("ё", "е")
+        if len(f["message"].split()) > 15 or any(w[:-1] in msg for w in words):
+            return None                                   # послание до 15 слов и без названия карты
+        if not 2 <= _sentences(f["body"]) <= 3 or not f["question"].endswith("?"):
+            return None
+        if sum(len(v) for v in f.values()) > DAILY_MAX_CHARS:
+            return None
+        joined = " ".join(f.values())
+        if MASC_RE.search(joined) or DAILY_PICTURE_RE.search(joined):
+            return None                                   # без мужского рода и без описания картинки
+        return f
+    return validate
+
+
+def daily_text(card: dict, f: dict, lang: str = "ru") -> str:
+    """Поля карты дня → текст для истории и приложения. Заголовки ставит код."""
+    if (lang if lang != "ru" else LANG.get()) == "en":
+        heads = ("Card of the day", "What to notice", "Advice for today", "Question of the day")
+    else:
+        heads = ("Карта дня", "На что обратить внимание", "Совет дня", "Вопрос дня")
+    return (f"**{heads[0]} – {card_title(card)}**\n\n{f['message']}\n\n{f['body']}\n\n"
+            f"**{heads[1]}:** {f['attention']}\n\n**{heads[2]}:** {f['advice']}\n\n**{heads[3]}:** {f['question']}")
+
+
+async def generate_daily_reading(pre_selected_cards: list, user: Optional[dict] = None) -> dict:
+    """Карта дня: послание, короткий абзац, на что обратить внимание, совет, вопрос дня – до 600 знаков.
+    Поля приходят от модели отдельно: послание идёт в превью, утреннее сообщение и картинку."""
+    card = pre_selected_cards[0]
+    user = user or {}
+    personal = ""
+    if user.get("birth_date"):
+        d = user["birth_date"]
+        personal = (f"\nАркан личности человека – {ARCANA[personality_arcana(d)]}, знак зодиака – {zodiac(d)}. "
+                    "Добавь в body одну короткую фразу с привязкой к аркану или знаку.")
     system_prompt = (
         "Ты – опытный таролог, работаешь по системе Уэйта. Пишешь тепло и просто, как в личной переписке, на «ты».\n\n"
-        "ЗАДАЧА: толкование Карты дня – одной карты, которая станет ориентиром на сегодня.\n\n"
-        "Текст состоит из четырёх частей, строго в таком виде:\n\n"
-        f"**Карта дня – {card_name}**\n\n"
-        "<абзац толкования>\n\n"
-        "**На что обратить внимание сегодня:** <текст>\n\n"
-        "**Совет дня:** <текст>\n\n"
-        "Что писать в каждой части:\n"
-        "• Абзац толкования – архетип карты по традиции Уэйта: светлая и теневая сторона, "
-        "символика, что карта говорит о сегодняшнем дне. Один-два образа из самой карты, без красивостей. "
-        "Примерно 120–150 слов. "
-        "Абзац начинается сразу с текста, без заголовка.\n"
-        "• «На что обратить внимание сегодня» – конкретная область жизни или внутреннее состояние, "
-        "которое карта подсвечивает сегодня. Примерно 50–60 слов.\n"
-        "• «Совет дня» – одно чёткое действенное напутствие: что сделать, о чём подумать, "
-        "чего избежать. Примерно 40–50 слов.\n\n"
-        "ВАЖНО:\n"
-        "• Никогда не пиши в тексте количество слов, скобки с цифрами и служебные пометки "
-        "вроде «Основное толкование».\n"
-        "• Только **жирный** Markdown, никаких HTML-тегов.\n"
-        "• Никаких слов 'нейросеть', 'ИИ'. Тепло и спокойно.\n"
-        "• Текст читает любой, кому выпала карта: не придумывай события из его жизни и не обещай, что сегодня "
-        "что-то случится. Говори о настроении дня и о том, на что человек может повлиять.\n\n"
+        "ЗАДАЧА: Карта дня – одна карта как ориентир на сегодня. Верни поля отдельно:\n"
+        "• message – послание на «ты», до 15 слов, без названия карты. Это первая строка, её видно в превью.\n"
+        "• body – 2–3 коротких предложения о сегодняшнем дне человека.\n"
+        "• attention – на что обратить внимание: одна строка.\n"
+        "• advice – совет дня: одно конкретное действие на сегодня.\n"
+        "• question – вопрос дня: один вопрос к человеку.\n\n"
+        "ПРАВИЛА:\n"
+        "• Одна мысль на весь текст, части не противоречат друг другу.\n"
+        "• Картинку карты не описывай: никаких фигур, лодок, одежд, цветов.\n"
+        "• Пол человека неизвестен: без «готов», «должен», «сам», «уверен», прошедшего времени на «-л» о человеке. "
+        "Пиши «тебе хочется», «у тебя есть», «важно», настоящее время.\n"
+        f"• Все поля вместе – не больше {DAILY_MAX_CHARS - 80} знаков.\n"
+        "• Не придумывай события и не обещай, что сегодня что-то случится: говори о настроении дня и о том, "
+        "на что человек может повлиять.\n"
+        "• Обычный текст, без Markdown. Никаких слов 'нейросеть', 'ИИ'." + personal + "\n\n"
         + HUMAN_STYLE + "\n\n"
-        "Формат ответа – строго JSON (без markdown-блоков):\n"
-        "{\"cards_used_indices\": [0], \"reading\": \"текст\"}"
+        'ФОРМАТ – строго JSON: {"message": "...", "body": "...", "attention": "...", "advice": "...", "question": "..."}'
     )
-
-    user_prompt = f"Карта дня: {card_str}."
-
-    result = await call_ai(system_prompt, user_prompt, max_tokens=1800)
-    if result:
-        text = _clean_daily_text(result.get("reading", ""))
-        new = await humanize_fields({"reading": text}, {"reading": "Толкование Карты дня"}, "",
-                                    keep_bold=True)
-        result["reading"] = new["reading"]
-        return result
-
-    return generate_local_tarot_reading("", pre_selected_cards, reading_type="daily")
+    user_prompt = f"Карта дня: {card['name']} ({card['type']})."
+    res = await call_ai(system_prompt, user_prompt, max_tokens=900, schema=DAILY_SCHEMA, validate=_daily_validator(card))
+    if res:
+        return {"cards_used_indices": [0], "reading": daily_text(card, res), "message": res["message"]}
+    log("⚠️ AI недоступен для Карты дня – запасной текст")
+    meaning = CARD_SHORT.get(card["id"]) or ""
+    f = {"message": "Сегодня важно замечать свои чувства и не спешить с выводами.",
+         "body": meaning[:300] or "Карта подсказывает действовать спокойно и опираться на то, что уже есть.",
+         "attention": "на то, что даёт тебе силы, а что их забирает.",
+         "advice": "выдели десять минут тишины и запиши одну мысль, которая сейчас важнее всего.",
+         "question": "Что сегодня может сделать тебя чуть спокойнее?"}
+    return {"cards_used_indices": [0], "reading": daily_text(card, f), "message": f["message"]}
 
 
 # =====================================================================
@@ -1918,8 +2083,10 @@ PUSH_TEXTS = [
 ]
 
 
-def webapp_kb(text: str = "🔮 Открыть расклады", channel: bool = False) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=FRONTEND_URL))]]
+def webapp_kb(text: str = "🔮 Открыть расклады", channel: bool = False, push: Optional[str] = None) -> InlineKeyboardMarkup:
+    """push – вид рассылки: кнопка откроет приложение с ?from=push_<вид>, и приложение запишет push_clicked."""
+    url = f"{FRONTEND_URL}?from=push_{push}" if push else FRONTEND_URL
+    rows = [[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=url))]]
     if channel and CHANNEL_URL:
         rows.append([InlineKeyboardButton(text="📢 Наш канал", url=CHANNEL_URL)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1982,7 +2149,7 @@ async def send_daily_push() -> int:
         rows = await p.fetch("""
             WITH t AS (
                 SELECT telegram_id, first_name, free_readings, free_preset, balance, streak, last_daily_date,
-                       daily_push, last_push_date, created_at, last_bot_msg_at, birth_date, horo_sign,
+                       daily_push, last_push_date, created_at, last_bot_msg_at, birth_date, horo_sign, lang, tz_offset_min,
                        COALESCE(push_hour, $2) AS hour,
                        (NOW() AT TIME ZONE 'UTC') + make_interval(mins => CASE WHEN push_hour IS NULL THEN $3
                            ELSE COALESCE(tz_offset_min, $3) END) AS local_ts,
@@ -2001,38 +2168,48 @@ async def send_daily_push() -> int:
                    AND rd.created_at > (NOW() AT TIME ZONE 'UTC') - INTERVAL '2 days'
                    AND to_char(rd.created_at + (t.day_ts - (NOW() AT TIME ZONE 'UTC')), 'YYYY-MM-DD')
                        >= to_char(t.day_ts, 'YYYY-MM-DD'))
-              AND NOT EXISTS (SELECT 1 FROM marathons m WHERE m.telegram_id = t.telegram_id
-                              AND m.remind_date = to_char(t.day_ts, 'YYYY-MM-DD'))
+              AND (daily_push OR NOT EXISTS (SELECT 1 FROM marathons m WHERE m.telegram_id = t.telegram_id
+                              AND m.remind_date = to_char(t.day_ts, 'YYYY-MM-DD')))
             LIMIT 200
         """, PUSH_WEEKDAY, PUSH_HOUR, TZ_OFFSET_HOURS * 60, PUSH_WINDOW_HOURS, NEW_USER_QUIET_DAYS, QUIET_HOURS)
         if not rows:
             break
         for r in rows:
             uid = r["telegram_id"]
-            text = random.choice(PUSH_TEXTS).format(name=r["first_name"] or "Искатель")
-            streak = r["streak"] or 0
-            if streak >= 2 and r["last_daily_date"] == r["day_yesterday"]:
-                nxt = STREAK_QUICK_EVERY - streak % STREAK_QUICK_EVERY
-                text += (f"\n\n🔥 Серия: {streak} {_plural(streak, 'день', 'дня', 'дней')} подряд. Не прерывай! "
-                         f"Через {nxt} {_plural(nxt, 'день', 'дня', 'дней')} ждёт +{STREAK_WEEK_ENERGY} Энергии.")
-            if (r["free_preset"] or 0) > 0:
-                text += "\n\n🎁 А ещё тебя ждёт бесплатный Расклад на ситуацию (3 карты)."
-            elif (r["free_readings"] or 0) > 0:
-                text += "\n\n🎁 А ещё у тебя есть бесплатный Быстрый ответ: задай картам свой вопрос."
-            text += energy_reminder(r["balance"] or 0)
-            kb = webapp_kb("🃏 Открыть Карту дня", channel=True)
-            # В день недельной рассылки – гороскоп: знак известен – сразу его, нет – выбор знака
-            sign = user_sign(dict(r))
-            if int(r["local_dow"]) == PUSH_WEEKDAY and (sign in horo_ready if sign else horo_ready):
-                text += "\n\n🔭 Твой гороскоп на неделю готов."
-                url = f"{FRONTEND_URL}?open=horoscope&from=broadcast" + (f"&sign={sign}" if sign else "")
-                kb.inline_keyboard.insert(1, [InlineKeyboardButton(text="🔭 Гороскоп на неделю",
-                                                                   web_app=WebAppInfo(url=url))])
-            await p.execute("UPDATE users SET last_push_date = $2, last_bot_msg_at = NOW() WHERE telegram_id = $1",
-                            uid, r["local_day"])
+            user = dict(r)
+            lang = set_lang(user)
+            kind = "daily" if r["daily_push"] else "weekly"
+            await p.execute("UPDATE users SET last_push_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
+            if not await can_message(uid):
+                continue
             try:
-                await bot.send_message(uid, text, reply_markup=kb)
+                if kind == "daily":
+                    # Этап 6: в сообщении сама карта – картинка и послание; полный текст – по кнопке
+                    card = random.choice(get_tarot_deck())
+                    res = await generate_daily_reading([card], user)
+                    rid = await save_reading(uid, "daily", "", [card], res.get("reading", ""), res.get("message"),
+                                             opened=False)
+                    caption = tr("daily_push_caption", lang, sky=await sky_occasion(user), card=_h(card_title(card)),
+                                 message=_h(res.get("message") or ""))
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[app_btn(tr("btn_read_full", lang), r=rid,
+                                                                        **{"from": "push_daily"})]])
+                    mday = await marathon_day_for_push(uid, user)
+                    if mday:   # марафон первой недели – кнопкой в том же утреннем сообщении
+                        kb.inline_keyboard.append(_marathon_day_kb(mday, push=True).inline_keyboard[0])
+                    await send_card_message(uid, card, caption, kb)
+                else:
+                    # Раз в неделю тем, кто не включил карту дня: одно сообщение – одно действие – одна кнопка
+                    sign = user_sign(user)
+                    if int(r["local_dow"]) == PUSH_WEEKDAY and (sign in horo_ready if sign else horo_ready):
+                        text, btn = tr("weekly_horo", lang), app_btn(tr("btn_weekly_horo", lang), open="horoscope",
+                                                                     sign=sign, **{"from": "push_weekly"})
+                    else:
+                        text, btn = tr("weekly_card", lang), app_btn(tr("btn_open_daily", lang), open="daily",
+                                                                     **{"from": "push_weekly"})
+                    await bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]))
+                await mark_bot_message(uid)
                 sent += 1
+                track(uid, "push_sent", {"kind": kind})
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
             except (TelegramForbiddenError, TelegramBadRequest):
@@ -2078,20 +2255,26 @@ async def send_streak_reminders() -> int:
             text = (f"🔥 Твоя серия – {streak} {_plural(streak, 'день', 'дня', 'дней')} подряд. "
                     "Открой сегодняшнюю Карту дня, чтобы не потерять её: в полночь серия начнётся заново.")
             if nxt == 1:
-                text += f"\n\n🎁 Сегодняшняя карта принесёт +{STREAK_WEEK_ENERGY} Энергии."
-            if await _send_safe(uid, text, webapp_kb("🃏 Открыть Карту дня")):
+                text += "\n\n🎁 Сегодняшняя карта принесёт бесплатный Быстрый ответ."
+            if await _send_safe(uid, text, webapp_kb("🃏 Открыть Карту дня", push="streak"), push="streak"):
                 sent += 1
             await asyncio.sleep(0.05)
     return sent
 
 
-async def _send_safe(uid: int, text: str, kb: InlineKeyboardMarkup) -> bool:
-    """Отправка в фоновых рассылках: помечает заблокировавших, переживает лимиты Telegram."""
+async def _send_safe(uid: int, text: str, kb: InlineKeyboardMarkup, push: Optional[str] = None,
+                     props: Optional[dict] = None) -> bool:
+    """Отправка в фоновых рассылках: помечает заблокировавших, переживает лимиты Telegram.
+    push – вид рассылки для события push_sent."""
     p = await db()
+    if push and not await can_message(uid):
+        return False
     for _ in range(2):
         try:
             await bot.send_message(uid, text, reply_markup=kb)
-            await p.execute("UPDATE users SET last_bot_msg_at = NOW() WHERE telegram_id = $1", uid)
+            await mark_bot_message(uid)
+            if push:
+                track(uid, "push_sent", {"kind": push, **(props or {})})
             return True
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
@@ -2112,12 +2295,12 @@ async def send_followups() -> int:
     берём его последний расклад в окне, остальные помечаем как пропущенные."""
     p = await db()
     rows = await p.fetch("""
-        SELECT DISTINCT ON (r.telegram_id) r.id, r.telegram_id, r.question, r.cards, u.first_name
+        SELECT DISTINCT ON (r.telegram_id) r.id, r.telegram_id, r.question, r.cards, u.first_name, u.lang, u.tz_offset_min
         FROM readings r JOIN users u ON u.telegram_id = r.telegram_id
         WHERE r.followup IS NULL AND r.kind = ANY($1::text[])
           AND r.created_at < NOW() - make_interval(days => $2)
           AND r.created_at > NOW() - make_interval(days => $2 + 4)
-          AND u.notify AND NOT u.blocked
+          AND u.notify AND NOT u.blocked AND COALESCE(r.question, '') NOT IN ('', 'Первая карта')
           AND (u.last_bot_msg_at IS NULL OR u.last_bot_msg_at < NOW() - make_interval(hours => $3))
         ORDER BY r.telegram_id, r.created_at DESC
         LIMIT 200
@@ -2125,23 +2308,22 @@ async def send_followups() -> int:
     sent = 0
     for r in rows:
         uid = r["telegram_id"]
+        if not 10 <= local_hour(r["tz_offset_min"]) < 21:
+            continue
         await p.execute("""
             UPDATE readings SET followup = CASE WHEN id = $2 THEN 'sent' ELSE 'skip' END
             WHERE telegram_id = $1 AND followup IS NULL AND created_at < NOW() - make_interval(days => $3)
         """, uid, r["id"], FOLLOWUP_DAYS)
-        cards = json.loads(r["cards"] or "[]")
-        card = _card_name(cards[0]) if cards else ""
         q = (r["question"] or "").strip()
-        text = (f"🔮 {r['first_name'] or 'Искатель'}, несколько дней назад ты спрашивал(а) карты:\n«{q[:200]}»\n\n"
-                + (f"Тогда выпала карта {card}. " if card else "") + "Как всё сложилось? Расклад сбылся?")
+        topic = q if len(q) <= 90 else q[:90].rsplit(" ", 1)[0] + "…"
+        text = tr("followup_week", r["lang"] or "ru", topic=topic)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Да, сбылось", callback_data=f"fu:{r['id']}:yes"),
              InlineKeyboardButton(text="❌ Нет", callback_data=f"fu:{r['id']}:no")],
             [InlineKeyboardButton(text="⏳ Пока непонятно", callback_data=f"fu:{r['id']}:wait")],
         ])
-        if await _send_safe(uid, text, kb):
+        if await _send_safe(uid, text, kb, push="followup", props={"reading": r["id"]}):
             sent += 1
-            track(uid, "followup_sent", {"reading": r["id"]})
         await asyncio.sleep(0.05)
     return sent
 
@@ -2150,8 +2332,8 @@ async def send_winback() -> int:
     """Возврат «спящих»: у кого есть Энергия или подарок, но не заходил WINBACK_IDLE_DAYS дней."""
     p = await db()
     rows = await p.fetch("""
-        SELECT telegram_id, first_name, balance, free_readings, free_preset FROM users
-        WHERE notify AND NOT blocked
+        SELECT telegram_id, first_name, balance, free_readings, free_preset, tz_offset_min FROM users
+        WHERE notify AND NOT blocked AND onboard_step IS DISTINCT FROM 0
           AND (balance >= $1 OR free_readings > 0 OR free_preset > 0)
           AND COALESCE(last_seen, created_at) < NOW() - make_interval(days => $2)
           AND (last_winback IS NULL OR last_winback < NOW() - make_interval(days => $3))
@@ -2162,6 +2344,8 @@ async def send_winback() -> int:
     sent = 0
     for r in rows:
         uid = r["telegram_id"]
+        if not 10 <= local_hour(r["tz_offset_min"]) < 21:
+            continue
         await p.execute("UPDATE users SET last_winback = NOW() WHERE telegram_id = $1", uid)
         name = r["first_name"] or "Искатель"
         if (r["free_preset"] or 0) > 0:
@@ -2170,9 +2354,102 @@ async def send_winback() -> int:
             text = f"🎁 {name}, у тебя есть бесплатный Быстрый ответ. Карты готовы ответить на твой вопрос."
         else:
             text = f"🔮 {name}, давно не виделись!" + energy_reminder(r["balance"] or 0)
-        if await _send_safe(uid, text, webapp_kb("🔮 Задать вопрос картам")):
+        if await _send_safe(uid, text, webapp_kb("🔮 Задать вопрос картам", push="winback"), push="winback"):
             sent += 1
-            track(uid, "winback_sent")
+        await asyncio.sleep(0.05)
+    return sent
+
+
+# =====================================================================
+# ЭТАП 6: ОБЩИЕ ПРАВИЛА СООБЩЕНИЙ ПО ИНИЦИАТИВЕ БОТА
+# – не больше одного в сутки (QUIET_HOURS; вечерний вопрос о карте – исключение);
+# – тем, кто ни разу ничего не сделал (ни карты, ни расклада, ни Кода судьбы), – не больше двух всего.
+# =====================================================================
+async def can_message(uid: int, ignore_quiet: bool = False) -> bool:
+    p = await db()
+    r = await p.fetchrow("""
+        SELECT u.last_bot_msg_at, COALESCE(u.bot_msgs_total, 0) AS total, u.fate_code_text IS NOT NULL AS fate,
+               EXISTS (SELECT 1 FROM readings rd WHERE rd.telegram_id = u.telegram_id AND rd.opened) AS acted
+        FROM users u WHERE u.telegram_id = $1 AND u.notify AND NOT u.blocked
+    """, uid)
+    if not r:
+        return False
+    if not (r["acted"] or r["fate"]) and r["total"] >= config.SILENT_USER_MAX_MSGS:
+        return False
+    if not ignore_quiet and r["last_bot_msg_at"] and r["last_bot_msg_at"] > datetime.utcnow() - timedelta(hours=QUIET_HOURS):
+        return False
+    return True
+
+
+async def mark_bot_message(uid: int):
+    p = await db()
+    await p.execute("UPDATE users SET last_bot_msg_at = NOW(), bot_msgs_total = COALESCE(bot_msgs_total, 0) + 1 "
+                    "WHERE telegram_id = $1", uid)
+
+
+def local_hour(tz_min: Optional[int]) -> int:
+    return (datetime.utcnow() + timedelta(minutes=tz_min if tz_min is not None else config.DEFAULT_TZ_MIN)).hour
+
+
+async def sky_occasion(user: dict) -> str:
+    """Повод из «Неба сегодня» для утреннего сообщения: новолуние, полнолуние, затмение, начало или конец
+    ретроградности – если событие сегодня по местному времени человека. Иначе пусто."""
+    try:
+        sky = await sky_snapshot()
+        if not sky:
+            return ""
+        tz = user_tz_min(user)
+        today = (datetime.now(timezone.utc) + timedelta(minutes=tz)).date()
+        for ev in sky.get("events", []):
+            if ev.get("kind") in ("new", "full", "station", "solar_eclipse", "lunar_eclipse"):
+                at = ev["at"] if ev["at"].tzinfo else ev["at"].replace(tzinfo=timezone.utc)
+                if (at + timedelta(minutes=tz)).date() == today:
+                    return f"{ev['emoji']} Сегодня: {ev['title'][0].lower() + ev['title'][1:]}.\n\n"
+    except Exception as e:
+        log(f"sky_occasion: {e}")
+    return ""
+
+
+async def send_returns() -> int:
+    """Возврат через сутки по незавершённому действию (вместо «давно не виделись» через 5 дней):
+    – поздоровались, а карту не вытянули → «Твоя карта ждёт»;
+    – Код судьбы закончился вопросом, а расклада после него нет → «Давай посмотрим расклад на это»;
+    – сделал расклад – ничего до следующего утра. Каждое напоминание – один раз."""
+    p = await db()
+    rows = await p.fetch("""
+        SELECT u.telegram_id, u.lang, u.tz_offset_min, u.free_preset, u.birth_date,
+            CASE
+              WHEN u.onboard_step = 0 AND u.created_at < NOW() - make_interval(hours => $1)
+                   AND u.created_at > NOW() - make_interval(hours => $1 * 3) THEN 'card'
+              WHEN u.fate_code_at IS NOT NULL AND u.fate_code_at < NOW() - make_interval(hours => $1)
+                   AND u.fate_code_at > NOW() - make_interval(hours => $1 * 3)
+                   AND NOT EXISTS (SELECT 1 FROM readings rd WHERE rd.telegram_id = u.telegram_id
+                                   AND rd.kind NOT IN ('daily', 'marathon') AND rd.created_at > u.fate_code_at
+                                   AND rd.question <> 'Первая карта') THEN 'fate'
+            END AS what
+        FROM users u
+        WHERE u.notify AND NOT u.blocked AND u.return_sent IS NULL AND NOT COALESCE(u.is_test, FALSE)
+        LIMIT 200
+    """, config.RETURN_AFTER_HOURS)
+    sent = 0
+    for r in rows:
+        if not r["what"] or not 10 <= local_hour(r["tz_offset_min"]) < 21:
+            continue
+        if r["what"] == "fate" and is_minor(dict(r)) and not (r["free_preset"] or 0):
+            continue
+        uid, lang = r["telegram_id"], r["lang"] or "ru"
+        if not await can_message(uid):
+            continue
+        await p.execute("UPDATE users SET return_sent = $2 WHERE telegram_id = $1", uid, r["what"])
+        if r["what"] == "card":
+            text = tr("return_card", lang)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=tr("btn_draw", lang),
+                                                                             callback_data="ob:card")]])
+        else:
+            text = tr("return_fate_question", lang)
+            kb = preset_offer_kb(dict(r), src="push_return")
+        if await _send_safe(uid, text, kb, push="return", props={"what": r["what"]}):
+            sent += 1
         await asyncio.sleep(0.05)
     return sent
 
@@ -2196,14 +2473,19 @@ async def push_loop():
             n = await send_streak_reminders()
             if n:
                 log(f"📬 «Серия сгорит»: {n}")
-            # «Сбылось?» и возврат – только днём, не ночью
-            if 10 <= now.hour < 21:
-                n = await send_followups()
-                if n:
-                    log(f"📬 «Сбылось?»: {n}")
-                n = await send_winback()
-                if n:
-                    log(f"📬 Возврат спящих: {n}")
+            n = await send_evening_questions()
+            if n:
+                log(f"📬 «Как отыгралась карта?»: {n}")
+            # Возврат через сутки, «Как сложилось?», возврат спящих – днём по местному времени (проверка внутри)
+            n = await send_returns()
+            if n:
+                log(f"📬 Возврат через сутки: {n}")
+            n = await send_followups()
+            if n:
+                log(f"📬 «Как сложилось?»: {n}")
+            n = await send_winback()
+            if n:
+                log(f"📬 Возврат спящих: {n}")
         except Exception as e:
             log(f"push_loop: {e}")
         await asyncio.sleep(120)
@@ -2253,7 +2535,7 @@ async def save_feedback(uid: int, username: Optional[str], kind: str, rating: Op
     recent = await p.fetchval(
         "SELECT COUNT(*) FROM feedback WHERE telegram_id = $1 AND created_at > NOW() - INTERVAL '1 hour'", uid)
     if recent >= FEEDBACK_LIMIT_PER_HOUR:
-        raise HTTPException(status_code=429, detail="Ты уже отправил(а) несколько сообщений. Попробуй чуть позже 🙏")
+        raise HTTPException(status_code=429, detail="Сообщений уже несколько подряд. Попробуй чуть позже 🙏")
     # тот же текст от того же человека за 2 минуты – дубль (двойное нажатие), не пересылаем
     dup = await p.fetchval("""
         SELECT id FROM feedback WHERE telegram_id = $1 AND text = $2
@@ -2315,6 +2597,8 @@ async def health():
 async def auth_user(authorization: Optional[str]) -> tuple:
     auth = verify_telegram_init_data(authorization)
     user, _, _ = await ensure_user(auth["user"], auth.get("start_param"))
+    user["_start_param"] = auth.get("start_param")
+    set_lang(user)
     return user, is_admin(user)
 
 
@@ -2332,8 +2616,13 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "tz_offset_min": user.get("tz_offset_min"),
         "push_default": {"hour": PUSH_HOUR, "tz_offset_min": TZ_OFFSET_HOURS * 60},
         "push_hours": [PUSH_HOUR_MIN, PUSH_HOUR_MAX],
-        "streak_rules": {"energy_day": STREAK_ENERGY_DAY, "energy": STREAK_ENERGY, "quick_every": STREAK_QUICK_EVERY,
-                         "week_energy": STREAK_WEEK_ENERGY},
+        # Этап 4: подарки серии – на 3-й день уточнение к карте, каждый 7-й день – Быстрый ответ
+        "streak_rules": {"clarify_day": STREAK_ENERGY_DAY, "quick_every": STREAK_QUICK_EVERY},
+        "free_clarify": 0 if admin else (user.get("free_clarify") or 0),
+        "minor": is_minor(user),
+        "adult_confirmed": bool(user.get("adult_confirmed")) or (user.get("purchases") or 0) > 0,
+        "lang": ulang(user),
+        "packs": [{"id": k, "energy": v[0]} for k, v in PACKS.items()],
         "streak": (user.get("streak") or 0) if (user.get("last_daily_date") or "") >= user_yesterday(user) else 0,
         "ref_link": ref_link(user["telegram_id"]),
         "ref_count": user.get("ref_count") or 0,
@@ -2409,12 +2698,14 @@ async def api_feedback(payload: dict, authorization: str = Header(None)):
 async def get_user_profile(authorization: str = Header(None)):
     auth = verify_telegram_init_data(authorization)
     user, created, referrer = await ensure_user(auth["user"], auth.get("start_param"))
+    set_lang(user)
     uid = user["telegram_id"]
     if referrer:
         asyncio.create_task(notify_referrer(referrer, user.get("first_name")))
     if created:
         track(uid, "signup", {"source": user.get("source")})
-    track(uid, "app_open")
+    sp = user.get("_start_param")
+    track(uid, "app_open", {"param": sp[:64], "source": start_parts(sp)[0]} if sp else None)
     out = profile_payload(user, is_admin(user))
     p = await db()
     out["ref_invited"] = await p.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", uid)
@@ -2426,6 +2717,9 @@ async def get_user_profile(authorization: str = Header(None)):
     out["marathon"] = marathon_state(await marathon_row(uid), user)
     out["dream"] = {"free": is_admin(user) or dream_free_today(user), "cost": COST_DREAM}
     out["paid"] = paid_profile(user)
+    # Этап 4: новичок до первого действия – упрощённый главный экран
+    out["fresh"] = not user.get("fate_code_text") and not await p.fetchval(
+        "SELECT 1 FROM readings WHERE telegram_id = $1 AND opened LIMIT 1", uid)
     return out
 
 
@@ -2436,16 +2730,18 @@ def _question(payload: dict) -> str:
     return q[:500]
 
 
-async def _finish_reading(uid: int, admin: bool, mode: str, kind: str, question: str, cards: list, text: str) -> dict:
+async def _finish_reading(uid: int, admin: bool, mode: str, kind: str, question: str, cards: list, text: str,
+                          message: Optional[str] = None) -> dict:
     """Общий хвост всех раскладов: сохранить в историю, событие, свежий баланс."""
-    rid = await save_reading(uid, kind, question, cards, text)
-    track(uid, "reading", {"kind": kind, "mode": mode})
+    rid = await save_reading(uid, kind, question, cards, text, message)
+    track(uid, "reading_done", {"kind": kind, "mode": mode})
     fresh = await get_user(uid)
     return {
         "success": True,
         "reading_id": rid,
         "cards": cards,
         "text": text,
+        "message": message,
         "new_balance": 99999 if admin else fresh["balance"],
         "free_readings": fresh.get("free_readings") or 0,
         "free_preset": fresh.get("free_preset") or 0,
@@ -2462,6 +2758,7 @@ async def use_preset_ai_reading(payload: dict, authorization: str = Header(None)
     question = _question(payload)
     uid = user["telegram_id"]
     mode = "admin" if admin else await charge(uid, COST_PRESET, free="preset")
+    track(uid, "reading_started", {"kind": "preset", "mode": mode})
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 3)
@@ -2486,6 +2783,7 @@ async def use_quick_reading(payload: dict, authorization: str = Header(None)):
     question = _question(payload)
     uid = user["telegram_id"]
     mode = "admin" if admin else await charge(uid, COST_QUICK, free="quick")  # подарок – первый Быстрый ответ
+    track(uid, "reading_started", {"kind": "quick", "mode": mode})
 
     try:
         pre_selected = random.sample(get_tarot_deck(), 1)
@@ -2511,6 +2809,7 @@ async def use_spread(payload: dict, authorization: str = Header(None)):
         raise HTTPException(status_code=400, detail="Напиши свой вопрос.")
     uid = user["telegram_id"]
     mode = "admin" if admin else await charge(uid, sp["cost"])
+    track(uid, "reading_started", {"kind": "spread", "mode": mode})
     n = len(sp["positions"])
     try:
         pre_selected = random.sample(get_tarot_deck(), n)
@@ -2541,12 +2840,31 @@ def daily_summary(row) -> dict:
     """Для карточки на главной: карта, номер и первый абзац толкования."""
     cards = json.loads(row["cards"] or "[]")
     card = cards[0] if cards and isinstance(cards[0], dict) else {}
-    paras = [x.strip() for x in re.split(r"\n\s*\n", row["text"] or "") if x.strip()]
-    body = next((x for x in paras if not x.startswith("**")), paras[0] if paras else "")
-    body = re.sub(r"\*\*", "", body)
+    if row["message"]:
+        body = row["message"]
+    else:
+        # старые карты: заголовок «**Карта дня – …**» мог идти через одну строку с текстом – убираем его,
+        # иначе в превью название карты повторялось дважды
+        lines = [x for x in (row["text"] or "").split("\n") if not x.strip().startswith("**Карта дня")]
+        paras = [x.strip() for x in re.split(r"\n\s*\n", "\n".join(lines)) if x.strip()]
+        body = next((x for x in paras if not x.startswith("**")), paras[0] if paras else "")
+        body = re.sub(r"\*\*", "", body)
     short = body if len(body) <= 170 else body[:170].rsplit(" ", 1)[0].rstrip(",.;:–") + "…"
     return {"id": row["id"], "card_id": card.get("id"), "name": str(card.get("name", "")).replace("Старший Аркан: ", ""),
             "short": short}
+
+
+async def open_daily_row(uid: int, user: dict, row) -> Optional[str]:
+    """Карту дня вытянул бот для утреннего сообщения – человек открыл её впервые: серия, коллекция, событие.
+    Возвращает текст награды за серию или None."""
+    p = await db()
+    ok = await p.fetchval("UPDATE readings SET opened = TRUE WHERE id = $1 AND NOT opened RETURNING 1", row["id"])
+    if not ok:
+        return None
+    await open_cards(uid, json.loads(row["cards"] or "[]"), "daily")
+    streak = await claim_daily_streak(uid, user)
+    track(uid, "card_opened", {"repeat": False, "via": "push", "streak": streak})
+    return await _streak_reward(uid, streak) if streak else None
 
 
 async def claim_daily_streak(uid: int, user: dict) -> Optional[int]:
@@ -2566,14 +2884,14 @@ async def _streak_reward(uid: int, streak: int) -> Optional[str]:
     """Награда за серию Карт Дня. Возвращает текст для показа или None."""
     p = await db()
     if streak > 0 and streak % STREAK_QUICK_EVERY == 0:
-        await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, STREAK_WEEK_ENERGY)
-        track(uid, "streak_reward", {"streak": streak, "kind": "week_energy"})
-        return (f"🔥 {streak} дней подряд! Дарим +{STREAK_WEEK_ENERGY} Энергии. "
-                "Она копится: можно потратить сразу или собрать на большой расклад.")
+        await p.execute("UPDATE users SET free_readings = free_readings + 1 WHERE telegram_id = $1", uid)
+        track(uid, "streak_reward", {"streak": streak, "kind": "free_quick"})
+        return f"🔥 {streak} дней подряд! Дарим бесплатный Быстрый ответ – задай картам свой вопрос."
     if streak == STREAK_ENERGY_DAY:
-        await p.execute("UPDATE users SET balance = balance + $2 WHERE telegram_id = $1", uid, STREAK_ENERGY)
-        track(uid, "streak_reward", {"streak": streak, "kind": "energy"})
-        return f"🔥 3 дня подряд! Дарим +{STREAK_ENERGY} Энергии. На 7-й день подарим ещё +{STREAK_WEEK_ENERGY}."
+        await p.execute("UPDATE users SET free_clarify = free_clarify + 1 WHERE telegram_id = $1", uid)
+        track(uid, "streak_reward", {"streak": streak, "kind": "free_clarify"})
+        return ("🔥 3 дня подряд! Дарим уточнение к карте: вытяни бесплатно ещё одну карту к любому раскладу. "
+                f"На {STREAK_QUICK_EVERY}-й день – бесплатный Быстрый ответ.")
     return None
 
 
@@ -2585,9 +2903,15 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
     uid = user["telegram_id"]
     if not admin:
         row = await today_daily_reading(uid, user)
-        if row:   # сегодняшняя карта уже открыта – показываем её же
+        if row:   # сегодняшняя карта уже есть – показываем её же
+            reward = None
+            if not row["opened"]:
+                reward = await open_daily_row(uid, user, row)
+            else:
+                track(uid, "card_opened", {"repeat": True})
             fresh = await get_user(uid)
             out = reading_payload(row, fresh)
+            out["streak_reward"] = reward
             out.update({"success": True, "repeat": True, "reading_id": row["id"],
                         "new_balance": fresh["balance"], "streak": fresh.get("streak") or 0})
             return out
@@ -2599,12 +2923,14 @@ async def use_daily_ai_reading(authorization: str = Header(None)):
         streak = None if admin else await claim_daily_streak(uid, user)
         pre_selected = random.sample(get_tarot_deck(), 1)
         try:
-            result_data = await generate_daily_reading(pre_selected)
+            result_data = await generate_daily_reading(pre_selected, user)
         except Exception as e:  # карта должна прийти в любом случае
             log(f"daily error: {e}")
             result_data = generate_local_tarot_reading("", pre_selected, reading_type="daily")
         reward = await _streak_reward(uid, streak) if streak else None
-        out = await _finish_reading(uid, admin, "free", "daily", "", [pre_selected[0]], result_data.get("reading", ""))
+        out = await _finish_reading(uid, admin, "free", "daily", "", [pre_selected[0]], result_data.get("reading", ""),
+                                    result_data.get("message"))
+        track(uid, "card_opened", {"repeat": False, "streak": streak})
     finally:
         daily_busy.discard(uid)
     fresh = await get_user(uid)
@@ -2619,6 +2945,7 @@ async def use_ai_reading(payload: dict, authorization: str = Header(None)):
     question = _question(payload)
     uid = user["telegram_id"]
     mode = "admin" if admin else await charge(uid, COST_AI)
+    track(uid, "reading_started", {"kind": "ai", "mode": mode})
 
     try:
         pre_selected = random.sample(get_tarot_deck(), dynamic_card_count(question))
@@ -2642,8 +2969,8 @@ async def list_readings(authorization: str = Header(None), limit: int = 30):
     user, _ = await auth_user(authorization)
     p = await db()
     rows = await p.fetch("""
-        SELECT id, kind, question, cards, clarifications, created_at FROM readings
-        WHERE telegram_id = $1 ORDER BY created_at DESC LIMIT $2
+        SELECT id, kind, question, cards, clarifications, created_at, followup, message FROM readings
+        WHERE telegram_id = $1 AND opened ORDER BY created_at DESC LIMIT $2
     """, user["telegram_id"], max(1, min(limit, 100)))
     track(user["telegram_id"], "history_open")
     return {"readings": [{
@@ -2651,6 +2978,8 @@ async def list_readings(authorization: str = Header(None), limit: int = 30):
         "question": r["question"] or "", "created_at": r["created_at"].isoformat(),
         "cards": [_card_name(c) for c in json.loads(r["cards"] or "[]")],
         "clarifications": len(json.loads(r["clarifications"] or "[]")),
+        "mark": r["followup"] if r["followup"] in ("yes", "no", "wait", "match", "miss") else None,
+        "message": r["message"],
     } for r in rows]}
 
 
@@ -2661,7 +2990,10 @@ async def get_reading(reading_id: int, authorization: str = Header(None)):
     row = await p.fetchrow("SELECT * FROM readings WHERE id = $1 AND telegram_id = $2", reading_id, user["telegram_id"])
     if not row:
         raise HTTPException(status_code=404, detail="Расклад не найден.")
-    return reading_payload(row, user)
+    out = reading_payload(row, user)
+    if row["kind"] == "daily" and not row["opened"]:   # «Читать полностью» из утреннего сообщения
+        out["streak_reward"] = await open_daily_row(user["telegram_id"], user, row)
+    return out
 
 
 @app.post("/api/readings/{reading_id}/clarify")
@@ -2676,7 +3008,7 @@ async def clarify_reading(reading_id: int, authorization: str = Header(None)):
     if len(json.loads(row["clarifications"] or "[]")) >= MAX_CLARIFY:
         raise HTTPException(status_code=400, detail="К этому раскладу уже вытянуты все уточняющие карты.")
     cost = 0 if (admin or sub_active(user)) else COST_CLARIFY
-    mode = await charge(uid, cost)
+    mode = await charge(uid, cost, free="clarify" if cost else None)   # подарок серии – бесплатное уточнение
 
     try:
         cards = json.loads(row["cards"] or "[]")
@@ -2707,7 +3039,8 @@ async def clarify_reading(reading_id: int, authorization: str = Header(None)):
     track(uid, "clarify", {"kind": row["kind"], "n": len(clar), "paid": cost > 0})
     fresh = await get_user(uid)
     return {"success": True, "clarification": item, "clarify_left": MAX_CLARIFY - len(clar),
-            "new_balance": 99999 if admin else fresh["balance"]}
+            "new_balance": 99999 if admin else fresh["balance"], "free_clarify": fresh.get("free_clarify") or 0,
+            "used_free": mode.startswith("free")}
 
 
 # ── Настройки и события из мини-аппа ──────────────────────────────────────
@@ -2719,7 +3052,7 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
         on = bool(payload.get("daily_push"))
         await p.execute("UPDATE users SET daily_push = $2, notify = notify OR $2 WHERE telegram_id = $1",
                         user["telegram_id"], on)
-        track(user["telegram_id"], "daily_push_on" if on else "daily_push_off")
+        track(user["telegram_id"], "daily_push_enabled" if on else "daily_push_off")
     tz = payload.get("tz_offset_min")
     if isinstance(tz, int) and not isinstance(tz, bool) and -720 <= tz <= 840:
         await p.execute("UPDATE users SET tz_offset_min = $2 WHERE telegram_id = $1", user["telegram_id"], tz)
@@ -2730,7 +3063,8 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
     return {"ok": True}
 
 
-CLIENT_EVENTS = {"store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
+CLIENT_EVENTS = {"card_full_read", "paywall_shown", "payment_started", "share_clicked", "push_clicked",
+                 "store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
                  "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open",
                  "sky_viewed", "horoscope_from_broadcast", "marathon_cta_clicked",
                  "compat_shared", "paid_open"}
@@ -2762,9 +3096,28 @@ async def client_event(payload: dict, authorization: str = Header(None)):
     return {"ok": True}
 
 
+@app.post("/api/user/adult")
+async def api_adult(authorization: str = Header(None)):
+    """Этап 5: перед первой оплатой человек подтверждает, что ему есть 18."""
+    user, _ = await auth_user(authorization)
+    if is_minor(user):
+        raise HTTPException(status_code=403, detail="Платные функции доступны с 18 лет.")
+    p = await db()
+    await p.execute("UPDATE users SET adult_confirmed = TRUE WHERE telegram_id = $1", user["telegram_id"])
+    track(user["telegram_id"], "adult_confirmed")
+    return {"ok": True}
+
+
+def check_can_pay(user: dict):
+    """Младше 18 по дате рождения – платное не продаём."""
+    if is_minor(user):
+        raise HTTPException(status_code=403, detail="Платные функции доступны с 18 лет.")
+
+
 @app.post("/api/payment/stars-invoice")
 async def create_stars_invoice(payload: dict, authorization: str = Header(None)):
     user, _ = await auth_user(authorization)
+    check_can_pay(user)
     pack = payload.get("pack")
     extra = {}
     if pack in SUBS:
@@ -2804,6 +3157,7 @@ async def create_tribute_order(payload: dict, authorization: str = Header(None))
     if not card_enabled():
         raise HTTPException(status_code=400, detail="Оплата картой пока недоступна.")
     user, _ = await auth_user(authorization)
+    check_can_pay(user)
     pack = payload.get("pack")
     if pack not in PACKS or pack not in TRIBUTE_PRODUCT_IDS:
         raise HTTPException(status_code=400, detail="Неверный тип пакета")
@@ -2923,7 +3277,7 @@ async def tribute_webhook(request: Request):
         if not user_ok:
             log(f"Tribute: оплатил {uid}, но его нет в users – энергия не зачислена, проверь вручную")
             return {"ok": True}
-        track(uid, "payment", {"pack": pack, "method": "card"})
+        track(uid, "payment_done", {"pack": pack, "method": "card"})
         if pack == "pack_3000":
             track(uid, "pack_3000_paid", {"method": "card"})
         asyncio.create_task(credit_referrer_if_due(uid))
@@ -3165,7 +3519,7 @@ async def notify_referrer(referrer_id: int, friend_name: Optional[str]):
     try:
         await bot.send_message(
             referrer_id,
-            f"🎁 {friend_name or 'Твой друг'} пришёл(а) по твоей ссылке! Твои +{REF_BONUS} Энергии придут "
+            f"🎁 {friend_name or 'Твой друг'} – новый человек по твоей ссылке! Твои +{REF_BONUS} Энергии придут "
             "после его первой покупки ✨",
             reply_markup=webapp_kb(),
         )
@@ -3177,59 +3531,427 @@ DISCLAIMER = ("🔮 Добро пожаловать в «Послание Тар
               "Расклады носят рекомендательный и развлекательный характер.")
 
 
+# =====================================================================
+# ЭТАП 2: ПЕРВЫЙ СЕАНС В ЧАТЕ – карта прямо в чате, потом Код судьбы, время карты дня, расклад
+# onboard_step: NULL – старый пользователь; 0 – поздоровались; 1 – первая карта вытянута;
+# 2 – Код судьбы показан (или пропущен); 3 – время карты дня выбрано, предложен расклад
+# =====================================================================
+RU_LANGS = {"ru", "uk", "be", "kk"}
+
+
+def lang_of(code: Optional[str]) -> str:
+    """Язык интерфейса по языку Telegram: русский для ru/uk/be/kk и если язык неизвестен, иначе английский."""
+    c = (code or "").lower()[:2]
+    return "ru" if not c or c in RU_LANGS else "en"
+
+
+def ulang(user: Optional[dict]) -> str:
+    return (user or {}).get("lang") or "ru"
+
+
+def clean_name(name: Optional[str]) -> str:
+    """Имя для обращения; если в нём нет ни букв, ни цифр (только эмодзи, точки) – обращаемся без имени."""
+    n = (name or "").strip()
+    return n if re.search(r"[^\W_]", n) and n != "Искатель" else ""
+
+
+def hello(user: dict, key: str) -> str:
+    name = clean_name(user.get("first_name"))
+    return tr(key, ulang(user), name=_h(name)) if name else tr(key + "_noname", ulang(user))
+
+
+def app_url(**params) -> str:
+    q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    return f"{FRONTEND_URL}?{q}" if q else FRONTEND_URL
+
+
+def app_btn(text: str, **params) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, web_app=WebAppInfo(url=app_url(**params)))
+
+
+def md_html(text: str) -> str:
+    """Текст расклада (**жирный**) → HTML для чата."""
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", _h(text or ""), flags=re.S)
+
+
+def card_title(card: dict) -> str:
+    return _card_name(card) if card.get("name") else ""
+
+
+_card_jpeg_cache: dict = {}
+
+
+async def card_jpeg(card_id: int, width: int = 640) -> Optional[bytes]:
+    """Рисунок карты для чата: берём webp мини-аппа и перекладываем в JPEG (Telegram надёжно показывает JPEG)."""
+    key = (card_id, width)
+    if key in _card_jpeg_cache:
+        return _card_jpeg_cache[key]
+    try:
+        from PIL import Image
+        import io
+        r = await http.get(f"{FRONTEND_URL}/cards/{int(card_id):02d}.webp", timeout=15)
+        r.raise_for_status()
+        im = Image.open(io.BytesIO(r.content)).convert("RGB")
+        if im.width > width:
+            im = im.resize((width, round(im.height * width / im.width)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=86)
+        _card_jpeg_cache[key] = buf.getvalue()
+        return _card_jpeg_cache[key]
+    except Exception as e:
+        log(f"card_jpeg {card_id}: {e}")
+        return None
+
+
+async def send_card_message(chat_id: int, card: dict, caption: str, kb: Optional[InlineKeyboardMarkup] = None):
+    """Карта картинкой с подписью; без картинки – просто текстом. Подпись в Telegram – до 1024 символов."""
+    img = await card_jpeg(card["id"])
+    if img and len(caption) <= 1024:
+        return await bot.send_photo(chat_id, BufferedInputFile(img, f"card{card['id']}.jpg"), caption=caption,
+                                    parse_mode="HTML", reply_markup=kb)
+    if img:
+        await bot.send_photo(chat_id, BufferedInputFile(img, f"card{card['id']}.jpg"))
+    return await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb,
+                                  link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def set_onboard(uid: int, step: int):
+    p = await db()
+    await p.execute("UPDATE users SET onboard_step = $2 WHERE telegram_id = $1 AND onboard_step IS NOT NULL "
+                    "AND onboard_step < $2", uid, step)
+
+
+FIRST_CARD_SCHEMA = {"type": "object", "properties": {"message": {"type": "string"}, "text": {"type": "string"}},
+                     "required": ["message", "text"]}
+
+
+def _first_card_validator(card_name: str):
+    def validate(parsed: dict) -> Optional[dict]:
+        msg = clean_ai_text(str(parsed.get("message") or "")).replace("**", "").strip()
+        text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
+        if not msg or len(msg.split()) > 15 or not 120 <= len(text) <= 520:
+            return None
+        words = [w.lower().replace("ё", "е") for w in card_name.split() if len(w) > 3]   # без «The», «of»
+        low = msg.lower().replace("ё", "е")
+        if any(w[:-1] in low for w in words) or MASC_RE.search(msg + " " + text):
+            return None
+        return {"message": msg, "text": text}
+    return validate
+
+
+async def generate_first_card(card: dict, context: str = "") -> dict:
+    """Первая карта в чате: послание одной строкой и 3–4 предложения толкования. Вопрос человек держит в уме."""
+    name = card_title(card)
+    system_prompt = (
+        "ЗАДАЧА: человек подумал о том, что его волнует, и вытянул одну карту. Вопрос он не написал. "
+        "Дай короткий ответ карты, который подходит к любой ситуации и при этом звучит лично.\n"
+        "• message – послание карты одной фразой на «ты», до 15 слов, без названия карты.\n"
+        "• text – 3–4 коротких предложения: что карта по Уэйту говорит о ситуации, которую человек держит в уме, "
+        "и один мягкий практичный шаг. Не описывай картинку. 250–450 знаков.\n"
+        'ФОРМАТ – строго JSON: {"message": "...", "text": "..."}. Обычный текст, без Markdown.\n\n'
+        + NO_INVENT_RULE + "\n\n" + HUMAN_STYLE
+    )
+    user_prompt = f"Карта: {card['name']} ({card['type']})." + (("\n" + context) if context else "")
+    res = await call_ai(system_prompt, user_prompt, max_tokens=700, schema=FIRST_CARD_SCHEMA,
+                        validate=_first_card_validator(name))
+    if res:
+        return res
+    if LANG.get() == "en":
+        return {"message": "The answer is close – look at the situation calmly.",
+                "text": "This card asks for a pause before the next step. Notice what you already know about the "
+                        "situation and choose one small, calm action for today."}
+    meaning = CARD_SHORT.get(card["id"]) or get_rich_card_meaning(card["name"], "present")
+    return {"message": "Ответ уже рядом – посмотри на ситуацию спокойно.", "text": meaning[:450]}
+
+
+def onboard_push_kb(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=tr("btn_push_morning", lang), callback_data="ob:push:8"),
+         InlineKeyboardButton(text=tr("btn_push_evening", lang), callback_data="ob:push:21")],
+        [InlineKeyboardButton(text=tr("btn_push_no", lang), callback_data="ob:push:no")],
+    ])
+
+
+def preset_offer_kb(user: dict, src: str = "onboard") -> InlineKeyboardMarkup:
+    lang = ulang(user)
+    free = (user.get("free_preset") or 0) > 0
+    label = tr("btn_preset_free", lang) if free else tr("btn_preset_paid", lang, cost=COST_PRESET)
+    return InlineKeyboardMarkup(inline_keyboard=[[app_btn(label, open="preset", **{"from": src})]])
+
+
+def menu_kb(user: dict) -> InlineKeyboardMarkup:
+    lang = ulang(user)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [app_btn(tr("btn_menu_daily", lang), open="daily", **{"from": "menu"}),
+         app_btn(tr("btn_menu_ask", lang), open="quick", **{"from": "menu"})],
+        [app_btn(tr("btn_menu_spreads", lang), open="spreads", **{"from": "menu"}),
+         InlineKeyboardButton(text=tr("btn_menu_fate", lang), callback_data="menu:code")],
+        [InlineKeyboardButton(text=tr("btn_menu_dream", lang), callback_data="menu:dream"),
+         app_btn(tr("btn_menu_balance", lang, balance=user.get("balance") or 0), open="store", **{"from": "menu"})],
+    ])
+
+
+# =====================================================================
+# ЭТАП 7: ЯЗЫК. Язык Telegram не ru/uk/be/kk → бот и расклады на английском.
+# LANG – язык текущего запроса (мини-апп или сообщение в чате); call_ai добавляет правило «пиши по-английски».
+# =====================================================================
+import contextvars
+
+LANG = contextvars.ContextVar("lang", default="ru")
+EN_RULE = ("\n\nLANGUAGE: the person speaks English. Write every text value in natural, warm English, address the "
+           "person as “you”. Use English Rider–Waite card names. Ignore any instruction above about Russian "
+           "grammar, «ты» or Russian phrasing; keep all other rules and the exact JSON keys.")
+
+
+def set_lang(user: Optional[dict]) -> str:
+    lang = ulang(user)
+    LANG.set(lang)
+    return lang
+
+
+def L(ru: str, en: str) -> str:
+    return en if LANG.get() == "en" else ru
+
+
+EN_MAJOR = ["The Fool", "The Magician", "The High Priestess", "The Empress", "The Emperor", "The Hierophant",
+            "The Lovers", "The Chariot", "Strength", "The Hermit", "Wheel of Fortune", "Justice", "The Hanged Man",
+            "Death", "Temperance", "The Devil", "The Tower", "The Star", "The Moon", "The Sun", "Judgement", "The World"]
+EN_SUITS = ["Cups", "Swords", "Wands", "Pentacles"]
+EN_RANKS = ["Ace", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Page", "Knight", "Queen",
+            "King"]
+EN_ZODIAC = {"Овен": "Aries", "Телец": "Taurus", "Близнецы": "Gemini", "Рак": "Cancer", "Лев": "Leo", "Дева": "Virgo",
+             "Весы": "Libra", "Скорпион": "Scorpio", "Стрелец": "Sagittarius", "Козерог": "Capricorn",
+             "Водолей": "Aquarius", "Рыбы": "Pisces"}
+EN_POSITIONS = {
+    "Настоящее": "Present", "Действие": "Action", "Перспектива": "Outlook",
+    "Корни ситуации": "Roots of the situation", "Что происходит сейчас": "What is happening now",
+    "Внутреннее состояние": "Inner state", "Скрытое влияние": "Hidden influence", "Окружение": "People around",
+    "Что помогает": "What helps", "Чего опасаться": "What to watch out for", "Совет карт": "Advice of the cards",
+    "Ближайшая перспектива": "Near future", "К чему всё идёт": "Where it is heading",
+    "За «да»": "For “yes”", "За «нет»": "For “no”", "Итог": "Outcome", "Где ты сейчас": "Where you are now",
+    "Что мешает": "What's in the way", "Первая неделя": "Week one", "Вторая неделя": "Week two",
+    "Третья неделя": "Week three", "Четвёртая неделя": "Week four", "Ты в этих отношениях": "You in this relationship",
+    "Партнёр": "Partner", "Что вас связывает": "What connects you",
+}
+
+
+def card_name_en(card_id: int) -> str:
+    if card_id < 22:
+        return EN_MAJOR[card_id]
+    s, r = divmod(card_id - 22, 14)
+    return f"{EN_RANKS[r]} of {EN_SUITS[s]}"
+
+
+def pos_title(position: str) -> str:
+    return EN_POSITIONS.get(position, position) if LANG.get() == "en" else position
+
+
+def arcana_title(n: int) -> str:
+    """Название аркана Кода судьбы (1–22, 22 – Шут) на языке запроса."""
+    return EN_MAJOR[n % 22] if LANG.get() == "en" else ARCANA[n]
+
+
+def is_minor(user: dict) -> bool:
+    """По дате рождения младше 18 – платные функции не предлагаем (этап 5)."""
+    d = user.get("birth_date")
+    if not d:
+        return False
+    today = date.today()
+    return (today.year - d.year - ((today.month, today.day) < (d.month, d.day))) < 18
+
+
+async def marathon_autostart(uid: int, user: dict):
+    """Этап 6: марафон «7 дней знаков Вселенной» – сценарий первой недели у каждого нового пользователя.
+    В день прихода о нём не пишем: первое напоминание – завтра утром."""
+    if not config.MARATHON_AUTOSTART:
+        return
+    try:
+        p = await db()
+        await p.execute("INSERT INTO marathons (telegram_id, remind_date) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        uid, user_today(user))
+        track(uid, "marathon_started", {"auto": True})
+    except Exception as e:
+        log(f"marathon_autostart {uid}: {e}")
+
+
+async def open_start_func(chat_id: int, uid: int, func: str) -> bool:
+    """Функция из ссылки (src_threads__code, …): открыть сразу. True – открыли."""
+    if func in ("code", "fate"):
+        await send_fate_code(chat_id, uid)
+    elif func == "dream":
+        await send_dream_prompt(chat_id, uid)
+    elif func == "marathon":
+        await send_marathon_status(chat_id, uid)
+    else:
+        return False
+    return True
+
+
+@dp.update.outer_middleware()
+async def lang_middleware(handler, event, data):
+    """Этап 7: язык человека для всех ответов бота и раскладов в этом обновлении."""
+    u = data.get("event_from_user")
+    if u:
+        lang = None
+        try:
+            p = await db()
+            lang = await p.fetchval("SELECT lang FROM users WHERE telegram_id = $1", u.id)
+        except Exception:
+            pass
+        LANG.set(lang or lang_of(u.language_code))
+    return await handler(event, data)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
     feedback_waiting.pop(message.from_user.id, None)
     u = message.from_user
-    tg_user = {"id": u.id, "first_name": u.first_name, "username": u.username}
+    tg_user = {"id": u.id, "first_name": u.first_name, "username": u.username, "language_code": u.language_code}
     try:
         user, created, referrer = await ensure_user(tg_user, command.args)
     except Exception as e:
         log(f"/start db: {e}")
-        user, created, referrer = {}, False, None
-    track(u.id, "start", {"param": (command.args or "")[:64] or None, "new": created})
+        user, created, referrer = {"telegram_id": u.id, "first_name": u.first_name}, False, None
+    src, func = start_parts(command.args)
+    if not func and (command.args or "") in ("dream", "marathon", "code"):
+        func = command.args
+    track(u.id, "start", {"param": (command.args or "")[:64] or None, "new": created, "source": src, "func": func})
+    lang = ulang(user)
 
     if created:
-        # Новый пользователь: приветствие → «Откуда вы о нас узнали?» (если метка не сказала) → дата → Код судьбы
+        # Новый: одно сообщение и одна кнопка. Согласие – строкой под текстом, источник – из ссылки.
         track(u.id, "signup", {"source": user.get("source")})
-        lines = [DISCLAIMER, ""]
-        lines.append("🎁 В подарок: первый Быстрый ответ" +
-                     (" и первый Расклад на ситуацию (3 карты)." if FREE_PRESET_ON_START else "."))
-        if referrer:
-            lines.append(f"✨ Ты пришёл(а) по приглашению – тебе начислено +{REF_BONUS} Энергии.")
-        await message.answer("\n".join(lines))
-        if user.get("source"):
-            await ask_birth_date(message.chat.id, u.id)
+        p = await db()
+        await p.execute("UPDATE users SET onboard_step = 0 WHERE telegram_id = $1", u.id)
+        await marathon_autostart(u.id, user)
+        lines = []
+        if func:
+            lines.append(hello(user, "hello_short"))
         else:
-            await message.answer("Откуда ты о нас узнал(а)?", reply_markup=source_kb())
+            lines.append(hello(user, "start_new"))
+        if referrer:
+            lines += ["", tr("ref_bonus_line", lang, bonus=REF_BONUS)]
+        lines += ["", tr("terms_line_use" if func else "terms_line", lang)]
+        kb = None if func else InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=tr("btn_draw", lang), callback_data="ob:card")]])
+        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        if func:
+            await open_start_func(message.chat.id, u.id, func)
         if referrer:
             asyncio.create_task(notify_referrer(referrer, u.first_name))
         return
 
-    if command.args in ("dream", "marathon"):   # ссылки t.me/<бот>?start=dream / =marathon
-        if command.args == "dream":
-            await send_dream_prompt(message.chat.id, u.id)
-        else:
-            await send_marathon_status(message.chat.id, u.id)
+    if func and await open_start_func(message.chat.id, u.id, func):
         return
-
-    lines = [f"Приветствую тебя, {u.first_name}! 🔮", "",
-             "Это Послание Таро. Задай вопрос – и карты ответят.", ""]
+    if (user.get("onboard_step") or 0) == 0 and user.get("onboard_step") is not None:
+        # начал знакомство, но карту так и не вытянул – повторяем первое сообщение
+        await message.answer(hello(user, "start_new") + "\n\n" + tr("terms_line", lang), parse_mode="HTML",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                 InlineKeyboardButton(text=tr("btn_draw", lang), callback_data="ob:card")]]))
+        return
+    text = hello(user, "welcome_back")
     if user.get("_move_gift"):
-        lines.append(f"🎁 В честь переезда в новый бот мы начислили тебе +{MOVE_GIFT} Энергии ✨ "
-                     f"Теперь на балансе {user.get('balance', 0)}.")
-    if (user.get("free_preset") or 0) > 0:
-        lines.append("🎁 У тебя есть бесплатный Расклад на ситуацию (3 карты).")
-    elif (user.get("free_readings") or 0) > 0:
-        lines.append("🎁 У тебя есть бесплатный Быстрый ответ.")
-    lines += ["🃏 Карта дня – бесплатно каждый день.",
-              f"⚡ Быстрый ответ одной картой на любой вопрос – {COST_QUICK} Энергии.",
-              "🎴 Расклад на ситуацию и 🔮 Индивидуальный разбор – за Энергию.",
-              "🔢 Твой Код судьбы по дате рождения – /code",
-              "🌙 Толкование сна голосом или текстом – /dream",
-              f"🗓 Марафон «{MARATHON_TITLE}» – /marathon", "",
-              "Жми кнопку ниже 👇"]
-    await message.answer("\n".join(lines), reply_markup=webapp_kb(channel=True))
+        text += (f"\n\n🎁 В честь переезда в новый бот мы начислили тебе +{MOVE_GIFT} Энергии ✨ "
+                 f"Теперь на балансе {user.get('balance', 0)}.")
+    await message.answer(text, reply_markup=menu_kb(user))
+
+
+@dp.callback_query(F.data == "ob:card")
+async def onboard_card(q: CallbackQuery):
+    """Первая карта прямо в чате: подарок – первый Быстрый ответ."""
+    uid = q.from_user.id
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    user = await get_user(uid) or {}
+    lang = ulang(user)
+    if (user.get("onboard_step") or 0) >= 1:
+        await q.message.answer(tr("first_card_used", lang))
+        return
+    if uid in daily_busy:
+        return
+    daily_busy.add(uid)
+    try:
+        try:
+            mode = await charge(uid, COST_QUICK, free="quick")
+        except HTTPException:
+            mode = "gift"   # подарок уже потрачен в приложении – первую карту в чате всё равно дарим
+        track(uid, "reading_started", {"kind": "first_card", "mode": mode})
+        await bot.send_chat_action(q.message.chat.id, "upload_photo")
+        card = random.choice(get_tarot_deck())
+        res = await generate_first_card(card, await sky_line(user))
+        text = f"{res['message']}\n\n{res['text']}"
+        rid = await save_reading(uid, "quick", "Первая карта", [card], f"**🃏 {card_title(card)}**\n{text}")
+        await set_onboard(uid, 1)
+        track(uid, "reading_done", {"kind": "first_card", "mode": mode})
+        await send_card_message(q.message.chat.id, card, tr(
+            "first_card_caption", lang, card=_h(card_title(card)), message=_h(res["message"]), text=_h(res["text"])))
+    finally:
+        daily_busy.discard(uid)
+    await asyncio.sleep(2)
+    await q.message.answer(tr("ob_fate", lang), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=tr("btn_fate", lang), callback_data="ob:code")]]))
+
+
+@dp.callback_query(F.data.in_({"ob:code", "menu:code"}))
+async def onboard_code(q: CallbackQuery):
+    await q.answer()
+    if q.data == "ob:code":
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await send_fate_code(q.message.chat.id, q.from_user.id)
+
+
+@dp.callback_query(F.data == "menu:dream")
+async def menu_dream(q: CallbackQuery):
+    await q.answer()
+    await send_dream_prompt(q.message.chat.id, q.from_user.id)
+
+
+async def onboard_after_fate(chat_id: int, uid: int):
+    """После Кода судьбы (или пропуска даты) в первом сеансе – вопрос о времени карты дня."""
+    user = await get_user(uid) or {}
+    if user.get("onboard_step") not in (0, 1):   # 0 – пришёл по ссылке сразу в Код судьбы
+        return
+    await set_onboard(uid, 2)
+    await asyncio.sleep(2)
+    await bot.send_message(chat_id, tr("ob_push", ulang(user)), reply_markup=onboard_push_kb(ulang(user)))
+
+
+@dp.callback_query(F.data.startswith("ob:push:"))
+async def onboard_push(q: CallbackQuery):
+    uid = q.from_user.id
+    choice = q.data.split(":")[2]
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    p = await db()
+    user = await get_user(uid) or {}
+    lang = ulang(user)
+    if choice in ("8", "21"):
+        hour = int(choice)
+        # Часовой пояс неизвестен, пока человек не открыл приложение: считаем по Москве
+        await p.execute("UPDATE users SET daily_push = TRUE, notify = TRUE, push_hour = $2, "
+                        "tz_offset_min = COALESCE(tz_offset_min, $3) WHERE telegram_id = $1",
+                        uid, hour, config.DEFAULT_TZ_MIN)
+        track(uid, "daily_push_enabled", {"hour": hour, "via": "onboarding"})
+        tz = "" if user.get("tz_offset_min") is not None else tr("push_set_msk", lang)
+        await q.message.answer(tr("push_set", lang, hour=hour, tz=tz))
+    else:
+        track(uid, "daily_push_declined", {"via": "onboarding"})
+        await q.message.answer(tr("push_no", lang))
+    if user.get("onboard_step") is not None and user["onboard_step"] < 3:
+        await set_onboard(uid, 3)
+        user = await get_user(uid) or user
+        if not is_minor(user) or (user.get("free_preset") or 0) > 0:
+            await asyncio.sleep(2)
+            await q.message.answer(tr("ob_preset", lang), reply_markup=preset_offer_kb(user))
 
 
 # =====================================================================
@@ -3934,6 +4656,11 @@ FATE_SAME_TEXT = "Оба аркана совпали: одна и та же эн
 
 def fate_header(d: date) -> str:
     f = fate_numbers(d)
+    if LANG.get() == "en":
+        lines = [f"Sign: {EN_ZODIAC.get(f['zodiac'], f['zodiac'])}", f"Life path number: {f['life_path']}",
+                 f"Personality arcana: {f['personality_num']}, {arcana_title(f['personality_num'])} – how people see you",
+                 f"Main energy: {f['arcana_num']}, {arcana_title(f['arcana_num'])} – your main theme and task"]
+        return "🔢 Your Fate Code\n\n" + "\n".join(lines)
     lines = [f"Знак: {f['zodiac']}", f"Число судьбы: {f['life_path']}",
              f"Аркан личности: {f['personality_num']}, {f['personality_name']} – каким тебя видят люди",
              f"Главная энергия: {f['arcana_num']}, {f['arcana_name']} – твоя главная тема и задача"]
@@ -3945,6 +4672,11 @@ def fate_header(d: date) -> str:
 FATE_STYLE = (
     "СТИЛЬ ТЕКСТА – пиши как живой человек, а не как ИИ:\n"
     "- Обращайся на «ты», тепло и спокойно, как опытный таролог на личной встрече.\n"
+    "- Пол человека неизвестен: текст читают и мужчины, и женщины. Пиши без рода. Нельзя «ты готов», "
+    "«ты сам», «уверен», «устал», «сделал», «был». Можно «тебе хочется», «у тебя есть силы», «тебе важно», "
+    "«ты умеешь», «ты держишься», настоящее время. Краткие прилагательные о человеке («надёжен», «практичен», "
+    "«упрям») замени существительным или глаголом: «в тебе есть надёжность», «ты умеешь стоять на своём». "
+    "Скобки вроде «готов(а)» не используй.\n"
     "- Пиши простым разговорным русским. Короткие и длинные предложения вперемешку.\n"
     "- Конкретика вместо общих слов: опиши, как это проявляется в обычной жизни (в работе, в разговорах, "
     "в отношениях), а не «энергия», «вибрации», «поток».\n"
@@ -3966,10 +4698,46 @@ FATE_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}, "re
 
 
 FATE_PERSONALITY_LEAD = "Твой аркан личности"
+FATE_LEADS_EN = ("Your personality arcana", "Your main energy")
+
+
+def fate_leads() -> tuple:
+    return FATE_LEADS_EN if LANG.get() == "en" else (FATE_PERSONALITY_LEAD, FATE_MAIN_LEAD)
 # «Овнам ты кажешься…» – ИИ путает знак человека с окружающими
 FATE_SIGN_PLURAL_RE = re.compile(r"\b(Овнам|Тельцам|Близнецам|Ракам|Львам|Девам|Весам|Скорпионам|Стрельцам|"
                                  r"Козерогам|Водолеям|Рыбам|другим [А-Я][а-я]+ам)\b")
 FATE_MAIN_LEAD = "Твоя главная энергия"
+FATE_MAX_CHARS = 620   # «до 600 знаков» с небольшим запасом на подписи абзацев
+
+# Слова из названий арканов для проверки опечаток («Иерерафант» вместо «Иерофант»)
+_ARCANA_WORDS = sorted({w.replace("ё", "е") for n in ARCANA.values() for w in n.split() if len(w) >= 5})
+# Прошедшее время и краткие прилагательные в мужском роде, обращённые к «ты»: «ты готов», «ты устал»
+FATE_MASC_RE = re.compile(
+    r"(?<![а-яё])ты\s+((бы|уже|не|сам|давно|раньше)\s+)?[а-яё]{2,}(?<!ы)л(?![а-яё])"   # «ты устал», «ты бы хотел»
+    r"|(?<![а-яё])тебя\s+(как\s+)?[а-яё]{3,}(ого|его|ым|им)(?![а-яё])"                  # «видят тебя как отстранённого»
+    r"|(?<![а-яё])(хотел|мог|смог|сумел|готов|уверен|рад|сам|должен|способен|открыт|свободен|над[её]жен|практичен|сил[её]н|упрям|"
+    r"чест[её]н|спокоен|терпелив|внимателен|настойчив|решителен|чуток|щедр|прав|склонен|счастлив|одинок|занят|"
+    r"независим|ум[её]н|смел|горд|влюбл[её]н|осторожен|честолюбив|амбициозен|целеустремл[её]н|трудолюбив|"
+    r"общителен|скромен|верен|предан|талантлив|интересен|заметен|убедителен|надеж[её]н)(?![а-яё])",
+    re.IGNORECASE)
+
+MASC_RE = FATE_MASC_RE   # проверка рода для всех текстов, не только Кода судьбы
+
+
+def arcana_typos(text: str) -> list:
+    """Слова, похожие на название аркана, но написанные с ошибкой. Падежные формы («Иерофанта») не считаются."""
+    import difflib
+    bad = []
+    for tok in set(re.findall(r"[А-ЯЁ][а-яё]{4,}", text)):
+        low = tok.lower().replace("ё", "е")
+        for w in _ARCANA_WORDS:
+            wl = w.lower()
+            if low[:2] != wl[:2] or abs(len(low) - len(wl)) > 2 or low.startswith(wl[:max(3, len(wl) - 2)]):
+                continue
+            if difflib.SequenceMatcher(None, low, wl).ratio() >= 0.75:
+                bad.append(tok)
+                break
+    return bad
 
 
 def _fate_validator(parsed: dict) -> Optional[dict]:
@@ -3977,19 +4745,23 @@ def _fate_validator(parsed: dict) -> Optional[dict]:
     чтобы было видно, какой абзац про какой аркан."""
     text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
     paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
-    if len(paras) < 3 or not paras[0].startswith(FATE_PERSONALITY_LEAD) or not paras[1].startswith(FATE_MAIN_LEAD):
+    lead1, lead2 = fate_leads()
+    if len(paras) < 3 or not paras[0].startswith(lead1) or not paras[1].startswith(lead2):
         return None
     if FATE_SIGN_PLURAL_RE.search(text) or not paras[-1].rstrip().endswith("?"):
         return None
+    if arcana_typos(text) or FATE_MASC_RE.search(text):
+        return None
     words = len(text.split())
-    return {"text": "\n\n".join(paras)} if 100 <= words <= 300 else None
+    return {"text": "\n\n".join(paras)} if 50 <= words <= 120 and len(text) <= FATE_MAX_CHARS else None
 
 
 async def _humanize_fate(text: str) -> str:
     """Гуманизатор для Кода судьбы. Правку берём, только если она прошла те же проверки
     (подписи абзацев, без «Овнам», длина) и вопрос в конце остался на месте."""
-    label = (f"Код судьбы по дате рождения, абзацы через пустую строку. Начала абзацев «{FATE_PERSONALITY_LEAD} – …» "
-             f"и «{FATE_MAIN_LEAD} – …» оставь дословно. Последнее предложение – вопрос человеку, его оставь: "
+    lead1, lead2 = fate_leads()
+    label = (f"Код судьбы по дате рождения, абзацы через пустую строку. Начала абзацев «{lead1} – …» "
+             f"и «{lead2} – …» оставь дословно. Последнее предложение – вопрос человеку, его оставь: "
              "здесь он нужен.")
     new = (await humanize_fields({"text": text}, {"text": label}, ""))["text"]
     if new == text:
@@ -4001,11 +4773,30 @@ async def _humanize_fate(text: str) -> str:
     return checked["text"]
 
 
+def fate_fix_names(text: str, f: dict, same: bool) -> str:
+    """Названия арканов – из словаря, а не от модели: начало первых двух абзацев ставим сами
+    («Твой аркан личности – Звезда.»), чтобы не было «Иерерафанта» и «Temperence»."""
+    lead1, lead2 = fate_leads()
+    paras = text.split("\n\n")
+    if len(paras) >= 2:
+        heads = [(lead1, f"{lead1} – {f['personality_name']}"),
+                 (lead2, f"{lead2} – " + (L("тоже ", "also ") if same else "") + f["arcana_name"])]
+        for i, (lead, head) in enumerate(heads):
+            # меняем только название после «Подпись – », пояснение в том же предложении остаётся
+            paras[i] = re.sub(rf"^{re.escape(lead)}\s*[–—-]\s*(?:тоже\s+|also\s+)?[^.,!?;:]*", lambda m: head,
+                              paras[i], count=1)
+    return "\n\n".join(paras)
+
+
 FATE_SOFT_ARCANA = {13, 16}  # Смерть и Башня пугают по названию
+# Фраза из запасного текста: по ней видно, что ИИ был недоступен и текст надо переписать позже
+FATE_FALLBACK_MARK = "каким тебя видят люди и как ты держишься в разговоре"
 
 
 async def generate_fate_code(d: date, fallback: bool = True) -> Optional[str]:
     f = fate_numbers(d)
+    lead1, lead2 = fate_leads()
+    f = dict(f, personality_name=arcana_title(f["personality_num"]), arcana_name=arcana_title(f["arcana_num"]))
     same = f["personality_num"] == f["arcana_num"]
     soft = sorted({f["personality_num"], f["arcana_num"]} & FATE_SOFT_ARCANA)
     rules = ""
@@ -4016,17 +4807,17 @@ async def generate_fate_code(d: date, fallback: bool = True) -> Optional[str]:
     if same:
         rules += ("\nОба аркана совпали, и над текстом это уже написано. Не повторяй это. Пиши первый абзац о том, "
                   "как аркан виден в характере, второй о том, какую задачу он ставит. Второй абзац начни так: "
-                  f"«{FATE_MAIN_LEAD} – тоже {f['arcana_name']}.»\n")
+                  f"«{lead2} – тоже {f['arcana_name']}.»\n")
     system_prompt = (
         "Ты таролог проекта «Послание Таро». Напиши человеку его персональный «Код судьбы» по дате рождения.\n\n"
-        "Структура (без заголовков, 4 абзаца, всего 140–220 слов):\n"
-        f"1. Аркан личности. Абзац начинается словами «{FATE_PERSONALITY_LEAD} – {f['personality_name']}.» "
+        f"Структура (без заголовков, 4 коротких абзаца, всего 70–95 слов и не больше {FATE_MAX_CHARS - 60} знаков):\n"
+        f"1. Аркан личности. Абзац начинается словами «{lead1} – {f['personality_name']}.» "
         "Дальше: каким человека видят окружающие и в чём его сильная сторона в общении, "
         "с учётом знака и числа судьбы.\n"
-        f"Знак здесь означает знак зодиака самого человека: он {f['zodiac']}. Пиши «ты как {f['zodiac']}…» или "
-        "«в тебе от знака…». Окружающие это просто люди вокруг, у них нет знака. Нельзя писать "
+        f"Знак здесь означает знак зодиака самого человека: {f['zodiac']}. Пиши «в тебе от знака {f['zodiac']}…» "
+        "или «как у многих с этим знаком…». Окружающие это просто люди вокруг, у них нет знака. Нельзя писать "
         "«Овнам ты кажешься», «другим Овнам», «для Рыб» и подобное.\n"
-        f"2. Главная энергия. Абзац начинается словами «{FATE_MAIN_LEAD} – {f['arcana_name']}.» "
+        f"2. Главная энергия. Абзац начинается словами «{lead2} – {f['arcana_name']}.» "
         "Дальше: главная тема и задача его жизни, как она проявляется в решениях, с одним бытовым примером.\n"
         "3. Одна зона роста: что даётся труднее, сказано мягко и по-честному.\n"
         "4. Последнее предложение: вопрос о его текущей ситуации, который естественно подводит к раскладу. "
@@ -4043,7 +4834,7 @@ async def generate_fate_code(d: date, fallback: bool = True) -> Optional[str]:
                    f"главная энергия: {f['arcana_num']} {f['arcana_name']}.")
     res = await call_ai(system_prompt, user_prompt, max_tokens=1400, schema=FATE_SCHEMA, validate=_fate_validator)
     if res:
-        return await _humanize_fate(res["text"])
+        return fate_fix_names(await _humanize_fate(res["text"]), f, same)
     if not fallback:
         return None
     log("⚠️ AI недоступен для Кода судьбы – запасной текст")
@@ -4052,7 +4843,7 @@ async def generate_fate_code(d: date, fallback: bool = True) -> Optional[str]:
         return " Это аркан перемен и обновления: старое уходит, чтобы освободить место новому." \
             if n in FATE_SOFT_ARCANA else ""
     first = (f"{FATE_PERSONALITY_LEAD} – {f['personality_name']}.{soft_note(f['personality_num'])} Он показывает, "
-             f"каким тебя видят люди и как ты держишься в разговоре. Знак {f['zodiac']} и число судьбы "
+             f"{FATE_FALLBACK_MARK}. Знак {f['zodiac']} и число судьбы "
              f"{f['life_path']} добавляют к этому твою манеру общаться.")
     if same:
         second = (f"{FATE_MAIN_LEAD} – тоже {f['arcana_name']}. Значит, то, что люди видят в тебе снаружи, "
@@ -4072,12 +4863,14 @@ def fate_cta_kb(user: dict) -> InlineKeyboardMarkup:
     """Кнопки после Кода судьбы: бесплатный подарок (или 75) и Расклад на ситуацию (или бесплатный, если есть)."""
     free_q = (user.get("free_readings") or 0) > 0
     free_p = (user.get("free_preset") or 0) > 0
-    q_text = "🎁 Задать вопрос картам (бесплатно)" if free_q else f"⚡ Задать вопрос картам – {COST_QUICK}"
-    p_text = "🎴 Расклад на ситуацию (бесплатно)" if free_p else f"🎴 Расклад на ситуацию – {COST_PRESET}"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=q_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=quick&from=fate"))],
-        [InlineKeyboardButton(text=p_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=preset&from=fate"))],
-    ])
+    lang = ulang(user)
+    q_text = tr("btn_fate_quick_free", lang) if free_q else tr("btn_fate_quick", lang, cost=COST_QUICK)
+    p_text = tr("btn_preset_free", lang) if free_p else tr("btn_preset_paid", lang, cost=COST_PRESET)
+    rows = [[InlineKeyboardButton(text=q_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=quick&from=fate"))]]
+    if free_p or not is_minor(user):
+        rows.append([InlineKeyboardButton(text=p_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}?open=preset&from=fate"))])
+    rows.append([InlineKeyboardButton(text=tr("btn_share_fate", ulang(user)), callback_data="sh:f")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def ask_birth_date(chat_id: int, uid: int):
@@ -4091,6 +4884,27 @@ def fate_is_fresh(user: dict) -> bool:
     return bool(user.get("fate_code_text")) and user.get("personality_arcana") is not None
 
 
+async def fate_or_pending(uid: int, d: date) -> Optional[str]:
+    """Сгенерировать Код судьбы: попытка и до двух повторов. Не вышло – сохраняем заглушку как «старый» текст
+    (её перепишет фоновый цикл), помечаем, что человек ждёт, и возвращаем None: заглушку не показываем."""
+    for attempt in range(3):
+        text = await generate_fate_code(d, fallback=False)
+        if text:
+            return await save_fate_code(uid, d, text)
+        if attempt < 2:
+            await asyncio.sleep(4)
+    stub = await generate_fate_code(d, fallback=True)
+    await save_fate_code(uid, d, stub)
+    p = await db()
+    await p.execute("UPDATE users SET fate_pending = TRUE WHERE telegram_id = $1", uid)
+    fate_wakeup.set()
+    track(uid, "fate_code_pending")
+    return None
+
+
+fate_wakeup = asyncio.Event()   # появился человек, который ждёт Код судьбы – фоновый цикл просыпается раньше
+
+
 async def save_fate_code(uid: int, d: date, text: Optional[str] = None) -> str:
     """Сгенерировать текст и сохранить: впервые или вместо старого текста с одним арканом – один раз.
     Если параллельно уже сохранили новый – вернуть сохранённый."""
@@ -4100,7 +4914,10 @@ async def save_fate_code(uid: int, d: date, text: Optional[str] = None) -> str:
         UPDATE users SET fate_code_text = $2, fate_code_at = NOW(), personality_arcana = $3
         WHERE telegram_id = $1 AND (fate_code_text IS NULL OR personality_arcana IS NULL)
         RETURNING fate_code_text
-    """, uid, text, personality_arcana(d))
+    """, uid, text, None if FATE_FALLBACK_MARK in text else personality_arcana(d))
+    if saved and FATE_FALLBACK_MARK not in text:
+        track(uid, "fate_code_done")
+    # запасной текст сохраняем без аркана: он считается старым, и его перепишут, когда ИИ снова доступен
     return saved or await p.fetchval("SELECT fate_code_text FROM users WHERE telegram_id = $1", uid)
 
 
@@ -4109,6 +4926,21 @@ FATE_SIGN_PLURAL_SQL = ("(Овнам|Тельцам|Близнецам|Рака�
                         "Водолеям|Рыбам)")
 FATE_REFRESH_EVERY = 600   # секунд до повтора, если не всё переписано (ИИ недоступен)
 FATE_REFRESH_BATCH = 30    # текстов за проход, по одному раз в несколько секунд – чтобы не упереться в лимиты ИИ
+FATE_REFRESH_PAUSE = int(os.getenv("FATE_REFRESH_PAUSE", "30"))  # секунд между текстами: лимит Groq общий с раскладами
+_fate_scan_done = False    # проверка старых текстов на мужской род и опечатки – один раз после запуска
+
+
+async def _mark_bad_fate_texts(p) -> int:
+    """Старые тексты в мужском роде («ты готов», «надёжен») или с опечаткой в названии аркана –
+    пометить к переписыванию. Регулярка сложная, поэтому проверяем в Python, а не в SQL."""
+    rows = await p.fetch("SELECT telegram_id, fate_code_text FROM users "
+                         "WHERE personality_arcana IS NOT NULL AND fate_code_text IS NOT NULL")
+    bad = [r["telegram_id"] for r in rows
+           if FATE_MASC_RE.search(r["fate_code_text"]) or arcana_typos(r["fate_code_text"])]
+    if bad:
+        await p.execute("UPDATE users SET personality_arcana = NULL WHERE telegram_id = ANY($1::bigint[])", bad)
+        log(f"🔢 Коды судьбы к переписыванию (мужской род, опечатки): {len(bad)} из {len(rows)}")
+    return len(bad)
 
 
 async def refresh_fate_codes() -> int:
@@ -4119,36 +4951,77 @@ async def refresh_fate_codes() -> int:
                     "WHERE fate_code_text LIKE '%\u2014%'")
     await p.execute("UPDATE users SET personality_arcana = NULL "
                     "WHERE personality_arcana IS NOT NULL AND fate_code_text ~ $1", FATE_SIGN_PLURAL_SQL)
+    # запасные тексты, сохранённые, когда ИИ был недоступен, и опечатка «Иерерафант» – тоже переписать
+    await p.execute("UPDATE users SET personality_arcana = NULL WHERE personality_arcana IS NOT NULL "
+                    "AND (strpos(fate_code_text, $1) > 0 OR strpos(fate_code_text, 'Иерерафант') > 0)",
+                    FATE_FALLBACK_MARK)
+    global _fate_scan_done
+    if not _fate_scan_done:
+        await _mark_bad_fate_texts(p)
+        _fate_scan_done = True
+    # random(): текст, который ИИ раз за разом не может написать без ошибок, не блокирует очередь
+    # сначала те, кто ждёт Код судьбы прямо сейчас, остальные – в случайном порядке
     rows = await p.fetch("""
-        SELECT telegram_id, birth_date FROM users
+        SELECT telegram_id, birth_date, lang FROM users
         WHERE fate_code_text IS NOT NULL AND personality_arcana IS NULL AND birth_date IS NOT NULL
-        ORDER BY fate_code_at DESC NULLS LAST LIMIT $1
+        ORDER BY fate_pending DESC, random() LIMIT $1
     """, FATE_REFRESH_BATCH)
-    done = 0
+    done, fails = 0, 0
     for r in rows:
+        LANG.set(r["lang"] or "ru")
         text = await generate_fate_code(r["birth_date"], fallback=False)
-        if not text:  # ИИ недоступен – запасным текстом не затираем, попробуем в следующий проход
-            break
+        if not text:  # ИИ недоступен или текст не прошёл проверки – старый не затираем
+            fails += 1
+            if fails >= 3:   # три неудачи подряд – скорее всего лимит, попробуем в следующий проход
+                break
+            await asyncio.sleep(FATE_REFRESH_PAUSE)
+            continue
+        fails = 0
         await save_fate_code(r["telegram_id"], r["birth_date"], text)
+        await deliver_pending_fate(r["telegram_id"])
         done += 1
-        await asyncio.sleep(3)
+        await asyncio.sleep(FATE_REFRESH_PAUSE)
     if done:
         log(f"🔢 Коды судьбы переписаны заранее: {done}")
     return await p.fetchval("SELECT COUNT(*) FROM users WHERE fate_code_text IS NOT NULL "
                             "AND personality_arcana IS NULL AND birth_date IS NOT NULL")
 
 
+async def deliver_pending_fate(uid: int):
+    """Человек ждал Код судьбы в чате, а ИИ не ответил – текст готов, присылаем."""
+    p = await db()
+    ok = await p.fetchval("UPDATE users SET fate_pending = FALSE WHERE telegram_id = $1 AND fate_pending RETURNING 1", uid)
+    if not ok:
+        return
+    user = await get_user(uid)
+    if not user or not user.get("birth_date") or FATE_FALLBACK_MARK in (user.get("fate_code_text") or ""):
+        return
+    set_lang(user)
+    try:
+        await bot.send_message(uid, fate_header(user["birth_date"]) + "\n\n" + user["fate_code_text"],
+                               reply_markup=fate_cta_kb(user))
+        track(uid, "fate_code_viewed", {"via": "pending"})
+        await onboard_after_fate(uid, uid)
+    except Exception as e:
+        log(f"deliver_pending_fate {uid}: {e}")
+
+
 async def fate_refresh_loop():
-    """Разовая чистка после запуска сервера: повторяет, пока не перепишет всё, и останавливается."""
+    """Фоновое переписывание Кодов судьбы: старые и битые тексты, а также тех, кто ждёт текст после сбоя ИИ.
+    Работает всё время; если кто-то ждёт – просыпается раньше (через минуту, чтобы лимит ИИ успел сброситься)."""
     await pool_ready.wait()
     await asyncio.sleep(60)
     while True:
         try:
-            if not await refresh_fate_codes():
-                return
+            await refresh_fate_codes()
         except Exception as e:
             log(f"⚠️ fate_refresh_loop: {e}")
-        await asyncio.sleep(FATE_REFRESH_EVERY)
+        try:
+            await asyncio.wait_for(fate_wakeup.wait(), timeout=FATE_REFRESH_EVERY)
+            fate_wakeup.clear()
+            await asyncio.sleep(60)
+        except asyncio.TimeoutError:
+            pass
 
 
 def fate_payload(user: dict) -> Optional[dict]:
@@ -4157,9 +5030,12 @@ def fate_payload(user: dict) -> Optional[dict]:
     if not user.get("birth_date") or not user.get("fate_code_text"):
         return None
     f = fate_numbers(user["birth_date"])
+    pending = FATE_FALLBACK_MARK in (user.get("fate_code_text") or "")
     f.update({"arcana_roman": ROMAN[f["arcana_num"]], "personality_roman": ROMAN[f["personality_num"]],
-              "same": f["arcana_num"] == f["personality_num"], "text": user["fate_code_text"],
-              "stale": not fate_is_fresh(user)})
+              "same": f["arcana_num"] == f["personality_num"],
+              "text": None if pending else user["fate_code_text"],
+              "pending": pending,   # ИИ не ответил – текст готовится, приложение покажет «считаем» и спросит позже
+              "stale": not pending and not fate_is_fresh(user)})
     return f
 
 
@@ -4178,11 +5054,11 @@ async def api_fate_code(payload: dict, authorization: str = Header(None)):
                              "RETURNING birth_date", uid, d)
         birth_waiting.pop(uid, None)
         track(uid, "birthdate_entered", {"via": "app"})
-    text = user["fate_code_text"] if fate_is_fresh(user) else await save_fate_code(uid, d)
-    track(uid, "fate_code_viewed", {"via": "app"})
-    return {"fate": fate_payload({"birth_date": d, "fate_code_text": text,
-                                  "personality_arcana": personality_arcana(d)}),
-            "birth_date": d.strftime("%d.%m.%Y")}
+    text = user["fate_code_text"] if fate_is_fresh(user) else await fate_or_pending(uid, d)
+    track(uid, "fate_code_viewed", {"via": "app", "pending": not text})
+    fate = fate_payload({"birth_date": d, "fate_code_text": text or FATE_FALLBACK_MARK,
+                         "personality_arcana": personality_arcana(d)})
+    return {"fate": fate, "birth_date": d.strftime("%d.%m.%Y")}
 
 
 async def send_fate_code(chat_id: int, uid: int):
@@ -4198,9 +5074,13 @@ async def send_fate_code(chat_id: int, uid: int):
             await bot.send_chat_action(chat_id, "typing")
         except Exception:
             pass
-        text = await save_fate_code(uid, user["birth_date"])
+        text = await fate_or_pending(uid, user["birth_date"])
+        if not text:   # ИИ не ответил дважды – заглушку не показываем, пришлём, когда текст будет готов
+            await bot.send_message(chat_id, tr("fate_pending", ulang(user)))
+            return
     await bot.send_message(chat_id, fate_header(user["birth_date"]) + "\n\n" + text, reply_markup=fate_cta_kb(user))
     track(uid, "fate_code_viewed")
+    await onboard_after_fate(chat_id, uid)
 
 
 @dp.callback_query(F.data.startswith("src:"))
@@ -4215,7 +5095,7 @@ async def source_selected(q: CallbackQuery):
     track(q.from_user.id, "source_selected", {"source": key})
     await q.answer("Спасибо!")
     try:
-        await q.message.edit_text(f"Откуда ты о нас узнал(а)? – {labels[key]}")
+        await q.message.edit_text(f"Откуда ты о нас знаешь? – {labels[key]}")
     except Exception:
         pass
     user = await get_user(q.from_user.id)
@@ -4234,6 +5114,9 @@ async def birth_date_skipped(q: CallbackQuery):
     except Exception:
         pass
     user = await get_user(uid) or {}
+    if user.get("onboard_step") == 1:   # первый сеанс: дальше – время карты дня
+        await onboard_after_fate(q.message.chat.id, uid)
+        return
     free = (user.get("free_readings") or 0) > 0
     text = ("Хорошо! Твой подарок – бесплатный ответ карт. Задай вопрос 👇" if free
             else "Хорошо! Задай вопрос картам 👇")
@@ -4354,7 +5237,7 @@ async def cmd_daily(message: Message):
     on = await p.fetchval("""
         UPDATE users SET daily_push = NOT daily_push, notify = TRUE WHERE telegram_id = $1 RETURNING daily_push
     """, message.from_user.id)
-    track(message.from_user.id, "daily_push_on" if on else "daily_push_off")
+    track(message.from_user.id, "daily_push_enabled" if on else "daily_push_off")
     if on:
         await message.answer("🌅 Готово! Карта дня будет приходить каждый день. Время можно выбрать в приложении, на карточке «Карта дня». Выключить: /daily")
     else:
@@ -4398,6 +5281,7 @@ async def followup_answer(q: CallbackQuery):
     if not ok:
         return
     track(q.from_user.id, f"followup_{ans}", {"reading": rid})
+    track(q.from_user.id, "push_clicked", {"kind": "followup", "answer": ans})
     try:
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -4423,30 +5307,53 @@ async def cmd_funnel(message: Message, command: CommandObject):
         return
     days = int(command.args) if command.args and command.args.strip().isdigit() else 7
     p = await db()
-    steps = [("Новые пользователи", "SELECT COUNT(*) FROM users WHERE created_at > NOW() - make_interval(days => $1)"),
-             ("Открыли мини-апп", "app_open"), ("Сделали расклад", "reading"), ("Открыли магазин", "store_open"),
-             ("Создали счёт", "invoice"), ("Оплатили", "payment")]
+    steps = [("Новые пользователи", "SELECT COUNT(*) FROM users WHERE created_at > NOW() - make_interval(days => $1) "
+                                     "AND NOT COALESCE(is_test, FALSE)"),
+             ("Открыли мини-апп", "app_open"), ("Сделали расклад", "reading_done"), ("Открыли магазин", "store_open"),
+             ("Создали счёт", "invoice"), ("Оплатили", "payment_done")]
     lines = [f"📊 Воронка за {days} дн. (уникальные пользователи)\n"]
     for title, q in steps:
         if q.startswith("SELECT"):
             n = await p.fetchval(q, days)
         else:
-            n = await p.fetchval("SELECT COUNT(DISTINCT telegram_id) FROM events "
-                                 "WHERE name = $1 AND created_at > NOW() - make_interval(days => $2)", q, days)
+            n = await p.fetchval("SELECT COUNT(DISTINCT user_id) FROM events_v "
+                                 "WHERE event = $1 AND NOT is_test AND created_at > NOW() - make_interval(days => $2)",
+                                 q, days)
         lines.append(f"{title}: {n}")
     rows = await p.fetch("""
-        SELECT name, COUNT(*) AS n, COUNT(DISTINCT telegram_id) AS u FROM events
-        WHERE created_at > NOW() - make_interval(days => $1)
-          AND name IN ('clarify', 'upsell_click', 'followup_yes', 'followup_no', 'followup_wait',
-                       'daily_push_on', 'streak_reward', 'ref_credited', 'history_open', 'story_share', 'sub_click')
-        GROUP BY name ORDER BY n DESC
+        SELECT event, COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM events_v
+        WHERE created_at > NOW() - make_interval(days => $1) AND NOT is_test
+          AND event IN ('clarify', 'upsell_click', 'followup_yes', 'followup_no', 'followup_wait',
+                        'daily_push_enabled', 'streak_reward', 'ref_credited', 'history_open', 'share_clicked',
+                        'sub_click', 'card_opened', 'card_full_read', 'paywall_shown', 'payment_started',
+                        'push_sent', 'push_clicked', 'fate_code_done', 'bot_blocked')
+        GROUP BY event ORDER BY n DESC
     """, days)
     if rows:
         lines.append("\nДругие события (раз / людей):")
-        lines += [f"{r['name']}: {r['n']} / {r['u']}" for r in rows]
+        lines += [f"{r['event']}: {r['n']} / {r['u']}" for r in rows]
     subs = await p.fetchval("SELECT COUNT(*) FROM users WHERE sub_until > NOW()")
     lines.append(f"\n🌟 Активных подписок: {subs}")
-    lines.append("Другой период: /funnel 30")
+    lines.append("Другой период: /funnel 30 · По неделям прихода: /cohorts")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("cohorts"))
+async def cmd_cohorts(message: Message):
+    """Только для админов: воронка по недельным когортам из представления funnel_weekly (без тестовых)."""
+    if not _is_admin_msg(message):
+        return
+    p = await db()
+    rows = await p.fetch("SELECT * FROM funnel_weekly LIMIT $1", config.COHORT_WEEKS)
+    if not rows:
+        await message.answer("Пока нет данных.")
+        return
+    lines = ["📊 Когорты по неделе прихода (без тестовых)",
+             "пришли · карта · расклад · Код · D1 · D7 · оплата · блок\n"]
+    for r in rows:
+        lines.append(f"{r['week']:%d.%m}: {r['came']} · {r['opened_card']} · {r['did_reading']} · "
+                     f"{r['did_fate_code']} · {r['returned_d1']} · {r['returned_d7']} · {r['paid']} · {r['blocked']}")
+    lines.append("\nD1 и D7 – было действие на 1-й и 7-й день после прихода. У свежих недель D7 ещё не наступил.")
     await message.answer("\n".join(lines))
 
 
@@ -4656,7 +5563,7 @@ async def process_successful_payment(message: Message):
                 await c.execute("UPDATE users SET sub_until = $2 WHERE telegram_id = $1", uid, sub_until)
     if pack == "pack_3000":
         track(uid, "pack_3000_paid", {"method": "stars"})
-    track(uid, "payment", {"pack": pack, "method": "stars", "stars": pay.total_amount,
+    track(uid, "payment_done", {"pack": pack, "method": "stars", "stars": pay.total_amount,
                            "renewal": bool(getattr(pay, "is_recurring", False) and not getattr(pay, "is_first_recurring", False))})
     asyncio.create_task(credit_referrer_if_due(uid))
     if is_sub:
@@ -5150,7 +6057,7 @@ async def handle_dream(message: Message, text: str, source: str, duration: Optio
     text = re.sub(r"[ \t]+", " ", (text or "")).strip()[:DREAM_MAX_CHARS]
     if len(text.split()) < DREAM_MIN_WORDS:
         dream_waiting[uid] = time.time() + DREAM_WAIT_SECONDS
-        await message.answer("Расскажи чуть подробнее: что происходило во сне, кто там был, что ты чувствовал(а)?")
+        await message.answer("Расскажи чуть подробнее: что происходило во сне, кто там был, какие были чувства?")
         return
     if uid in dream_busy:
         await message.answer("Толкую предыдущий сон, это займёт меньше минуты 🌙")
@@ -5216,7 +6123,7 @@ async def run_dream(chat_id: int, uid: int, text: str, source: str, mode: str, p
                                             "через пару минут.")
             return
         name = card["name"].replace("Старший Аркан: ", "")
-        await bot.send_message(chat_id, f"💭 Ты рассказал(а):\n{_h(res['summary'])}", parse_mode="HTML")
+        await bot.send_message(chat_id, f"💭 Твой сон:\n{_h(res['summary'])}", parse_mode="HTML")
         body = (f"🌙 <b>Толкование сна</b>\n\n{_h(res['interpretation'])}\n\n"
                 f"🃏 <b>Карта-совет: {_h(name)}</b>\n{_h(res['card_advice'])}")
         if mode == "free":
@@ -5374,7 +6281,7 @@ MARATHON_DAYS = [
              "Сформулируй один главный вопрос, который у тебя остался."},
 ]
 MARATHON_LEN = len(MARATHON_DAYS)
-MARATHON_FINAL = "За неделю ты многое заметил(а). Хочешь разобрать главный вопрос с картами?"
+MARATHON_FINAL = "За неделю набралось много наблюдений. Хочешь разобрать главный вопрос с картами?"
 MARATHON_INTRO = (
     f"🗓 Марафон «{MARATHON_TITLE}»\n\n"
     "Семь дней – семь тем: внимание к знакам, отношения, деньги, отложенное решение, благодарность, страх и итог "
@@ -5538,9 +6445,10 @@ def marathon_cta_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _marathon_day_kb(day: int) -> InlineKeyboardMarkup:
+def _marathon_day_kb(day: int, push: bool = False) -> InlineKeyboardMarkup:
+    """push=True – кнопка из утреннего напоминания: нажатие пишется как push_clicked."""
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-        text=f"🗓 Открыть день {day} из {MARATHON_LEN}", callback_data="mr:day")]])
+        text=f"🗓 Открыть день {day} из {MARATHON_LEN}", callback_data="mr:dayp" if push else "mr:day")]])
 
 
 async def send_marathon_day(chat_id: int, uid: int):
@@ -5574,7 +6482,7 @@ async def send_marathon_status(chat_id: int, uid: int):
     user = await get_user(uid) or {"telegram_id": uid}
     st = marathon_state(await marathon_row(uid), user)
     if st["status"] in ("none", "finished"):
-        intro = MARATHON_INTRO + ("\n\nТы уже проходил(а) марафон – можно начать заново." if st["status"] == "finished" else "")
+        intro = MARATHON_INTRO + ("\n\nМарафон уже пройден – можно начать заново." if st["status"] == "finished" else "")
         await bot.send_message(chat_id, intro, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🚀 Начать марафон", callback_data="mr:start")]]))
     elif st["status"] == "ready":
@@ -5608,7 +6516,9 @@ async def marathon_callback(q: CallbackQuery):
             await send_marathon_day(q.message.chat.id, uid)
         else:
             await send_marathon_status(q.message.chat.id, uid)
-    elif q.data == "mr:day":
+    elif q.data in ("mr:day", "mr:dayp"):
+        if q.data == "mr:dayp":
+            track(uid, "push_clicked", {"kind": "marathon"})
         await send_marathon_day(q.message.chat.id, uid)
 
 
@@ -5623,6 +6533,19 @@ async def api_marathon_start(authorization: str = Header(None)):
 async def api_marathon_day(authorization: str = Header(None)):
     user, admin = await auth_user(authorization)
     return await marathon_open_day(user, admin)
+
+
+async def marathon_day_for_push(uid: int, user: dict) -> Optional[int]:
+    """Номер дня марафона для кнопки в утренней карте (у включивших карту дня отдельного напоминания нет)."""
+    try:
+        st = marathon_state(await marathon_row(uid), user)
+        if st.get("status") == "ready":
+            p = await db()
+            await p.execute("UPDATE marathons SET remind_date = $2 WHERE telegram_id = $1", uid, user_today(user))
+            return st.get("next_day")
+    except Exception as e:
+        log(f"marathon_day_for_push {uid}: {e}")
+    return None
 
 
 async def send_marathon_reminders() -> int:
@@ -5640,7 +6563,7 @@ async def send_marathon_reminders() -> int:
                            ELSE COALESCE(u.tz_offset_min, $2) END) AS local_ts,
                        (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(u.tz_offset_min, $2)) AS day_ts
                 FROM marathons m JOIN users u ON u.telegram_id = m.telegram_id
-                WHERE m.finished_at IS NULL AND u.notify AND NOT u.blocked
+                WHERE m.finished_at IS NULL AND u.notify AND NOT u.blocked AND NOT u.daily_push
             )
             SELECT *, to_char(day_ts, 'YYYY-MM-DD') AS local_day,
                    to_char(day_ts - INTERVAL '1 day', 'YYYY-MM-DD') AS day_yesterday,
@@ -5668,12 +6591,12 @@ async def send_marathon_reminders() -> int:
             else:
                 text = (f"🗓 Марафон «{MARATHON_TITLE}»\n{marathon_dots(done)} День {nxt} из {MARATHON_LEN}: "
                         f"«{theme}». Задание и карта ждут.")
-            kb = _marathon_day_kb(nxt)
+            kb = _marathon_day_kb(nxt, push=True)
             if r["daily_open"]:   # Карта дня сегодня не открыта – вторая кнопка в том же сообщении
                 text += "\n\n🃏 И твоя Карта дня тоже ждёт."
                 kb.inline_keyboard.append([InlineKeyboardButton(text="🃏 Открыть Карту дня",
-                                                                web_app=WebAppInfo(url=FRONTEND_URL))])
-            if await _send_safe(uid, text, kb):
+                                                                web_app=WebAppInfo(url=f"{FRONTEND_URL}?from=push_marathon"))])
+            if await _send_safe(uid, text, kb, push="marathon"):
                 sent += 1
             await asyncio.sleep(0.05)
     return sent
@@ -6653,3 +7576,298 @@ async def api_deck(authorization: str = Header(None)):
         "granted": granted,
         "new_balance": 99999 if admin else await p.fetchval("SELECT balance FROM users WHERE telegram_id = $1", uid),
     }
+
+
+# =====================================================================
+# ЭТАП 2: ВОПРОС ТЕКСТОМ В ЧАТ → «Вытянуть карту на этот вопрос?»
+# Обработчик последний: раньше него стоят дата рождения, сон, отзыв и ответы админа.
+# =====================================================================
+chat_questions: dict = {}   # telegram_id → (вопрос, время)
+ASK_TTL = 24 * 3600
+
+
+def looks_like_question(text: str) -> bool:
+    t = (text or "").strip()
+    words = re.findall(r"[^\W\d_]{2,}", t)
+    return len(t) >= 8 and (t.endswith("?") or len(words) >= 3)
+
+
+@dp.message(F.text & ~F.text.startswith("/"), F.chat.type == "private")
+async def chat_question(message: Message):
+    uid = message.from_user.id
+    user = await get_user(uid)
+    if not user:
+        user, _, _ = await ensure_user({"id": uid, "first_name": message.from_user.first_name,
+                                        "username": message.from_user.username,
+                                        "language_code": message.from_user.language_code})
+    lang = ulang(user)
+    if not looks_like_question(message.text):
+        await message.answer(tr("ask_hint", lang), reply_markup=menu_kb(user))
+        return
+    chat_questions[uid] = (message.text.strip()[:500], time.time())
+    free = (user.get("free_readings") or 0) > 0
+    label = tr("btn_ask_free", lang) if free else tr("btn_ask_paid", lang, cost=COST_QUICK)
+    await message.answer(tr("ask_confirm", lang), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data="q:draw")]]))
+
+
+@dp.callback_query(F.data == "q:draw")
+async def chat_question_draw(q: CallbackQuery):
+    uid = q.from_user.id
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    user = await get_user(uid) or {}
+    lang = ulang(user)
+    item = chat_questions.pop(uid, None)
+    if not item or time.time() - item[1] > ASK_TTL:
+        await q.message.answer(tr("ask_expired", lang))
+        return
+    question = item[0]
+    free = (user.get("free_readings") or 0) > 0
+    if not free and is_minor(user):
+        await q.message.answer(tr("minor_paid", lang))
+        return
+    try:
+        mode = "admin" if is_admin(user) else await charge(uid, COST_QUICK, free="quick")
+    except HTTPException:
+        track(uid, "paywall_shown", {"cost": COST_QUICK, "via": "chat"})
+        await q.message.answer(tr("no_energy", lang, cost=COST_QUICK, balance=user.get("balance") or 0),
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                   app_btn(tr("btn_topup", lang), open="store", need=COST_QUICK,
+                                           **{"from": "chat_question"})]]))
+        return
+    track(uid, "reading_started", {"kind": "quick", "mode": mode, "via": "chat"})
+    await bot.send_chat_action(q.message.chat.id, "typing")
+    card = random.choice(get_tarot_deck())
+    try:
+        res = await generate_quick_reading(question, [card], await sky_line(user))
+    except Exception as e:
+        log(f"chat quick {uid}: {e}")
+        await refund(uid, mode, COST_QUICK)
+        await q.message.answer(tr("reading_failed", lang))
+        return
+    text = res.get("reading", "")
+    rid = await save_reading(uid, "quick", question, [card], text)
+    await set_onboard(uid, 1)
+    track(uid, "reading_done", {"kind": "quick", "mode": mode, "via": "chat"})
+    await send_card_message(q.message.chat.id, card, f"<b>{_h(card_title(card))}</b>")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[app_btn(tr("btn_open_reading", lang), r=rid)]]) if rid else None
+    await bot.send_message(q.message.chat.id, md_html(text)[:4000], parse_mode="HTML", reply_markup=kb)
+
+
+# =====================================================================
+# ЭТАП 3: КАРТИНКИ ДЛЯ ПЕРЕСЫЛКИ – карта, послание и реферальная ссылка. Бот присылает картинку в чат,
+# человек пересылает её сам (из мини-приложения картинку в чужой чат не отправить)
+# =====================================================================
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+
+def _wrap(draw, text: str, font, width: int) -> list:
+    lines, cur = [], ""
+    for w in text.split():
+        nxt = (cur + " " + w).strip()
+        if draw.textlength(nxt, font=font) <= width:
+            cur = nxt
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+async def share_image(card_id: int, title: str, message: str, link: str) -> Optional[bytes]:
+    """Картинка 1080×1350: рисунок карты, заголовок, послание и ссылка на бота с реферальным кодом."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+        W, H = 1080, 1350
+        im = Image.new("RGB", (W, H), "#12101A")
+        dr = ImageDraw.Draw(im)
+        for y in range(H):   # мягкий градиент вниз
+            k = y / H
+            dr.line([(0, y), (W, y)], fill=(int(18 + 12 * k), int(16 + 8 * k), int(26 + 22 * k)))
+        raw = await card_jpeg(card_id, width=900)
+        top = 70
+        if raw:
+            card = Image.open(io.BytesIO(raw)).convert("RGB")
+            ch = 700
+            card = card.resize((round(card.width * ch / card.height), ch), Image.LANCZOS)
+            x = (W - card.width) // 2
+            dr.rounded_rectangle([x - 6, top - 6, x + card.width + 6, top + ch + 6], radius=26, outline="#E6D2B5", width=4)
+            im.paste(card, (x, top))
+            top += ch + 50
+        semi = ImageFont.truetype(os.path.join(FONT_DIR, "Montserrat-SemiBold.ttf"), 46)
+        reg = ImageFont.truetype(os.path.join(FONT_DIR, "Montserrat-Regular.ttf"), 40)
+        small = ImageFont.truetype(os.path.join(FONT_DIR, "Montserrat-Regular.ttf"), 28)
+        for line in _wrap(dr, title, semi, W - 140)[:2]:
+            dr.text((W // 2, top), line, font=semi, fill="#E6D2B5", anchor="ma")
+            top += 60
+        top += 16
+        for line in _wrap(dr, message, reg, W - 160)[:4]:
+            dr.text((W // 2, top), line, font=reg, fill="#F2EDE4", anchor="ma")
+            top += 54
+        dr.text((W // 2, H - 70), L("Послание Таро · ", "Tarot Message · ") + link.replace("https://", ""), font=small,
+                fill="#CFC9DC", anchor="ma")
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+        return buf.getvalue()
+    except Exception as e:
+        log(f"share_image: {e}")
+        return None
+
+
+async def send_share(uid: int, kind: str, reading_id: Optional[int] = None) -> bool:
+    """Прислать в чат картинку для пересылки: карта дня (или другой расклад) – kind='daily', Код судьбы – 'fate'."""
+    user = await get_user(uid)
+    if not user:
+        return False
+    lang, link = ulang(user), ref_link(uid)
+    p = await db()
+    if kind == "fate":
+        if not user.get("birth_date"):
+            return False
+        n = personality_arcana(user["birth_date"])
+        arcana = arcana_title(n)
+        img = await share_image(n % 22, L(f"Мой аркан – {arcana}", f"My arcana – {arcana}"),
+                                L(fate_share_line(n), "The arcana that shows my strong side."), link)
+        caption = tr("share_caption_fate", lang, arcana=arcana, link=link)
+    else:
+        row = await p.fetchrow("SELECT * FROM readings WHERE id = $1 AND telegram_id = $2", reading_id, uid)
+        if not row:
+            return False
+        cards = json.loads(row["cards"] or "[]")
+        if not cards:
+            return False
+        card = cards[0]
+        msg = row["message"] or daily_summary(row)["short"]
+        title = (L("Карта дня – ", "Card of the day – ") + card_title(card) if row["kind"] == "daily" else card_title(card))
+        img = await share_image(card["id"], title, msg, link)
+        caption = tr("share_caption_daily", lang, card=card_title(card), link=link)
+    if not img:
+        return False
+    await bot.send_photo(uid, BufferedInputFile(img, "poslanie-taro.jpg"), caption=caption)
+    await bot.send_message(uid, tr("share_ready", lang))
+    track(uid, "share_clicked", {"what": kind, "via": "image"})
+    return True
+
+
+def fate_share_line(n: int) -> str:
+    return FATE_SHARE_LINES.get(n, "Аркан, который показывает мою сильную сторону.")
+
+
+# Короткая строка про аркан для картинки «Мой аркан – …» (без даты рождения и личного текста)
+FATE_SHARE_LINES = {
+    1: "Умею начинать и превращать идеи в дела.", 2: "Слышу то, что другие не замечают.",
+    3: "Создаю уют и даю вещам расти.", 4: "Держу слово и строю надёжное.",
+    5: "Ищу смысл и делюсь опытом.", 6: "Выбираю сердцем и ценю близость.",
+    7: "Иду к цели и не сворачиваю.", 8: "Мягкая сила, которая выдерживает многое.",
+    9: "Нахожу ответы в тишине.", 10: "Умею ловить перемены и поворачивать их к лучшему.",
+    11: "Чувствую, где честно, а где нет.", 12: "Умею посмотреть на всё с другой стороны.",
+    13: "Отпускаю старое и обновляюсь.", 14: "Нахожу меру и баланс.",
+    15: "Знаю свои желания и не боюсь их.", 16: "Меняюсь быстро и по-настоящему.",
+    17: "Верю в лучшее и вдохновляю других.", 18: "Доверяю интуиции и снам.",
+    19: "Несу тепло и радость.", 20: "Слышу свой внутренний зов.",
+    21: "Довожу начатое до конца.", 22: "Иду навстречу новому налегке.",
+}
+
+
+@app.post("/api/share")
+async def api_share(payload: dict, authorization: str = Header(None)):
+    """Мини-приложение: «Поделиться» – бот присылает в чат картинку, человек пересылает её."""
+    user, _ = await auth_user(authorization)
+    kind = "fate" if payload.get("kind") == "fate" else "daily"
+    rid = int(payload.get("reading_id") or 0) or None
+    ok = await send_share(user["telegram_id"], kind, rid)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Не получилось сделать картинку, попробуй ещё раз.")
+    return {"ok": True}
+
+
+@dp.callback_query(F.data.startswith("sh:"))
+async def share_callback(q: CallbackQuery):
+    await q.answer()
+    parts = q.data.split(":")
+    if parts[1] == "f":
+        await send_share(q.from_user.id, "fate")
+    elif len(parts) > 2 and parts[2].isdigit():
+        await send_share(q.from_user.id, "daily", int(parts[2]))
+
+
+# =====================================================================
+# ЭТАП 3: ВЕЧЕРНИЙ ВОПРОС «Как сегодня отыгралась карта?» – только тем, кто открыл карту дня.
+# Исключение из правила «одно сообщение в сутки». Ответ – в readings.followup (match / miss).
+# =====================================================================
+async def send_evening_questions() -> int:
+    p = await db()
+    rows = await p.fetch("""
+        WITH t AS (
+            SELECT u.telegram_id, u.lang, u.push_hour, u.evening_ask_date,
+                   (NOW() AT TIME ZONE 'UTC') + make_interval(mins => COALESCE(u.tz_offset_min, $1)) AS local_ts
+            FROM users u WHERE u.notify AND NOT u.blocked AND NOT COALESCE(u.is_test, FALSE) AND u.daily_push
+        )
+        SELECT t.telegram_id, t.lang, to_char(t.local_ts, 'YYYY-MM-DD') AS local_day, r.id AS rid, r.cards
+        FROM t JOIN LATERAL (
+            SELECT id, cards FROM readings rd WHERE rd.telegram_id = t.telegram_id AND rd.kind = 'daily'
+              AND rd.opened AND rd.followup IS NULL
+              AND to_char(rd.created_at + (t.local_ts - (NOW() AT TIME ZONE 'UTC')), 'YYYY-MM-DD')
+                  = to_char(t.local_ts, 'YYYY-MM-DD')
+            ORDER BY rd.created_at DESC LIMIT 1) r ON TRUE
+        WHERE EXTRACT(HOUR FROM t.local_ts) >= $2 AND EXTRACT(HOUR FROM t.local_ts) < $2 + 2
+          AND COALESCE(t.push_hour, 9) < $2 - 2
+          AND t.evening_ask_date IS DISTINCT FROM to_char(t.local_ts, 'YYYY-MM-DD')
+        LIMIT 200
+    """, config.DEFAULT_TZ_MIN, config.EVENING_ASK_HOUR)
+    sent = 0
+    for r in rows:
+        uid, lang = r["telegram_id"], r["lang"] or "ru"
+        await p.execute("UPDATE users SET evening_ask_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
+        cards = json.loads(r["cards"] or "[]")
+        if not cards:
+            continue
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=tr("btn_match", lang), callback_data=f"ev:{r['rid']}:match"),
+            InlineKeyboardButton(text=tr("btn_miss", lang), callback_data=f"ev:{r['rid']}:miss")]])
+        try:
+            await bot.send_message(uid, tr("evening_ask", lang, card=card_title(cards[0])), reply_markup=kb)
+            track(uid, "push_sent", {"kind": "evening"})
+            sent += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            await p.execute("UPDATE users SET blocked = TRUE WHERE telegram_id = $1", uid)
+        except Exception as e:
+            log(f"evening {uid}: {e}")
+        await asyncio.sleep(0.05)
+    return sent
+
+
+@dp.callback_query(F.data.startswith("ev:"))
+async def evening_answer(q: CallbackQuery):
+    try:
+        _, rid, ans = q.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        await q.answer()
+        return
+    await q.answer()
+    if ans not in ("match", "miss"):
+        return
+    p = await db()
+    ok = await p.fetchval("UPDATE readings SET followup = $3 WHERE id = $1 AND telegram_id = $2 RETURNING 1",
+                          rid, q.from_user.id, ans)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if not ok:
+        return
+    track(q.from_user.id, "push_clicked", {"kind": "evening", "answer": ans})
+    track(q.from_user.id, "daily_feedback", {"answer": ans, "reading": rid})
+    user = await get_user(q.from_user.id) or {}
+    lang = ulang(user)
+    kb = None if is_minor(user) and not (user.get("free_preset") or 0) else InlineKeyboardMarkup(inline_keyboard=[[
+        app_btn(tr("btn_preset_tomorrow", lang), open="preset", **{"from": "evening"})]])
+    await q.message.answer(tr("evening_thanks_" + ans, lang), reply_markup=kb)
