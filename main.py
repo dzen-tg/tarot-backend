@@ -1210,6 +1210,16 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json=payload, timeout=60.0,
         )
+        if r.status_code == 400 and "json_validate_failed" in r.text:
+            # gpt-oss иногда отдаёт пустой или неровный JSON, и Groq сам отклоняет ответ.
+            # Сразу повторяем без строгого формата: JSON достанем из текста сами (extract_json_from_text).
+            log("Groq: формат JSON не прошёл проверку Groq – повторяем без строгого формата")
+            payload.pop("response_format", None)
+            r = await http.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json=payload, timeout=60.0,
+            )
         if r.status_code != 200:
             log(f"⚠️ Groq ошибка {r.status_code}: {r.text[:200]}")
             return None
@@ -4929,6 +4939,8 @@ FATE_REFRESH_EVERY = 600   # секунд до повтора, если не в�
 FATE_REFRESH_BATCH = 30    # текстов за проход, по одному раз в несколько секунд – чтобы не упереться в лимиты ИИ
 FATE_REFRESH_PAUSE = int(os.getenv("FATE_REFRESH_PAUSE", "30"))  # секунд между текстами: лимит Groq общий с раскладами
 _fate_scan_done = False    # проверка старых текстов на мужской род и опечатки – один раз после запуска
+FATE_MAX_TRIES = 3         # столько неудачных проходов на один старый текст, потом оставляем прежний до перезапуска
+_fate_fails: dict = {}     # telegram_id → сколько раз не удалось переписать
 
 
 async def _mark_bad_fate_texts(p) -> int:
@@ -4963,15 +4975,19 @@ async def refresh_fate_codes() -> int:
     # random(): текст, который ИИ раз за разом не может написать без ошибок, не блокирует очередь
     # сначала те, кто ждёт Код судьбы прямо сейчас, остальные – в случайном порядке
     rows = await p.fetch("""
-        SELECT telegram_id, birth_date, lang FROM users
+        SELECT telegram_id, birth_date, lang, fate_pending FROM users
         WHERE fate_code_text IS NOT NULL AND personality_arcana IS NULL AND birth_date IS NOT NULL
         ORDER BY fate_pending DESC, random() LIMIT $1
-    """, FATE_REFRESH_BATCH)
+    """, FATE_REFRESH_BATCH * 3)
+    # кто ждёт текст в чате – всегда; остальные – пока не исчерпали попытки (иначе ИИ дёргается каждые 10 минут)
+    rows = [r for r in rows if r["fate_pending"] or _fate_fails.get(r["telegram_id"], 0) < FATE_MAX_TRIES]
+    rows = rows[:FATE_REFRESH_BATCH]
     done, fails = 0, 0
     for r in rows:
         LANG.set(r["lang"] or "ru")
         text = await generate_fate_code(r["birth_date"], fallback=False)
         if not text:  # ИИ недоступен или текст не прошёл проверки – старый не затираем
+            _fate_fails[r["telegram_id"]] = _fate_fails.get(r["telegram_id"], 0) + 1
             fails += 1
             if fails >= 3:   # три неудачи подряд – скорее всего лимит, попробуем в следующий проход
                 break
