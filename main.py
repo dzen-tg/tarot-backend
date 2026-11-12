@@ -4747,6 +4747,10 @@ def arcana_typos(text: str) -> list:
     bad = []
     for tok in set(re.findall(r"[А-ЯЁ][а-яё]{4,}", text)):
         low = tok.lower().replace("ё", "е")
+        # слово само является названием аркана или его падежной формой («Император», «Императора») – не опечатка,
+        # даже если похоже на соседнее название («Императрица»)
+        if any(abs(len(low) - len(w)) <= 2 and low.startswith(w.lower()[:max(3, len(w) - 2)]) for w in _ARCANA_WORDS):
+            continue
         for w in _ARCANA_WORDS:
             wl = w.lower()
             if low[:2] != wl[:2] or abs(len(low) - len(wl)) > 2 or low.startswith(wl[:max(3, len(wl) - 2)]):
@@ -4761,11 +4765,12 @@ def _fate_validator(parsed: dict) -> Optional[dict]:
     """Длина 100–300 слов, первый абзац начинается с аркана личности, второй – с главной энергии,
     чтобы было видно, какой абзац про какой аркан."""
     text = clean_ai_text(str(parsed.get("text") or "")).replace("**", "").strip()
-    paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
+    # абзацы короткие, внутри них переносов нет: модель иногда ставит один перенос вместо пустой строки
+    paras = [t.strip() for t in re.split(r"\n+", text) if t.strip()]
     lead1, lead2 = fate_leads()
     words = len(text.split())
     masc = FATE_MASC_RE.search(text)
-    why = ("абзацы или подписи" if len(paras) < 3 or not paras[0].startswith(lead1) or not paras[1].startswith(lead2)
+    why = (f"абзацы или подписи (абзацев: {len(paras)}, начало: {text[:70]!r})" if len(paras) < 3 or not paras[0].startswith(lead1) or not paras[1].startswith(lead2)
            else "«Овнам…»" if FATE_SIGN_PLURAL_RE.search(text)
            else "нет вопроса в конце" if not paras[-1].rstrip().endswith("?")
            else f"опечатка в аркане: {arcana_typos(text)}" if arcana_typos(text)
