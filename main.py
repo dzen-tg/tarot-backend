@@ -21,6 +21,7 @@ import hashlib
 import math
 import random
 import asyncio
+import contextvars
 import re
 import time
 import unicodedata
@@ -1186,8 +1187,25 @@ def _clean_reading(parsed: dict) -> dict:
 # Низкоуровневые вызовы: возвращают сырой dict из JSON-ответа модели
 # (или None, если ответ оборван/не распарсился).
 # ---------------------------------------------------------------------
+GROQ_TRIES = max(1, int(os.getenv("GROQ_TRIES", "2")))   # попыток Groq на один ответ человеку (фоновые задачи – всегда 1)
+BACKGROUND = contextvars.ContextVar("background", default=False)   # True в фоновых циклах: без повторов
+_groq_blocked_until = 0.0   # лимит Groq исчерпан – до этого времени к нему не ходим
+
+
+def _groq_note_limit(body: str):
+    """429 от Groq: запоминаем, на сколько он просит подождать («try again in 12m34.5s»), и не шлём запросы зря."""
+    global _groq_blocked_until
+    m = re.search(r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", body)
+    wait = 0.0
+    if m:
+        wait = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0)
+    wait = min(max(wait, 30.0), 3600.0)   # не дольше часа за раз: потом проверим снова
+    _groq_blocked_until = time.monotonic() + wait
+    log(f"⏸ Groq: лимит исчерпан, пауза {int(wait)} с")
+
+
 async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float = 0.8) -> Optional[dict]:
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEY or time.monotonic() < _groq_blocked_until:
         return None
     payload = {
         "model": GROQ_MODEL,
@@ -1222,6 +1240,8 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
             )
         if r.status_code != 200:
             log(f"⚠️ Groq ошибка {r.status_code}: {r.text[:200]}")
+            if r.status_code == 429:
+                _groq_note_limit(r.text)
             return None
         choice = r.json()["choices"][0]
         if choice.get("finish_reason") == "length":
@@ -1291,13 +1311,13 @@ async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
     """Groq → (повтор Groq) → Gemini. validate(dict) -> dict|None отбраковывает неполные ответы.
     temperature=None – как раньше (Groq 0.8, Gemini по умолчанию); редактору передаём ниже, чтобы не менял смысл."""
     g_temp = 0.8 if temperature is None else temperature
+    if not HUMANIZE_ENABLED and system_prompt is not HUMANIZER_PROMPT:
+        system_prompt += INLINE_STYLE   # редактор выключен – правила стиля в том же запросе
     if LANG.get() == "en":
         system_prompt += EN_RULE
-    attempts = [
-        lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp),
-        lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp),
-        lambda: _gemini_json(system_prompt, user_prompt, max_tokens, schema, temperature),
-    ]
+    tries = 1 if BACKGROUND.get() else GROQ_TRIES
+    attempts = [lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp) for _ in range(tries)]
+    attempts.append(lambda: _gemini_json(system_prompt, user_prompt, max_tokens, schema, temperature))
     for attempt in attempts:
         parsed = await attempt()
         if not parsed:
@@ -1315,7 +1335,18 @@ async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
 # Правила – сжатая версия гайда «Signs of AI writing» (скилл humanizer).
 # Каждое поле правится отдельно; если правка не прошла проверку – остаётся исходный текст.
 # ---------------------------------------------------------------------
-HUMANIZE_ENABLED = os.getenv("HUMANIZE", "1") == "1"
+# Второй запрос к ИИ на каждый ответ (редактор). По умолчанию выключен: он удваивает расход дневного лимита Groq.
+# Вместо него короткие правила стиля (INLINE_STYLE) добавляются в основной запрос. HUMANIZE=1 в Render – вернуть редактора.
+HUMANIZE_ENABLED = os.getenv("HUMANIZE", "0") == "1"
+INLINE_STYLE = (
+    "\n\nСТИЛЬ ТЕКСТА (как живой таролог в переписке, не как машинный текст):\n"
+    "- Без конструкций «не X, а Y», «это не просто X», «дело не в X»: говори прямо.\n"
+    "- Без разгонов («Важно понимать», «Стоит отметить», «Итак») и без афоризмов («ключ к…», «истинная сила в…»).\n"
+    "- Без штампов и пафоса: «ключевой», «уникальный», «трансформация», «потенциал», «поворотный момент», «новая глава».\n"
+    "- Не добавляй «точно», «обязательно», «наверняка». Одна оговорка вместо нескольких подряд.\n"
+    "- О человеке пиши без мужского и женского рода: «тебе хочется», а не «ты готов», «ты хотел».\n"
+    "- Чередуй короткие и длинные предложения. Тире только там, где без него нельзя."
+)
 HUMANIZE_TIMEOUT = float(os.getenv("HUMANIZE_TIMEOUT", "25"))
 HUMANIZE_TEMPERATURE = float(os.getenv("HUMANIZE_TEMPERATURE", "0.35"))
 # Редактор не должен добавлять обещаний, которых не было в исходном тексте
@@ -4526,6 +4557,7 @@ async def get_horoscope(sign: str, ws: date, generate: bool = True) -> Optional[
 async def horoscope_loop():
     """Каждые 10 минут: если у текущей недели (по Алматы) нет каких-то знаков – пишем их по одному.
     Новая неделя начинается в полночь на понедельник – тексты готовы к утренней рассылке."""
+    BACKGROUND.set(True)
     await pool_ready.wait()
     await asyncio.sleep(120)
     while True:
@@ -4957,6 +4989,11 @@ FATE_REFRESH_BATCH = 30    # текстов за проход, по одному
 FATE_REFRESH_PAUSE = int(os.getenv("FATE_REFRESH_PAUSE", "30"))  # секунд между текстами: лимит Groq общий с раскладами
 _fate_scan_done = False    # проверка старых текстов на мужской род и опечатки – один раз после запуска
 FATE_MAX_TRIES = 3         # столько неудачных проходов на один старый текст, потом оставляем прежний до перезапуска
+# Сколько СТАРЫХ текстов переписывать в фоне за сутки (каждый – запрос к ИИ из общего дневного лимита).
+# 0 (по умолчанию) – готовые тексты не трогаем и не помечаем к переписыванию: в фоне пишем только тем,
+# кто ждёт Код судьбы в чате после сбоя ИИ. Больше нуля – вернуть фоновое переписывание.
+FATE_REFRESH_DAILY = int(os.getenv("FATE_REFRESH_DAILY", "0"))
+_fate_day = [None, 0]      # [дата, сколько старых текстов уже пробовали сегодня]
 FATE_MAX_TRIES_PENDING = 12   # для тех, кто ждёт текст в чате: дольше, но тоже не бесконечно
 _fate_fails: dict = {}     # telegram_id → сколько раз не удалось переписать
 
@@ -4980,15 +5017,17 @@ async def refresh_fate_codes() -> int:
     p = await db()
     await p.execute("UPDATE users SET fate_code_text = replace(fate_code_text, '\u2014', '–') "
                     "WHERE fate_code_text LIKE '%\u2014%'")
-    await p.execute("UPDATE users SET personality_arcana = NULL "
-                    "WHERE personality_arcana IS NOT NULL AND fate_code_text ~ $1", FATE_SIGN_PLURAL_SQL)
+    if FATE_REFRESH_DAILY > 0:
+        await p.execute("UPDATE users SET personality_arcana = NULL "
+                        "WHERE personality_arcana IS NOT NULL AND fate_code_text ~ $1", FATE_SIGN_PLURAL_SQL)
     # запасные тексты, сохранённые, когда ИИ был недоступен, и опечатка «Иерерафант» – тоже переписать
     await p.execute("UPDATE users SET personality_arcana = NULL WHERE personality_arcana IS NOT NULL "
                     "AND (strpos(fate_code_text, $1) > 0 OR strpos(fate_code_text, 'Иерерафант') > 0)",
                     FATE_FALLBACK_MARK)
     global _fate_scan_done
     if not _fate_scan_done:
-        await _mark_bad_fate_texts(p)
+        if FATE_REFRESH_DAILY > 0:
+            await _mark_bad_fate_texts(p)
         _fate_scan_done = True
     # random(): текст, который ИИ раз за разом не может написать без ошибок, не блокирует очередь
     # сначала те, кто ждёт Код судьбы прямо сейчас, остальные – в случайном порядке
@@ -5000,9 +5039,16 @@ async def refresh_fate_codes() -> int:
     # кто ждёт текст в чате – всегда; остальные – пока не исчерпали попытки (иначе ИИ дёргается каждые 10 минут)
     rows = [r for r in rows if _fate_fails.get(r["telegram_id"], 0)
             < (FATE_MAX_TRIES_PENDING if r["fate_pending"] else FATE_MAX_TRIES)]
-    rows = rows[:FATE_REFRESH_BATCH]
+    today = datetime.now(timezone.utc).date()
+    if _fate_day[0] != today:
+        _fate_day[0], _fate_day[1] = today, 0
+    left = max(0, FATE_REFRESH_DAILY - _fate_day[1])
+    pending_rows = [r for r in rows if r["fate_pending"]]
+    rows = (pending_rows + [r for r in rows if not r["fate_pending"]][:left])[:FATE_REFRESH_BATCH]
     done, fails = 0, 0
     for r in rows:
+        if not r["fate_pending"]:
+            _fate_day[1] += 1
         LANG.set(r["lang"] or "ru")
         text = await generate_fate_code(r["birth_date"], fallback=False)
         if not text:  # ИИ недоступен или текст не прошёл проверки – старый не затираем
@@ -5046,6 +5092,7 @@ async def deliver_pending_fate(uid: int):
 async def fate_refresh_loop():
     """Фоновое переписывание Кодов судьбы: старые и битые тексты, а также тех, кто ждёт текст после сбоя ИИ.
     Работает всё время; если кто-то ждёт – просыпается раньше (через минуту, чтобы лимит ИИ успел сброситься)."""
+    BACKGROUND.set(True)
     await pool_ready.wait()
     await asyncio.sleep(60)
     while True:
