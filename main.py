@@ -56,6 +56,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # llama-3.3-70b-versatile отключён Groq 16.08.2026 (404 model_not_found) – замена gpt-oss-120b
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Вторая модель Groq: к ней идём последней (основная Groq → Gemini → эта). У каждой модели Groq свой дневной лимит,
+# поэтому она выручает, когда лимит основной исчерпан. Пустая строка – не использовать.
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b").strip()
 GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://tarot-frontend-wine.vercel.app")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Tarot_answer_question_bot")
@@ -1189,26 +1192,30 @@ def _clean_reading(parsed: dict) -> dict:
 # ---------------------------------------------------------------------
 GROQ_TRIES = max(1, int(os.getenv("GROQ_TRIES", "2")))   # попыток Groq на один ответ человеку (фоновые задачи – всегда 1)
 BACKGROUND = contextvars.ContextVar("background", default=False)   # True в фоновых циклах: без повторов
-_groq_blocked_until = 0.0   # лимит Groq исчерпан – до этого времени к нему не ходим
+_groq_blocked: dict = {}    # модель → до какого времени к ней не ходим (лимит исчерпан или модель отключена)
+_gemini_blocked: dict = {}  # то же для моделей Gemini
 
 
-def _groq_note_limit(body: str):
-    """429 от Groq: запоминаем, на сколько он просит подождать («try again in 12m34.5s»), и не шлём запросы зря."""
-    global _groq_blocked_until
+def _groq_note_limit(body: str, model: str = ""):
+    """429 от Groq: запоминаем, на сколько он просит подождать («try again in 12m34.5s»), и не шлём запросы зря.
+    Лимит у каждой модели свой, поэтому пауза – только для этой модели."""
+    model = model or GROQ_MODEL
     m = re.search(r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", body)
     wait = 0.0
     if m:
         wait = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0)
     wait = min(max(wait, 30.0), 3600.0)   # не дольше часа за раз: потом проверим снова
-    _groq_blocked_until = time.monotonic() + wait
-    log(f"⏸ Groq: лимит исчерпан, пауза {int(wait)} с")
+    _groq_blocked[model] = time.monotonic() + wait
+    log(f"⏸ Groq {model}: лимит исчерпан, пауза {int(wait)} с")
 
 
-async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float = 0.8) -> Optional[dict]:
-    if not GROQ_API_KEY or time.monotonic() < _groq_blocked_until:
+async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float = 0.8,
+                     model: str = "") -> Optional[dict]:
+    model = model or GROQ_MODEL
+    if not GROQ_API_KEY or time.monotonic() < _groq_blocked.get(model, 0.0):
         return None
     payload = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt + "\n\nОТВЕЧАЙ ТОЛЬКО JSON без markdown-блоков (без ```json). Только чистый JSON."},
             {"role": "user", "content": user_prompt},
@@ -1217,7 +1224,7 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
-    if GROQ_MODEL.startswith("openai/gpt-oss"):
+    if model.startswith("openai/gpt-oss"):
         # gpt-oss «думает» перед ответом; low – быстрее и не съедает лимит токенов на рассуждения
         payload["reasoning_effort"] = "low"
         payload["include_reasoning"] = False
@@ -1239,9 +1246,11 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
                 json=payload, timeout=60.0,
             )
         if r.status_code != 200:
-            log(f"⚠️ Groq ошибка {r.status_code}: {r.text[:200]}")
+            log(f"⚠️ Groq {model} ошибка {r.status_code}: {r.text[:200]}")
             if r.status_code == 429:
-                _groq_note_limit(r.text)
+                _groq_note_limit(r.text, model)
+            elif r.status_code == 404:   # модель отключена – час к ней не ходим
+                _groq_blocked[model] = time.monotonic() + 3600
             return None
         choice = r.json()["choices"][0]
         if choice.get("finish_reason") == "length":
@@ -1249,7 +1258,7 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
             return None
         content = choice["message"].get("content") or ""
         parsed = extract_json_from_text(content)
-        log(f"Groq {time.monotonic() - t0:.1f}s, json={'ok' if parsed else 'fail'}")
+        log(f"Groq{'' if model == GROQ_MODEL else ' ' + model} {time.monotonic() - t0:.1f}s, json={'ok' if parsed else 'fail'}")
         if not parsed:
             log(f"Groq: не разобрали ответ ({len(content)} симв., finish={choice.get('finish_reason')}): {content[:200]!r}")
         return parsed
@@ -1263,6 +1272,8 @@ async def _gemini_json(system_prompt: str, user_prompt: str, max_tokens: int, sc
     if not GEMINI_API_KEY:
         return None
     for model in GEMINI_MODELS:
+        if time.monotonic() < _gemini_blocked.get(model, 0.0):
+            continue
         gen_cfg = {"responseMimeType": "application/json", "maxOutputTokens": max_tokens + 1000}
         if temperature is not None:
             gen_cfg["temperature"] = temperature
@@ -1290,6 +1301,9 @@ async def _gemini_json(system_prompt: str, user_prompt: str, max_tokens: int, sc
                     return parsed
             else:
                 log(f"⚠️ Gemini {model} ошибка {r.status_code}: {r.text[:150]}")
+                if r.status_code in (404, 429):   # модель отключена или квота исчерпана – пауза, чтобы не тратить время
+                    _gemini_blocked[model] = time.monotonic() + (3600 if r.status_code == 404 else 600)
+                    log(f"⏸ Gemini {model}: пауза {60 if r.status_code == 404 else 10} мин")
         except Exception as e:
             log(f"⚠️ Gemini {model} исключение: {type(e).__name__}: {e}")
     return None
@@ -1318,6 +1332,8 @@ async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
     tries = 1 if BACKGROUND.get() else GROQ_TRIES
     attempts = [lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp) for _ in range(tries)]
     attempts.append(lambda: _gemini_json(system_prompt, user_prompt, max_tokens, schema, temperature))
+    if GROQ_FALLBACK_MODEL and GROQ_FALLBACK_MODEL != GROQ_MODEL:   # вторая модель Groq – последней, после Gemini
+        attempts.append(lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp, GROQ_FALLBACK_MODEL))
     for attempt in attempts:
         parsed = await attempt()
         if not parsed:
@@ -1986,18 +2002,23 @@ def _daily_validator(card: dict):
     def validate(parsed: dict) -> Optional[dict]:
         f = {k: clean_ai_text(str(parsed.get(k) or "")).replace("**", "").replace("\n", " ").strip()
              for k in DAILY_SCHEMA["required"]}
-        if not all(f.values()):
-            return None
         msg = f["message"].lower().replace("ё", "е")
-        if len(f["message"].split()) > 15 or any(w[:-1] in msg for w in words):
-            return None                                   # послание до 15 слов и без названия карты
-        if not 2 <= _sentences(f["body"]) <= 3 or not f["question"].endswith("?"):
-            return None
-        if sum(len(v) for v in f.values()) > DAILY_MAX_CHARS:
-            return None
         joined = " ".join(f.values())
-        if MASC_RE.search(joined) or DAILY_PICTURE_RE.search(joined):
-            return None                                   # без мужского рода и без описания картинки
+        total = sum(len(v) for v in f.values())
+        masc = MASC_RE.search(joined)
+        pic = DAILY_PICTURE_RE.search(joined)
+        why = (f"пустые поля: {[k for k, v in f.items() if not v]}" if not all(f.values())
+               else f"послание длиннее 15 слов ({len(f['message'].split())})" if len(f["message"].split()) > 15
+               else "в послании название карты" if any(w[:-1] in msg for w in words)
+               else f"в тексте {_sentences(f['body'])} предложений вместо 1–4" if not 1 <= _sentences(f["body"]) <= 4
+               else "вопрос без «?»" if not f["question"].endswith("?")
+               else f"длина {total} знаков, предел {DAILY_MAX_CHARS}" if total > DAILY_MAX_CHARS
+               else f"мужской род: «{masc.group(0)}»" if masc
+               else f"описание картинки: «{pic.group(0)}»" if pic
+               else "")
+        if why:
+            log(f"Карта дня не прошла проверку – {why}")
+            return None
         return f
     return validate
 
