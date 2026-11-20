@@ -1193,6 +1193,33 @@ def _clean_reading(parsed: dict) -> dict:
 GROQ_TRIES = max(1, int(os.getenv("GROQ_TRIES", "2")))   # попыток Groq на один ответ человеку (фоновые задачи – всегда 1)
 BACKGROUND = contextvars.ContextVar("background", default=False)   # True в фоновых циклах: без повторов
 _groq_blocked: dict = {}    # модель → до какого времени к ней не ходим (лимит исчерпан или модель отключена)
+# Свой учёт токенов: бесплатный Groq даёт 8000 токенов в минуту на модель. Раньше утренняя рассылка
+# выбирала их за 15 секунд и ловила 429. Теперь перед запросом смотрим, сколько потрачено за минуту.
+GROQ_TPM = int(os.getenv("GROQ_TPM", "7200"))   # чуть ниже лимита 8000 – запас на неточную оценку
+GROQ_WAIT = contextvars.ContextVar("groq_wait", default=False)   # True в рассылках и фоне: можно подождать
+_groq_spent: dict = {}      # модель → список [время, токены] за последнюю минуту
+
+
+def _groq_used(model: str) -> int:
+    now = time.monotonic()
+    items = [x for x in _groq_spent.get(model, []) if now - x[0] < 60]
+    _groq_spent[model] = items
+    return sum(x[1] for x in items)
+
+
+async def _groq_take(model: str, est: int) -> Optional[list]:
+    """Занять место под запрос в минутном лимите модели. Рассылки и фон ждут, сколько нужно (до минуты);
+    ответ человеку не ждёт: лимит занят – бот сразу берёт другую модель."""
+    limit_wait = 65.0 if (GROQ_WAIT.get() or BACKGROUND.get()) else 0.0
+    t_end = time.monotonic() + limit_wait
+    while _groq_used(model) + est > GROQ_TPM:
+        if time.monotonic() >= t_end:
+            log(f"⏸ Groq {model}: минутный лимит занят, берём другую модель")
+            return None
+        await asyncio.sleep(2)
+    slot = [time.monotonic(), est]
+    _groq_spent.setdefault(model, []).append(slot)
+    return slot
 _gemini_blocked: dict = {}  # то же для моделей Gemini
 
 
@@ -1214,6 +1241,11 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
     model = model or GROQ_MODEL
     if not GROQ_API_KEY or time.monotonic() < _groq_blocked.get(model, 0.0):
         return None
+    # оценка: ~2,5 знака на токен у русского текста + ответ с «размышлением»
+    est = int((len(system_prompt) + len(user_prompt)) / 2.5) + min(max_tokens, 600)
+    slot = await _groq_take(model, est)
+    if slot is None:
+        return None
     payload = {
         "model": model,
         "messages": [
@@ -1227,7 +1259,8 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
     if model.startswith("openai/gpt-oss"):
         # gpt-oss «думает» перед ответом; low – быстрее и не съедает лимит токенов на рассуждения
         payload["reasoning_effort"] = "low"
-        payload["include_reasoning"] = False
+        # «размышление» просим вернуть: иногда модель кладёт весь ответ туда, а основной текст пустой
+        payload["include_reasoning"] = True
     t0 = time.monotonic()
     try:
         r = await http.post(
@@ -1235,16 +1268,27 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json=payload, timeout=60.0,
         )
+        try:
+            slot[1] = int(r.json().get("usage", {}).get("total_tokens") or slot[1])   # фактический расход
+        except Exception:
+            pass
         if r.status_code == 400 and "json_validate_failed" in r.text:
             # gpt-oss иногда отдаёт пустой или неровный JSON, и Groq сам отклоняет ответ.
             # Сразу повторяем без строгого формата: JSON достанем из текста сами (extract_json_from_text).
             log("Groq: формат JSON не прошёл проверку Groq – повторяем без строгого формата")
             payload.pop("response_format", None)
+            slot2 = await _groq_take(model, est)
+            if slot2 is None:
+                return None
             r = await http.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json=payload, timeout=60.0,
             )
+            try:
+                slot2[1] = int(r.json().get("usage", {}).get("total_tokens") or slot2[1])
+            except Exception:
+                pass
         if r.status_code != 200:
             log(f"⚠️ Groq {model} ошибка {r.status_code}: {r.text[:200]}")
             if r.status_code == 429:
@@ -1258,6 +1302,11 @@ async def _groq_json(system_prompt: str, user_prompt: str, max_tokens: int, temp
             return None
         content = choice["message"].get("content") or ""
         parsed = extract_json_from_text(content)
+        if not parsed and choice["message"].get("reasoning"):
+            # основной ответ пустой – JSON часто лежит в «размышлении» модели
+            parsed = extract_json_from_text(choice["message"]["reasoning"])
+            if parsed:
+                log(f"Groq {model}: ответ взят из «размышления» модели")
         log(f"Groq{'' if model == GROQ_MODEL else ' ' + model} {time.monotonic() - t0:.1f}s, json={'ok' if parsed else 'fail'}")
         if not parsed:
             log(f"Groq: не разобрали ответ ({len(content)} симв., finish={choice.get('finish_reason')}): {content[:200]!r}")
@@ -2524,6 +2573,7 @@ async def send_returns() -> int:
 async def push_loop():
     if not PUSH_ENABLED:
         return
+    GROQ_WAIT.set(True)   # утренние карты подождут места в минутном лимите Groq, а не получат 429
     await pool_ready.wait()
     while True:
         try:
