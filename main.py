@@ -2837,6 +2837,9 @@ async def get_user_profile(authorization: str = Header(None)):
     # Этап 4: новичок до первого действия – упрощённый главный экран
     out["fresh"] = not user.get("fate_code_text") and not await p.fetchval(
         "SELECT 1 FROM readings WHERE telegram_id = $1 AND opened LIMIT 1", uid)
+    # окно энергообмена показываем один раз – в приложении или в чате
+    out["exchange_shown"] = bool(await p.fetchval(
+        "SELECT 1 FROM events WHERE telegram_id = $1 AND name = 'exchange_shown' LIMIT 1", uid))
     return out
 
 
@@ -3184,7 +3187,9 @@ CLIENT_EVENTS = {"card_full_read", "paywall_shown", "payment_started", "share_cl
                  "store_open", "upsell_click", "clarify_click", "share_click", "story_share", "spread_open",
                  "sub_click", "pay_start", "fate_cta_free", "fate_cta_paid", "fate_open", "today_open",
                  "sky_viewed", "horoscope_from_broadcast", "marathon_cta_clicked",
-                 "compat_shared", "paid_open"}
+                 "compat_shared", "paid_open",
+                 # окно энергообмена после последнего бесплатного расклада
+                 "exchange_shown", "exchange_pay", "exchange_share", "exchange_later"}
 
 
 @app.post("/api/user/source")
@@ -7813,6 +7818,30 @@ async def chat_question_draw(q: CallbackQuery):
     await send_card_message(q.message.chat.id, card, f"<b>{_h(card_title(card))}</b>")
     kb = InlineKeyboardMarkup(inline_keyboard=[[app_btn(tr("btn_open_reading", lang), r=rid)]]) if rid else None
     await bot.send_message(q.message.chat.id, md_html(text)[:4000], parse_mode="HTML", reply_markup=kb)
+    if mode.startswith("free"):
+        await maybe_send_exchange(q.message.chat.id, uid)
+
+
+async def maybe_send_exchange(chat_id: int, uid: int):
+    """Энергообмен: бесплатные расклады закончились – один раз предлагаем пополнить Энергию или поделиться с другом."""
+    user = await get_user(uid) or {}
+    if (user.get("free_readings") or 0) > 0 or (user.get("free_preset") or 0) > 0 or (user.get("purchases") or 0) > 0:
+        return
+    if is_minor(user) or is_admin(user):
+        return
+    p = await db()
+    if await p.fetchval("SELECT 1 FROM events WHERE telegram_id = $1 AND name = 'exchange_shown' LIMIT 1", uid):
+        return
+    await log_event(uid, "exchange_shown", {"via": "chat"})   # сразу, чтобы второе окно не ушло параллельно
+    lang = ulang(user)
+    link = ref_link(uid)
+    share = "https://t.me/share/url?url=" + urllib.parse.quote(link) + "&text=" + urllib.parse.quote(tr("exchange_share_text", lang))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [app_btn(tr("btn_exchange_pay", lang), open="store", **{"from": "exchange"})],
+        [InlineKeyboardButton(text=tr("btn_exchange_share", lang), url=share)],
+    ])
+    await asyncio.sleep(3)
+    await bot.send_message(chat_id, tr("exchange_text", lang, bonus=REF_BONUS), reply_markup=kb)
 
 
 # =====================================================================

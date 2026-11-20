@@ -99,6 +99,22 @@ TEXTS = {
         "en": "Paid spreads are available from 18. The card of the day, Fate Code and one dream a day stay free.",
     },
 
+    # ── Энергообмен: бесплатные расклады закончились ──
+    "exchange_text": {
+        "ru": "🔮 Бесплатные расклады закончились.\n\nЧтобы был энергообмен, за ответ карт нужно отдать что-то взамен: "
+              "пополнить Энергию или поделиться Посланием Таро с другом – это тоже энергообмен. "
+              "Другу – {bonus} Энергии в подарок.",
+        "en": "🔮 Your free readings are used up.\n\nFor an energy exchange, the cards' answer needs something in return: "
+              "top up your Energy or share Tarot Message with a friend – that is an exchange too. "
+              "Your friend gets {bonus} Energy as a gift.",
+    },
+    "btn_exchange_pay": {"ru": "⚡ Пополнить Энергию", "en": "⚡ Top up Energy"},
+    "btn_exchange_share": {"ru": "💌 Поделиться с другом", "en": "💌 Share with a friend"},
+    "exchange_share_text": {
+        "ru": "🔮 Послание Таро в Telegram: первый расклад бесплатно и Энергия в подарок по моей ссылке.",
+        "en": "🔮 Tarot Message in Telegram: your first reading is free, plus gift Energy with my link.",
+    },
+
     # ── Карта дня в чате (этапы 3 и 6) ──
     "daily_push_caption": {
         "ru": "{sky}<b>Карта дня – {card}</b>\n\n<i>{message}</i>",
