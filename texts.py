@@ -186,7 +186,22 @@ TEXTS = {
 }
 
 
+import json as _json
+import os as _os
+
+# Переводы на остальные языки – в i18n_bot.json (язык → {русская фраза: перевод}), чтобы этот файл оставался коротким
+try:
+    _I18N = _json.loads(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "i18n_bot.json"),
+                             encoding="utf-8").read())
+except Exception:
+    _I18N = {}
+
+
 def tr(key: str, lang: str = "ru", **kw) -> str:
     item = TEXTS.get(key) or {}
-    text = item.get(lang) or item.get("ru") or key
-    return text.format(**kw) if kw else text
+    ru = item.get("ru") or key
+    text = item.get(lang) or (_I18N.get(lang) or {}).get(ru) or (item.get("en") if lang != "ru" else None) or ru
+    try:
+        return text.format(**kw) if kw else text
+    except (KeyError, IndexError):   # перевод испортил подстановку – лучше русский, чем ошибка
+        return ru.format(**kw) if kw else ru

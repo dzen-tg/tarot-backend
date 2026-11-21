@@ -473,6 +473,8 @@ async def init_schema():
             # дата вечернего вопроса о карте дня, ждёт ли человек Код судьбы в чате
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboard_step SMALLINT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang VARCHAR(8) DEFAULT NULL",
+            # Язык выбран вручную в мини-аппе – не перезаписываем его языком Telegram
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang_manual BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_clarify INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS adult_confirmed BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_msgs_total INTEGER DEFAULT 0",
@@ -828,7 +830,7 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
                         balance = balance + $4,
                         move_gift_state = CASE WHEN $5 THEN 'given' ELSE move_gift_state END,
                         start_param = COALESCE(start_param, $6), source = COALESCE(source, $7),
-                        lang = COALESCE($8, lang)
+                        lang = CASE WHEN lang_manual THEN lang ELSE COALESCE($8, lang) END
                     WHERE telegram_id = $1 RETURNING *
                 """, uid, username, first_name, MOVE_GIFT if move_gift else 0, move_gift,
                     (ref_param or "")[:64] or None, source if (ref_param or "").lower().startswith("src_") else None,
@@ -1387,8 +1389,8 @@ async def call_ai(system_prompt: str, user_prompt: str, max_tokens: int = 2000,
     g_temp = 0.8 if temperature is None else temperature
     if not HUMANIZE_ENABLED and system_prompt is not HUMANIZER_PROMPT:
         system_prompt += INLINE_STYLE   # редактор выключен – правила стиля в том же запросе
-    if LANG.get() == "en":
-        system_prompt += EN_RULE
+    if LANG.get() != "ru":
+        system_prompt += lang_rule(LANG.get())
     tries = 1 if BACKGROUND.get() else GROQ_TRIES
     attempts = [lambda: _groq_json(system_prompt, user_prompt, max_tokens, g_temp) for _ in range(tries)]
     attempts.append(lambda: _gemini_json(system_prompt, user_prompt, max_tokens, schema, temperature))
@@ -1675,6 +1677,8 @@ PAREN_GENDER_RE = re.compile(r"[а-яё]\((а|ла|на|ая|ой)\)", re.IGNORE
 
 
 def _has_paren_gender(parsed: dict) -> bool:
+    if LANG.get() != "ru":
+        return False
     return bool(PAREN_GENDER_RE.search(json.dumps(parsed, ensure_ascii=False)))
 
 
@@ -1712,8 +1716,8 @@ def _make_validator(pre_selected_cards: list, min_cards: int, max_cards: int):
 
 
 def _card_name(card: dict) -> str:
-    if LANG.get() == "en" and isinstance(card.get("id"), int):
-        return card_name_en(card["id"])
+    if LANG.get() != "ru" and isinstance(card.get("id"), int):
+        return tr_ru(card["name"].replace("Старший Аркан: ", "")) or card_name_en(card["id"])
     return card["name"].replace("Старший Аркан: ", "")
 
 
@@ -2067,7 +2071,7 @@ def _daily_validator(card: dict):
         msg = f["message"].lower().replace("ё", "е")
         joined = " ".join(f.values())
         total = sum(len(v) for v in f.values())
-        masc = MASC_RE.search(joined)
+        masc = MASC_RE.search(joined) if LANG.get() == "ru" else None   # род – только для русского
         pic = DAILY_PICTURE_RE.search(joined)
         why = (f"пустые поля: {[k for k, v in f.items() if not v]}" if not all(f.values())
                else f"послание длиннее 15 слов ({len(f['message'].split())})" if len(f["message"].split()) > 15
@@ -2087,10 +2091,8 @@ def _daily_validator(card: dict):
 
 def daily_text(card: dict, f: dict, lang: str = "ru") -> str:
     """Поля карты дня → текст для истории и приложения. Заголовки ставит код."""
-    if (lang if lang != "ru" else LANG.get()) == "en":
-        heads = ("Card of the day", "What to notice", "Advice for today", "Question of the day")
-    else:
-        heads = ("Карта дня", "На что обратить внимание", "Совет дня", "Вопрос дня")
+    heads = (L("Карта дня", "Card of the day"), L("На что обратить внимание", "What to notice"),
+             L("Совет дня", "Advice for today"), L("Вопрос дня", "Question of the day"))
     return (f"**{heads[0]} – {card_title(card)}**\n\n{f['message']}\n\n{f['body']}\n\n"
             f"**{heads[1]}:** {f['attention']}\n\n**{heads[2]}:** {f['advice']}\n\n**{heads[3]}:** {f['question']}")
 
@@ -2157,20 +2159,7 @@ async def setup_bot():
     except Exception as e:
         log(f"⚠️ Не удалось установить вебхук: {e}")
     try:
-        await bot.set_my_commands([
-            BotCommand(command="start", description="🔮 Открыть Послание Таро"),
-            BotCommand(command="code", description="🔢 Мой Код судьбы"),
-            BotCommand(command="dream", description="🌙 Толкователь снов"),
-            BotCommand(command="marathon", description="🗓 Марафон «7 дней знаков Вселенной»"),
-            BotCommand(command="ref", description="🎁 Пригласить друга и получить энергию"),
-            BotCommand(command="daily", description="🌅 Карта дня каждое утро: вкл/выкл"),
-            BotCommand(command="subscription", description="🌟 Подписка «Послание+»"),
-            BotCommand(command="stop", description="🔕 Отключить напоминания"),
-            BotCommand(command="feedback", description="✍️ Отзыв или идея"),
-            BotCommand(command="support", description="💬 Поддержка"),
-            BotCommand(command="paysupport", description="💳 Вопросы по оплате"),
-            BotCommand(command="terms", description="📜 Условия использования"),
-        ])
+        asyncio.create_task(sync_bot_profile())
         await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🔮 Таро", web_app=WebAppInfo(url=FRONTEND_URL)))
     except Exception as e:
         log(f"⚠️ Команды/меню: {e}")
@@ -2750,6 +2739,7 @@ def profile_payload(user: dict, admin: bool) -> dict:
         "minor": is_minor(user),
         "adult_confirmed": bool(user.get("adult_confirmed")) or (user.get("purchases") or 0) > 0,
         "lang": ulang(user),
+        "lang_manual": bool(user.get("lang_manual")),
         "packs": [{"id": k, "energy": v[0]} for k, v in PACKS.items()],
         "streak": (user.get("streak") or 0) if (user.get("last_daily_date") or "") >= user_yesterday(user) else 0,
         "ref_link": ref_link(user["telegram_id"]),
@@ -3191,6 +3181,11 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
     if isinstance(hour, int) and not isinstance(hour, bool) and PUSH_HOUR_MIN <= hour <= PUSH_HOUR_MAX:
         await p.execute("UPDATE users SET push_hour = $2 WHERE telegram_id = $1", user["telegram_id"], hour)
         track(user["telegram_id"], "push_hour", {"hour": hour})
+    lang = payload.get("lang")
+    if isinstance(lang, str) and lang in SUPPORTED_LANGS:
+        await p.execute("UPDATE users SET lang = $2, lang_manual = TRUE WHERE telegram_id = $1",
+                        user["telegram_id"], lang)
+        track(user["telegram_id"], "lang_selected", {"lang": lang, "from": ulang(user)})
     return {"ok": True}
 
 
@@ -3669,13 +3664,16 @@ DISCLAIMER = ("🔮 Добро пожаловать в «Послание Тар
 # onboard_step: NULL – старый пользователь; 0 – поздоровались; 1 – первая карта вытянута;
 # 2 – Код судьбы показан (или пропущен); 3 – время карты дня выбрано, предложен расклад
 # =====================================================================
-RU_LANGS = {"ru", "uk", "be", "kk"}
+RU_LANGS = {"ru", "be"}   # белорусам – русский
+SUPPORTED_LANGS = {"ru", "uk", "kk", "en", "es", "ar", "uz", "tr", "pt", "de", "fr"}
 
 
 def lang_of(code: Optional[str]) -> str:
-    """Язык интерфейса по языку Telegram: русский для ru/uk/be/kk и если язык неизвестен, иначе английский."""
+    """Язык по языку Telegram: 11 языков; белорусский и пустой – русский, остальные – английский.й."""
     c = (code or "").lower()[:2]
-    return "ru" if not c or c in RU_LANGS else "en"
+    if not c or c in RU_LANGS:
+        return "ru"
+    return c if c in SUPPORTED_LANGS else "en"
 
 
 def ulang(user: Optional[dict]) -> str:
@@ -3766,7 +3764,7 @@ def _first_card_validator(card_name: str):
             return None
         words = [w.lower().replace("ё", "е") for w in card_name.split() if len(w) > 3]   # без «The», «of»
         low = msg.lower().replace("ё", "е")
-        if any(w[:-1] in low for w in words) or MASC_RE.search(msg + " " + text):
+        if any(w[:-1] in low for w in words) or (LANG.get() == "ru" and MASC_RE.search(msg + " " + text)):
             return None
         return {"message": msg, "text": text}
     return validate
@@ -3831,9 +3829,30 @@ def menu_kb(user: dict) -> InlineKeyboardMarkup:
 import contextvars
 
 LANG = contextvars.ContextVar("lang", default="ru")
-EN_RULE = ("\n\nLANGUAGE: the person speaks English. Write every text value in natural, warm English, address the "
-           "person as “you”. Use English Rider–Waite card names. Ignore any instruction above about Russian "
-           "grammar, «ты» or Russian phrasing; keep all other rules and the exact JSON keys.")
+LANG_NAMES = {"en": "English", "uk": "Ukrainian", "kk": "Kazakh (Cyrillic)", "es": "Spanish", "ar": "Arabic",
+              "uz": "Uzbek (Latin script)", "tr": "Turkish", "pt": "Brazilian Portuguese", "de": "German", "fr": "French"}
+
+
+def lang_rule(lang: str) -> str:
+    name = LANG_NAMES.get(lang, "English")
+    return (f"\n\nLANGUAGE: the person speaks {name}. Write every text value in natural, warm {name}, addressing the "
+            f"person informally as a friend. Use the standard {name} names of Rider–Waite cards. Ignore any instruction "
+            "above about Russian grammar, «ты» or Russian phrasing; keep all other rules and the exact JSON keys.")
+
+
+EN_RULE = lang_rule("en")
+# Переводы фраз бота: язык → {русская фраза: перевод}. Файл i18n_bot.json рядом с main.py.
+try:
+    BOT_I18N = json.loads(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "i18n_bot.json"),
+                               encoding="utf-8").read())
+except Exception:
+    BOT_I18N = {}
+
+
+def tr_ru(ru: str, lang: Optional[str] = None) -> Optional[str]:
+    """Перевод русской фразы на язык запроса или None, если перевода нет."""
+    lang = lang or LANG.get()
+    return None if lang == "ru" else (BOT_I18N.get(lang) or {}).get(ru)
 
 
 def set_lang(user: Optional[dict]) -> str:
@@ -3843,7 +3862,9 @@ def set_lang(user: Optional[dict]) -> str:
 
 
 def L(ru: str, en: str) -> str:
-    return en if LANG.get() == "en" else ru
+    if LANG.get() == "ru":
+        return ru
+    return tr_ru(ru) or en
 
 
 EN_MAJOR = ["The Fool", "The Magician", "The High Priestess", "The Empress", "The Emperor", "The Hierophant",
@@ -3876,12 +3897,12 @@ def card_name_en(card_id: int) -> str:
 
 
 def pos_title(position: str) -> str:
-    return EN_POSITIONS.get(position, position) if LANG.get() == "en" else position
+    return position if LANG.get() == "ru" else (tr_ru(position) or EN_POSITIONS.get(position, position))
 
 
 def arcana_title(n: int) -> str:
     """Название аркана Кода судьбы (1–22, 22 – Шут) на языке запроса."""
-    return EN_MAJOR[n % 22] if LANG.get() == "en" else ARCANA[n]
+    return ARCANA[n] if LANG.get() == "ru" else (tr_ru(ARCANA[n]) or EN_MAJOR[n % 22])
 
 
 def is_minor(user: dict) -> bool:
@@ -3921,6 +3942,38 @@ async def open_start_func(chat_id: int, uid: int, func: str) -> bool:
 
 
 @dp.update.outer_middleware()
+async def sync_bot_profile():
+    """Меню команд, описание и About бота на 11 языках: Telegram показывает их по языку человека,
+    для языков вне списка – английский (default). Ставим только то, что отличается, – так не упираемся в лимиты."""
+    try:
+        prof = json.loads(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_profile.json"),
+                               encoding="utf-8").read())
+    except Exception as e:
+        log(f"⚠️ bot_profile.json: {e}")
+        return
+    changed = 0
+    for lang, d in prof.items():
+        code = None if lang == "default" else lang
+        for attempt in range(3):
+            try:
+                cmds = [BotCommand(command=c, description=t) for c, t in d["commands"]]
+                cur = await bot.get_my_commands(language_code=code)
+                if [(c.command, c.description) for c in cur] != [(c.command, c.description) for c in cmds]:
+                    await bot.set_my_commands(cmds, language_code=code); changed += 1
+                if (await bot.get_my_description(language_code=code)).description != d["description"]:
+                    await bot.set_my_description(description=d["description"], language_code=code); changed += 1
+                if (await bot.get_my_short_description(language_code=code)).short_description != d["about"]:
+                    await bot.set_my_short_description(short_description=d["about"], language_code=code); changed += 1
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception as e:
+                log(f"⚠️ Профиль бота ({lang}): {e}")
+                break
+        await asyncio.sleep(0.3)
+    log(f"Профиль бота на {len(prof)} языках: обновлено {changed}")
+
+
 async def lang_middleware(handler, event, data):
     """Этап 7: язык человека для всех ответов бота и раскладов в этом обновлении."""
     u = data.get("event_from_user")
@@ -4790,11 +4843,14 @@ FATE_SAME_TEXT = "Оба аркана совпали: одна и та же эн
 
 def fate_header(d: date) -> str:
     f = fate_numbers(d)
-    if LANG.get() == "en":
-        lines = [f"Sign: {EN_ZODIAC.get(f['zodiac'], f['zodiac'])}", f"Life path number: {f['life_path']}",
-                 f"Personality arcana: {f['personality_num']}, {arcana_title(f['personality_num'])} – how people see you",
-                 f"Main energy: {f['arcana_num']}, {arcana_title(f['arcana_num'])} – your main theme and task"]
-        return "🔢 Your Fate Code\n\n" + "\n".join(lines)
+    if LANG.get() != "ru":
+        sign = tr_ru(f["zodiac"]) or EN_ZODIAC.get(f["zodiac"], f["zodiac"])
+        lines = [f"{L('Знак', 'Sign')}: {sign}", f"{L('Число судьбы', 'Life path number')}: {f['life_path']}",
+                 f"{L('Аркан личности', 'Personality arcana')}: {f['personality_num']}, {arcana_title(f['personality_num'])}"
+                 f" – {L('каким тебя видят люди', 'how people see you')}",
+                 f"{L('Главная энергия', 'Main energy')}: {f['arcana_num']}, {arcana_title(f['arcana_num'])}"
+                 f" – {L('твоя главная тема и задача', 'your main theme and task')}"]
+        return L("🔢 Твой Код судьбы", "🔢 Your Fate Code") + "\n\n" + "\n".join(lines)
     lines = [f"Знак: {f['zodiac']}", f"Число судьбы: {f['life_path']}",
              f"Аркан личности: {f['personality_num']}, {f['personality_name']} – каким тебя видят люди",
              f"Главная энергия: {f['arcana_num']}, {f['arcana_name']} – твоя главная тема и задача"]
@@ -4836,7 +4892,7 @@ FATE_LEADS_EN = ("Your personality arcana", "Your main energy")
 
 
 def fate_leads() -> tuple:
-    return FATE_LEADS_EN if LANG.get() == "en" else (FATE_PERSONALITY_LEAD, FATE_MAIN_LEAD)
+    return (L(FATE_PERSONALITY_LEAD, FATE_LEADS_EN[0]), L(FATE_MAIN_LEAD, FATE_LEADS_EN[1]))
 # «Овнам ты кажешься…» – ИИ путает знак человека с окружающими
 FATE_SIGN_PLURAL_RE = re.compile(r"\b(Овнам|Тельцам|Близнецам|Ракам|Львам|Девам|Весам|Скорпионам|Стрельцам|"
                                  r"Козерогам|Водолеям|Рыбам|другим [А-Я][а-я]+ам)\b")
@@ -4890,11 +4946,13 @@ def _fate_validator(parsed: dict) -> Optional[dict]:
     paras = [t.strip() for t in re.split(r"\n+", text) if t.strip()]
     lead1, lead2 = fate_leads()
     words = len(text.split())
-    masc = FATE_MASC_RE.search(text)
+    ru = LANG.get() == "ru"
+    masc = FATE_MASC_RE.search(text) if ru else None
+    typos = arcana_typos(text) if ru else []
     why = (f"абзацы или подписи (абзацев: {len(paras)}, начало: {text[:70]!r})" if len(paras) < 3 or not paras[0].startswith(lead1) or not paras[1].startswith(lead2)
            else "«Овнам…»" if FATE_SIGN_PLURAL_RE.search(text)
            else "нет вопроса в конце" if not paras[-1].rstrip().endswith("?")
-           else f"опечатка в аркане: {arcana_typos(text)}" if arcana_typos(text)
+           else f"опечатка в аркане: {typos}" if typos
            else f"мужской род: «{masc.group(0)}»" if masc
            else f"длина: {words} слов, {len(text)} знаков" if not (FATE_MIN_WORDS <= words <= 120 and len(text) <= FATE_MAX_CHARS)
            else "")
