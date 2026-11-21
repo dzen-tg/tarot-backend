@@ -170,7 +170,10 @@ PACK_BY_PRODUCT: dict = {}  # числовой product_id из вебхука �
 # Цены для показа в мини-аппе. При старте подтягиваются из Tribute (load_tribute_products),
 # эти значения – запасные, если API не ответил. Списывает Tribute всегда цену из карточки товара.
 CARD_PRICES = _parse_prices(os.getenv("TRIBUTE_PRICES", "pack_150:199,pack_450:499,pack_750:899"))
-CARD_LINKS: dict = {}  # pack → веб-ссылка на оплату картой
+CARD_LINKS: dict = {}  # pack → веб-ссылка на оплату картой (запасная)
+# pack → ссылка на мини-апп Tribute внутри Telegram. Веб-страница просит войти через Telegram,
+# после входа человек остаётся в Telegram и не доходит до ввода карты – поэтому открываем мини-апп.
+CARD_APP_LINKS: dict = {}
 # Курс рубля к доллару для подсказки «≈ в другой валюте»: сколько долларов стоит 1 рубль (например 0.0125).
 # Списание всё равно идёт в TRIBUTE_CURRENCY.
 RUB_USD_RATE = float(os.getenv("RUB_USD_RATE", "0.0125"))
@@ -188,6 +191,8 @@ async def load_tribute_products():
         return
     for pack, ref in TRIBUTE_PRODUCT_IDS.items():
         CARD_LINKS.setdefault(pack, f"https://web.tribute.tg/p/{ref}")
+        if not ref.isdigit():
+            CARD_APP_LINKS.setdefault(pack, f"https://t.me/tribute/app?startapp=p{ref}")
         if ref.isdigit():
             PACK_BY_PRODUCT[int(ref)] = pack
     for attempt in range(5):
@@ -217,6 +222,12 @@ async def load_tribute_products():
         TRIBUTE_CURRENCY_SIGN = {"rub": "₽", "usd": "$", "eur": "€"}.get(cur, "")
         if d.get("webLink"):
             CARD_LINKS[pack] = d["webLink"]
+        app_link = str(d.get("link") or "")
+        web_code = str(d.get("webLink") or "").rstrip("/").rsplit("/p/", 1)
+        if app_link.startswith("https://t.me/"):
+            CARD_APP_LINKS[pack] = app_link
+        elif len(web_code) == 2 and web_code[1]:
+            CARD_APP_LINKS[pack] = f"https://t.me/tribute/app?startapp=p{web_code[1]}"
         log(f"Tribute: {pack} → товар {d['id']} ({ref}), {CARD_PRICES[pack]} {cur}, статус {d.get('status')}")
 
 
@@ -3298,7 +3309,7 @@ async def create_tribute_order(payload: dict, authorization: str = Header(None))
     return {
         "order_id": order_id,
         "payment_url": CARD_LINKS.get(pack) or f"https://web.tribute.tg/p/{TRIBUTE_PRODUCT_IDS[pack]}",
-        "webapp_url": "",
+        "webapp_url": CARD_APP_LINKS.get(pack, ""),
     }
 
 
