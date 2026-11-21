@@ -3945,7 +3945,6 @@ async def open_start_func(chat_id: int, uid: int, func: str) -> bool:
     return True
 
 
-@dp.update.outer_middleware()
 async def sync_bot_profile():
     """Меню команд, описание и About бота на 11 языках: Telegram показывает их по языку человека,
     для языков вне списка – английский (default). Ставим только то, что отличается, – так не упираемся в лимиты."""
@@ -3978,6 +3977,7 @@ async def sync_bot_profile():
     log(f"Профиль бота на {len(prof)} языках: обновлено {changed}")
 
 
+@dp.update.outer_middleware()
 async def lang_middleware(handler, event, data):
     """Этап 7: язык человека для всех ответов бота и раскладов в этом обновлении."""
     u = data.get("event_from_user")
