@@ -475,6 +475,8 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang VARCHAR(8) DEFAULT NULL",
             # Язык выбран вручную в мини-аппе – не перезаписываем его языком Telegram
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang_manual BOOLEAN DEFAULT FALSE",
+            # Код судьбы на каждом языке, где он уже написан (JSON: язык → текст) – при смене языка без ИИ
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_texts TEXT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_clarify INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS adult_confirmed BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_msgs_total INTEGER DEFAULT 0",
@@ -3185,6 +3187,8 @@ async def user_settings(payload: dict, authorization: str = Header(None)):
     if isinstance(lang, str) and lang in SUPPORTED_LANGS:
         await p.execute("UPDATE users SET lang = $2, lang_manual = TRUE WHERE telegram_id = $1",
                         user["telegram_id"], lang)
+        if lang != ulang(user):
+            await switch_fate_lang(user, ulang(user), lang)
         track(user["telegram_id"], "lang_selected", {"lang": lang, "from": ulang(user)})
     return {"ok": True}
 
@@ -5112,16 +5116,40 @@ async def fate_or_pending(uid: int, d: date) -> Optional[str]:
 fate_wakeup = asyncio.Event()   # появился человек, который ждёт Код судьбы – фоновый цикл просыпается раньше
 
 
+async def switch_fate_lang(user: dict, old: str, new: str):
+    """Смена языка: Код судьбы на новом языке берём из сохранённых, если он там уже есть.
+    Нет – помечаем текст старым, и он один раз перепишется на новом языке при следующем открытии."""
+    if not user.get("fate_code_text"):
+        return
+    try:
+        texts = json.loads(user.get("fate_texts") or "{}")
+    except Exception:
+        texts = {}
+    cur = user["fate_code_text"]
+    if fate_is_fresh(user) and FATE_FALLBACK_MARK not in cur:
+        texts.setdefault(old, cur)
+    p = await db()
+    if texts.get(new) and user.get("birth_date"):
+        await p.execute("UPDATE users SET fate_code_text = $2, personality_arcana = $3, fate_texts = $4 "
+                        "WHERE telegram_id = $1", user["telegram_id"], texts[new],
+                        personality_arcana(user["birth_date"]), json.dumps(texts, ensure_ascii=False))
+    else:
+        await p.execute("UPDATE users SET personality_arcana = NULL, fate_texts = $2 WHERE telegram_id = $1",
+                        user["telegram_id"], json.dumps(texts, ensure_ascii=False) if texts else None)
+
+
 async def save_fate_code(uid: int, d: date, text: Optional[str] = None) -> str:
     """Сгенерировать текст и сохранить: впервые или вместо старого текста с одним арканом – один раз.
     Если параллельно уже сохранили новый – вернуть сохранённый."""
     text = text or await generate_fate_code(d)
     p = await db()
     saved = await p.fetchval("""
-        UPDATE users SET fate_code_text = $2, fate_code_at = NOW(), personality_arcana = $3
+        UPDATE users SET fate_code_text = $2, fate_code_at = NOW(), personality_arcana = $3,
+            fate_texts = CASE WHEN $3::int IS NULL THEN fate_texts
+                ELSE (COALESCE(fate_texts, '{}')::jsonb || jsonb_build_object($4::text, $2::text))::text END
         WHERE telegram_id = $1 AND (fate_code_text IS NULL OR personality_arcana IS NULL)
         RETURNING fate_code_text
-    """, uid, text, None if FATE_FALLBACK_MARK in text else personality_arcana(d))
+    """, uid, text, None if FATE_FALLBACK_MARK in text else personality_arcana(d), LANG.get())
     if saved and FATE_FALLBACK_MARK not in text:
         track(uid, "fate_code_done")
     # запасной текст сохраняем без аркана: он считается старым, и его перепишут, когда ИИ снова доступен
