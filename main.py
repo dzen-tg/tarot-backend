@@ -13,6 +13,7 @@
   кнопка-меню мини-аппа, команды /ref и /stop.
 """
 import os
+import sys
 import json
 import base64
 import hmac
@@ -252,6 +253,9 @@ WEBHOOK_PATH = "/telegram-webhook"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+# «Мой 2027» – отдельный модуль; его обработчики срабатывают только для своих кнопок и ввода
+import forecast2027
+forecast2027.setup_bot(sys.modules[__name__], dp)
 
 # Старый бот после переезда: отвечает «мы переехали» и делает рассылку о переезде.
 # Задайте OLD_BOT_TOKEN в Render – без него этот режим выключен.
@@ -2625,6 +2629,7 @@ async def lifespan(_app: FastAPI):
         asyncio.create_task(load_tribute_products()),
         asyncio.create_task(news_scheduler()),
         asyncio.create_task(deck_backfill()),
+        asyncio.create_task(forecast2027.on_startup()),
     ]
     yield
     for t in tasks:
@@ -2696,6 +2701,7 @@ async def save_feedback(uid: int, username: Optional[str], kind: str, rating: Op
 
 
 app = FastAPI(lifespan=lifespan)
+forecast2027.setup_api(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -3379,6 +3385,10 @@ async def tribute_webhook(request: Request):
         log(f"Tribute: нет product_id/telegram_user_id в событии {event}")
         return {"ok": True}
     pack = PACK_BY_PRODUCT.get(int(product_id))
+    if pack in forecast2027.PRODUCTS:
+        return await forecast2027.on_tribute(
+            int(tg_id), pack, purchase_id or f"{product_id}:{tg_id}:{data.get('created_at') or _find_key(data, ('createdat',))}",
+            event, _find_key(pl, ("amount",)))
     if not pack:
         log(f"Tribute: товар {product_id} не привязан к пакету (проверь TRIBUTE_PRODUCTS)")
         return {"ok": True}
@@ -3816,7 +3826,8 @@ def preset_offer_kb(user: dict, src: str = "onboard") -> InlineKeyboardMarkup:
 
 def menu_kb(user: dict) -> InlineKeyboardMarkup:
     lang = ulang(user)
-    return InlineKeyboardMarkup(inline_keyboard=[
+    f27 = forecast2027.menu_button(user)
+    return InlineKeyboardMarkup(inline_keyboard=([f27] if f27 else []) + [
         [app_btn(tr("btn_menu_daily", lang), open="daily", **{"from": "menu"}),
          app_btn(tr("btn_menu_ask", lang), open="quick", **{"from": "menu"})],
         [app_btn(tr("btn_menu_spreads", lang), open="spreads", **{"from": "menu"}),
@@ -4007,6 +4018,14 @@ async def cmd_start(message: Message, command: CommandObject):
         func = command.args
     track(u.id, "start", {"param": (command.args or "")[:64] or None, "new": created, "source": src, "func": func})
     lang = ulang(user)
+    # Ссылка t.me/<бот>?start=2027 или 2027_<источник> – сразу сценарий «Мой 2027» (если он включён для человека)
+    if forecast2027.is_start(command.args) and forecast2027.visible_for(user):
+        if created:
+            track(u.id, "signup", {"source": user.get("source")})
+            p = await db()
+            await p.execute("UPDATE users SET onboard_step = 0 WHERE telegram_id = $1", u.id)
+        await forecast2027.open_flow(message.chat.id, user, source=command.args)
+        return
 
     if created:
         # Новый: одно сообщение и одна кнопка. Согласие – строкой под текстом, источник – из ссылки.
@@ -5145,7 +5164,7 @@ async def save_fate_code(uid: int, d: date, text: Optional[str] = None) -> str:
     p = await db()
     saved = await p.fetchval("""
         UPDATE users SET fate_code_text = $2, fate_code_at = NOW(), personality_arcana = $3,
-            fate_texts = CASE WHEN $3::int IS NULL THEN fate_texts
+            fate_texts = CASE WHEN $3::smallint IS NULL THEN fate_texts
                 ELSE (COALESCE(fate_texts, '{}')::jsonb || jsonb_build_object($4::text, $2::text))::text END
         WHERE telegram_id = $1 AND (fate_code_text IS NULL OR personality_arcana IS NULL)
         RETURNING fate_code_text
@@ -5789,6 +5808,8 @@ async def on_bot_blocked(ev: ChatMemberUpdated):
 
 @dp.pre_checkout_query()
 async def process_pre_checkout(q: PreCheckoutQuery):
+    if forecast2027.is_payload(q.invoice_payload):
+        return await forecast2027.on_pre_checkout(q)
     ok = _parse_invoice_payload(q.invoice_payload) is not None
     await q.answer(ok=ok, error_message=None if ok else "Счёт устарел, создайте новый в приложении.")
 
@@ -5796,6 +5817,8 @@ async def process_pre_checkout(q: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     pay = message.successful_payment
+    if forecast2027.is_payload(pay.invoice_payload):
+        return await forecast2027.on_successful_payment(message)
     parsed = _parse_invoice_payload(pay.invoice_payload)
     if not parsed:
         log(f"Неизвестный payload платежа: {pay.invoice_payload}")
