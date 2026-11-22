@@ -55,16 +55,16 @@ STAGE = _env_int("FORECAST_2027_STAGE", 1)          # 1 – нумерологи
 PROMO_PCT = _env_int("FORECAST_2027_PROMO_PCT", 0)  # скидка в % на Stars и ⚡ (карта – цена из карточки Tribute)
 PROMO_UNTIL = os.getenv("FORECAST_2027_PROMO_UNTIL", "")   # ГГГГ-ММ-ДД включительно; пусто – без срока
 
-# emoji, название, рубли (для показа, списывает Tribute), звёзды, энергия, этап
+# emoji, название, рубли (для показа, списывает Tribute), звёзды, энергия (= звёзды: 1 ⚡ = 1 ⭐ по базовому курсу), этап
 PRODUCTS = {
     "full_2027": ("✨", "Весь 2027", _env_int("F27_RUB_FULL", 1990), _env_int("F27_STARS_FULL", 1200),
-                  _env_int("F27_ENERGY_FULL", 1990), 2),
+                  _env_int("F27_ENERGY_FULL", 1200), 2),
     "tarot_2027": ("🃏", "Таро-прогноз 2027", _env_int("F27_RUB_TAROT", 990), _env_int("F27_STARS_TAROT", 600),
-                   _env_int("F27_ENERGY_TAROT", 990), 1),
+                   _env_int("F27_ENERGY_TAROT", 600), 1),
     "astro_2027": ("🪐", "Астропрогноз 2027", _env_int("F27_RUB_ASTRO", 1290), _env_int("F27_STARS_ASTRO", 800),
-                   _env_int("F27_ENERGY_ASTRO", 1290), 2),
+                   _env_int("F27_ENERGY_ASTRO", 800), 2),
     "numerology_2027": ("🔢", "Нумерология 2027", _env_int("F27_RUB_NUM", 490), _env_int("F27_STARS_NUM", 300),
-                        _env_int("F27_ENERGY_NUM", 490), 1),
+                        _env_int("F27_ENERGY_NUM", 300), 1),
 }
 PARTS = ("numerology_2027", "tarot_2027", "astro_2027")   # что входит в «Весь 2027»
 SPHERES = [("love", "❤️ Любовь"), ("money", "💼 Деньги и работа"), ("growth", "🌱 Саморазвитие"), ("all", "✨ Всё сразу")]
