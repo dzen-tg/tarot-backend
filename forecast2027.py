@@ -848,7 +848,9 @@ async def pay_kb(user: dict, kind: str) -> InlineKeyboardMarkup:
     if card:
         rows.append([card])
     bal = user.get("balance") or 0
-    if bal >= price(kind, "energy"):
+    if uid in M.ADMIN_IDS:
+        rows.append([InlineKeyboardButton(text=T("⚡ Тест для админа – бесплатно"), callback_data=f"f27:energy:{kind}")])
+    elif bal >= price(kind, "energy"):
         rows.append([InlineKeyboardButton(text=T("⚡ Оплатить энергией – {n}", n=price(kind, "energy")),
                                           callback_data=f"f27:energy:{kind}")])
     rows.append([InlineKeyboardButton(text=T("← Назад"), callback_data="f27:open")])
@@ -945,6 +947,41 @@ def register(dp):
         await save_profile(uid, birth_date=d)
         await ask_sphere(message.chat.id)
 
+    @dp.message(Command("f27test"))
+    async def cmd_f27test(message: Message, command: CommandObject):
+        """Админ: прислать прогноз без оплаты. /f27test tarot|numerology [new] – new пишет текст заново."""
+        if not M._is_admin_msg(message):
+            return
+        uid = message.from_user.id
+        args = (command.args or "").lower().split()
+        kind = {"tarot": "tarot_2027", "numerology": "numerology_2027", "num": "numerology_2027",
+                "astro": "astro_2027", "full": "full_2027"}.get(args[0] if args else "tarot", "tarot_2027")
+        user = await M.get_user(uid) or {"telegram_id": uid}
+        M.set_lang(user)
+        if not (await get_profile(uid)).get("birth_date"):
+            await message.answer("Сначала заполни данные: «🔮 Мой 2027» в меню.")
+            return
+        if "new" in args:
+            p = await M.db()
+            await p.execute("DELETE FROM forecasts_2027 WHERE telegram_id = $1 AND product = ANY($2::text[])",
+                            uid, parts_of(kind))
+        await message.answer(f"Тест: {kind}, язык {M.ulang(user)} – генерирую, это до пары минут…")
+        asyncio.create_task(fulfil(uid, kind))
+
+    @dp.message(Command("f27reset"))
+    async def cmd_f27reset(message: Message):
+        """Админ: стереть СВОИ тестовые прогнозы и покупки за 0 (бесплатные тесты), чтобы проверить заново."""
+        if not M._is_admin_msg(message):
+            return
+        uid = message.from_user.id
+        p = await M.db()
+        n1 = await p.fetchval("WITH d AS (DELETE FROM forecasts_2027 WHERE telegram_id = $1 RETURNING 1) "
+                              "SELECT COUNT(*) FROM d", uid)
+        n2 = await p.fetchval("WITH d AS (DELETE FROM forecast_orders WHERE telegram_id = $1 AND amount = 0 "
+                              "RETURNING 1) SELECT COUNT(*) FROM d", uid)
+        await message.answer(f"Сброшено: прогнозов {n1}, бесплатных тестовых покупок {n2}. "
+                             "Настоящие оплаты не тронуты.")
+
     @dp.message(Command("who"))
     async def cmd_who(message: Message, command: CommandObject):
         if not M._is_admin_msg(message):
@@ -1035,7 +1072,8 @@ def _product_view(kind: str, have: set, lang: str) -> dict:
     e, title, rub, stars, energy, _ = PRODUCTS[kind]
     return {"id": kind, "emoji": e, "title": T(title), "stars": price(kind, "stars"),
             "energy": price(kind, "energy"), "card": price(kind, "card") if card_ok(kind, lang) else None,
-            "card_sign": M.TRIBUTE_CURRENCY_SIGN or "₽", "owned": kind in have, "can_buy": can_buy(kind, have),
+            "card_sign": M.TRIBUTE_CURRENCY_SIGN or "₽",
+            "card_alt": M.alt_price(price(kind, "card")) if card_ok(kind, lang) else "", "owned": kind in have, "can_buy": can_buy(kind, have),
             "parts": list(parts_of(kind)) if kind == "full_2027" else None}
 
 
@@ -1045,7 +1083,7 @@ def _fmt_date(d) -> Optional[str]:
 
 @api.get("/api/f27/state")
 async def api_state(authorization: str = Header(None)):
-    user, _ = await M.auth_user(authorization)
+    user, admin = await M.auth_user(authorization)
     if not visible_for(user):
         return {"enabled": False}
     uid, lang = user["telegram_id"], M.ulang(user)
@@ -1066,7 +1104,7 @@ async def api_state(authorization: str = Header(None)):
                         "birth_date": _fmt_date(prof.get("birth_date") or user.get("birth_date")),
                         "complete": bool(prof.get("name") and prof.get("birth_date") and prof.get("sphere"))},
             "spheres": [[k, T(t)] for k, t in SPHERES], "teaser": teaser, "forecasts": status,
-            "balance": user.get("balance") or 0}
+            "balance": 99999 if admin else (user.get("balance") or 0)}   # админу ⚡ – бесплатный тест
 
 
 @api.post("/api/f27/profile")
