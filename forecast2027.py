@@ -10,6 +10,7 @@ on – видят все. Числа и карты считает код, ИИ �
 из тех же расчётов бесплатно и хранится рядом с прежним.
 """
 import asyncio
+import astro2027
 import hashlib
 import hmac
 import io
@@ -208,7 +209,7 @@ async def get_profile(uid: int) -> dict:
 
 
 async def save_profile(uid: int, **fields):
-    allowed = {"name", "birth_date", "sphere", "source", "teaser_at"}
+    allowed = {"name", "birth_date", "sphere", "source", "teaser_at", "birth_time", "birth_city", "lat", "lon", "tz"}
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
@@ -234,6 +235,22 @@ async def owned(uid: int) -> set:
     return out
 
 
+async def bought(uid: int) -> list:
+    """Что реально куплено или подарено (без раскрытия «Весь 2027» на части) – для «Моих прогнозов»."""
+    p = await M.db()
+    rows = await p.fetch("SELECT product, MIN(created_at) AS at FROM forecast_orders WHERE telegram_id = $1 "
+                         "AND status = 'paid' GROUP BY product ORDER BY at", uid)
+    return [r["product"] for r in rows if r["product"] in PRODUCTS]
+
+
+ASTRO_KINDS = ("astro_2027", "full_2027")
+
+
+def needs_astro(kind: str, prof: dict) -> bool:
+    """Астро и «Весь 2027» – нужны время рождения («?» – не знаю) и город."""
+    return kind in ASTRO_KINDS and (prof.get("birth_time") is None or not prof.get("birth_city"))
+
+
 def can_buy(kind: str, have: set) -> bool:
     """Часть линейки уже куплена – комплект не предлагаем, только недостающее."""
     if kind in have:
@@ -254,17 +271,21 @@ def is_payload(raw: str) -> bool:
 
 
 def parse_payload(raw: str) -> Optional[tuple]:
+    """«f27:<продукт>:<uid>:<случайное>» или с «:g» в конце – подарок. → (продукт, uid, подарок?)"""
     parts = (raw or "").split(":")
-    if len(parts) != 4 or parts[0] != PAYLOAD_PREFIX or parts[1] not in PRODUCTS or not parts[2].isdigit():
+    if len(parts) not in (4, 5) or parts[0] != PAYLOAD_PREFIX or parts[1] not in PRODUCTS or not parts[2].isdigit():
         return None
-    return parts[1], int(parts[2])
+    if len(parts) == 5 and parts[4] != "g":
+        return None
+    return parts[1], int(parts[2]), len(parts) == 5
 
 
-async def stars_link(kind: str, uid: int) -> str:
+async def stars_link(kind: str, uid: int, gift: bool = False) -> str:
     return await M.bot.create_invoice_link(
-        title=f"{PRODUCTS[kind][0]} {T(PRODUCTS[kind][1])}"[:32],
-        description=T("Персональный прогноз на 2027 год: откроется сразу после оплаты, PDF придёт в чат."),
-        payload=f"{PAYLOAD_PREFIX}:{kind}:{uid}:{random.randint(100000, 999999)}",
+        title=(("🎁 " if gift else "") + f"{PRODUCTS[kind][0]} {T(PRODUCTS[kind][1])}")[:32],
+        description=T("Подарок: прогноз на 2027 год. После оплаты придёт ссылка, которую можно отправить.") if gift
+        else T("Персональный прогноз на 2027 год: откроется сразу после оплаты, PDF придёт в чат."),
+        payload=f"{PAYLOAD_PREFIX}:{kind}:{uid}:{random.randint(100000, 999999)}" + (":g" if gift else ""),
         provider_token="", currency="XTR", prices=[LabeledPrice(label="Telegram Stars", amount=price(kind, "stars"))])
 
 
@@ -273,20 +294,102 @@ def card_link(kind: str) -> str:
                                       if kind in M.TRIBUTE_PRODUCT_IDS else "")
 
 
-async def record_paid(uid: int, kind: str, method: str, amount: int, currency: str, charge_id: str) -> bool:
-    """Записать оплату. False – эта оплата уже записана (повторная доставка), ничего не делаем."""
+async def record_paid(uid: int, kind: str, method: str, amount: int, currency: str, charge_id: str,
+                      gift: bool = False) -> bool:
+    """Записать оплату. False – эта оплата уже записана (повторная доставка), ничего не делаем.
+    Подарок: заказ со статусом gift (покупателю прогноз не открывается) + одноразовый код."""
     p = await M.db()
     prof = await get_profile(uid)
     user = await M.get_user(uid) or {}
+    code = secrets.token_urlsafe(9).replace("-", "x").replace("_", "y")[:12] if gift else None
     oid = await p.fetchval("""
-        INSERT INTO forecast_orders (telegram_id, product, method, amount, currency, status, charge_id, source, lang)
-        VALUES ($1, $2, $3, $4, $5, 'paid', $6, $7, $8) ON CONFLICT (charge_id) DO NOTHING RETURNING id
-    """, uid, kind, method, amount, currency, charge_id, prof.get("source"), M.ulang(user))
+        INSERT INTO forecast_orders (telegram_id, product, method, amount, currency, status, charge_id, source, lang,
+                                     gift_code)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (charge_id) DO NOTHING RETURNING id
+    """, uid, kind, method, amount, currency, "gift" if gift else "paid", charge_id, prof.get("source"),
+        M.ulang(user), code)
     if not oid:
         return False
-    M.track(uid, "f27_paid", {"product": kind, "method": method, "amount": amount, "currency": currency})
-    asyncio.create_task(fulfil(uid, kind))
+    M.track(uid, "f27_paid", {"product": kind, "method": method, "amount": amount, "currency": currency, "gift": gift})
+    if gift:
+        await p.execute("INSERT INTO forecast_gifts (code, buyer_id, product, order_charge_id) VALUES ($1, $2, $3, $4)",
+                        code, uid, kind, charge_id)
+        asyncio.create_task(send_gift_link(uid, kind, code))
+    else:
+        asyncio.create_task(fulfil(uid, kind))
     return True
+
+
+def gift_url(code: str) -> str:
+    return f"https://t.me/{M.BOT_USERNAME}?start=gift_{code}"
+
+
+async def send_gift_link(uid: int, kind: str, code: str):
+    user = await M.get_user(uid) or {}
+    M.set_lang(user)
+    url = gift_url(code)
+    share = "https://t.me/share/url?" + __import__("urllib.parse").parse.urlencode(
+        {"url": url, "text": T("🎁 Я дарю тебе {p} – открой ссылку, введи свои данные и получи прогноз.",
+                               p=ptitle(kind))})
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=T("📤 Отправить подарок"), url=share)]])
+    try:
+        await M.bot.send_message(uid, T("🎁 Подарок готов: {p}.\n\nОтправь эту ссылку тому, кого хочешь порадовать. "
+                                        "Она сработает один раз:\n{url}", p=ptitle(kind), url=url),
+                                 reply_markup=kb, link_preview_options=M.LinkPreviewOptions(is_disabled=True))
+    except Exception as e:
+        M.log(f"f27 gift link {uid}: {e}")
+
+
+async def redeem_gift(chat_id: int, user: dict, code: str) -> bool:
+    """Получатель открыл ссылку-подарок. Код одноразовый: второй раз не сработает."""
+    uid = user["telegram_id"]
+    M.set_lang(user)
+    p = await M.db()
+    row = await p.fetchrow("UPDATE forecast_gifts SET redeemed_by = $2, redeemed_at = NOW() "
+                           "WHERE code = $1 AND redeemed_by IS NULL RETURNING product, buyer_id", code, uid)
+    if not row:
+        await M.bot.send_message(chat_id, T("Эта подарочная ссылка уже использована или неверна."))
+        return False
+    kind = row["product"]
+    await p.execute("""
+        INSERT INTO forecast_orders (telegram_id, product, method, amount, currency, status, charge_id, lang, gift_code)
+        VALUES ($1, $2, 'gift', 0, 'gift', 'paid', $3, $4, $5) ON CONFLICT (charge_id) DO NOTHING
+    """, uid, kind, f"gift:{code}", M.ulang(user), code)
+    M.track(uid, "f27_gift_open", {"product": kind, "from": row["buyer_id"]})
+    await M.bot.send_message(chat_id, T("🎁 Тебе подарили «{p}»! Ответь на пару вопросов – и прогноз придёт сюда.",
+                                        p=ptitle(kind)))
+    try:
+        buyer = await M.get_user(row["buyer_id"]) or {}
+        tok = M.LANG.set(M.ulang(buyer))
+        await M.bot.send_message(row["buyer_id"], T("🎁 Твой подарок «{p}» открыли!", p=ptitle(kind)))
+        M.LANG.reset(tok)
+    except Exception:
+        pass
+    M.set_lang(user)
+    if not await fulfil_pending(chat_id, user):   # данные уже есть – выдаём сразу, иначе спрашиваем
+        await open_flow(chat_id, user)
+    return True
+
+
+async def fulfil_pending(chat_id: int, user: dict) -> bool:
+    """Есть купленное или подаренное без прогноза – выдать (сначала спросить астроданные, если нужны)."""
+    uid = user["telegram_id"]
+    prof = await get_profile(uid)
+    if not (prof.get("name") and prof.get("birth_date") and prof.get("sphere")):
+        return False
+    p = await M.db()
+    done = {r["product"] for r in await p.fetch("SELECT product FROM forecasts_2027 WHERE telegram_id = $1", uid)}
+    for kind in await bought(uid):
+        if kind in done:
+            continue
+        if needs_astro(kind, prof):
+            astro_next[uid] = ("deliver", kind)
+            await ask_time(chat_id)
+            return True
+        await M.bot.send_message(chat_id, T("✨ Раскладываю карты на твой 2027…"))
+        asyncio.create_task(fulfil(uid, kind))
+        return True
+    return False
 
 
 async def on_pre_checkout(q: PreCheckoutQuery):
@@ -300,9 +403,9 @@ async def on_successful_payment(message: Message):
     if not parsed:
         M.log(f"f27: неизвестный payload {pay.invoice_payload}")
         return
-    kind, uid = parsed
-    fresh = await record_paid(uid, kind, "stars", pay.total_amount, "XTR", pay.telegram_payment_charge_id)
-    if fresh:
+    kind, uid, gift = parsed
+    fresh = await record_paid(uid, kind, "stars", pay.total_amount, "XTR", pay.telegram_payment_charge_id, gift)
+    if fresh and not gift:
         M.set_lang(await M.get_user(uid))
         await message.answer(T("✨ Оплата прошла! Раскладываю карты на твой 2027…"))
 
@@ -323,9 +426,9 @@ async def on_tribute(uid: int, kind: str, base_key: str, event: str, amount: Opt
     return {"ok": True}
 
 
-async def pay_energy(user: dict, kind: str, admin: bool = False) -> bool:
+async def pay_energy(user: dict, kind: str, admin: bool = False, gift: bool = False) -> bool:
     uid = user["telegram_id"]
-    if not can_buy(kind, await owned(uid)):
+    if not gift and not can_buy(kind, await owned(uid)):
         raise HTTPException(status_code=400, detail=T("Этот прогноз уже открыт."))
     cost = 0 if admin else price(kind, "energy")
     if cost:
@@ -334,7 +437,7 @@ async def pay_energy(user: dict, kind: str, admin: bool = False) -> bool:
                               "RETURNING 1", uid, cost)
         if not ok:
             raise HTTPException(status_code=402, detail=T("Не хватает Энергии."))
-    return await record_paid(uid, kind, "energy", cost, "energy", f"energy:{uid}:{kind}:{secrets.token_hex(4)}")
+    return await record_paid(uid, kind, "energy", cost, "energy", f"energy:{uid}:{kind}:{secrets.token_hex(4)}", gift)
 
 
 # =====================================================================
@@ -348,6 +451,10 @@ SECTIONS_RU = [("intro", "Главная тема года"), ("core", ""), ("q1
 def core_title(kind: str, calc: dict) -> str:
     if kind == "numerology_2027":
         return T("Твой личный год {n}", n=calc["personal_year"])
+    if kind == "astro_2027":
+        return T("Твоё небо 2027")
+    if kind == "full_2027":
+        return T("Числа, карты и звёзды о твоём 2027")
     return T("Карта года: {card}", card=card_name(calc["year_card"]))
 
 
@@ -356,7 +463,7 @@ def section_title(kind: str, key: str, calc: dict) -> str:
 
 
 SYSTEM_COMMON = (
-    "Ты таролог и нумеролог проекта «Послание Таро». Ты сам сделал этот прогноз и пишешь его человеку от первого "
+    "Ты таролог, нумеролог и астролог проекта «Послание Таро». Ты сам сделал этот прогноз и пишешь его человеку от первого "
     "лица («я вижу», «я бы советовал»), тепло, по-дружески, на «ты», без воды. Это прогноз на {year} год.\n"
     "Главная сфера, на которую человек хочет посмотреть: {sphere} – делай на ней акцент, но не забывай остальное.\n"
     "Опирайся на данные и фрагменты базы: перескажи их своими словами, раскрой подробно и свяжи в цельную историю "
@@ -380,7 +487,8 @@ PART_GENERAL = [("intro", 60, 130, "главная тема года для эт
                 ("advice", 30, 80, "главный совет на год, тепло и конкретно")]
 MONTH_WORDS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
                "ноябрь", "декабрь"]
-PART_MONTHS = [(f"m{i + 1}", 35, 95, f"{m}: что принесёт месяц по его данным, на что направить силы и что учесть; "
+PART_MONTHS = [(f"m{i + 1}", 35, 95, f"{m}: что принесёт месяц по ЕГО данным (назови 1–2 конкретных факта из данных "
+                f"этого месяца – карту, число или планету с домом), на что направить силы и что учесть; "
                 f"начни с названия месяца") for i, m in enumerate(MONTH_WORDS)]
 GENDER_RU = re.compile(r"(?<![а-яё])ты\s+(?:будешь|станешь|была|был|стала|стал)\s+(?:[а-яё]+\s+)?"
                        r"[а-яё]+(?:на|на|ен|ов|ова|ая|ый|ой|ым)(?![а-яё])", re.I)
@@ -429,6 +537,53 @@ MONTHS_RU = ["январь", "февраль", "март", "апрель", "ма
              "ноябрь", "декабрь"]
 
 
+def _first(text: str) -> str:
+    """Первое предложение фрагмента базы – для «Весь 2027», чтобы запрос был легче."""
+    m = re.match(r"(.+?[.!?])(\s|$)", text or "")
+    return m.group(1) if m else (text or "")
+
+
+async def astro_calc(uid: int, prof: dict) -> dict:
+    """Натал и транзиты 2027 (в потоке – это расчёт эфемерид) + затмения и ретрограды года."""
+    nat = await asyncio.to_thread(astro2027.natal, M._sky_load, M._lon, prof["birth_date"],
+                                  None if prof.get("birth_time") in (None, "?") else prof["birth_time"],
+                                  prof.get("lat"), prof.get("lon"), prof.get("tz"))
+    tr = await asyncio.to_thread(astro2027.transits, M._sky_load, M._lon, nat, YEAR)
+    user = await M.get_user(uid) or {"telegram_id": uid}
+    try:
+        yd = await M.year_data(user, prof["birth_date"], YEAR)
+        key_events = yd.get("key_events") or []
+    except Exception as e:
+        M.log(f"f27 year_data {uid}: {e}")
+        key_events = []
+    # события года по месяцам: «… – 12 марта» → месяц 3
+    ev_by_month: dict = {}
+    for e in key_events:
+        for mm, gen in enumerate(["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+                                  "сентября", "октября", "ноября", "декабря"], 1):
+            if gen in e:
+                ev_by_month.setdefault(mm, []).append(e)
+    months = []
+    for i, mo in enumerate(tr["months"]):
+        pl = "; ".join(f"{x['name']} в знаке {x['sign']}" + (f", {x['house']}-й дом (тема дома: {x['house_theme']})"
+                                                              if x.get("house") else "") for x in mo["planets"])
+        nm = mo.get("new_moon")
+        if nm:
+            pl += f"; новолуние {nm['date']} в знаке {nm['sign']}" + (f", {nm['house']}-й дом" if nm.get("house") else "")
+        months.append({"planets": pl, "aspects": mo["aspects"], "events": ev_by_month.get(i + 1, [])})
+    summary = []
+    for key, name in (("jupiter", "Юпитер"), ("saturn", "Сатурн")):
+        pos = []
+        for mi in (0, 6, 11):
+            x = next(p for p in tr["months"][mi]["planets"] if p["key"] == key)
+            pos.append(f"{MONTHS_RU[mi]} – {x['sign']}" + (f", {x['house']}-й дом ({x['house_theme']})" if x.get("house") else ""))
+        summary.append(f"{name} в 2027: " + "; ".join(pos))
+    return {"natal": astro2027.natal_lines(nat), "time_known": nat["time_known"], "months": months,
+            "transit_summary": summary,
+            "ingress": tr["ingress"], "key_events": key_events,
+            "sun_sign": nat["points"]["sun"]["sign"], "asc_sign": nat["points"].get("asc", {}).get("sign")}
+
+
 def data_prompt(kind: str, calc: dict, prof: dict) -> tuple:
     """(тема ядра, данные года, данные месяцев). Год – с фрагментом базы, месяцы – каждый со своим фрагментом;
     общей части месяцы даются коротко, чтобы запросы были легче (минутный лимит ИИ)."""
@@ -436,11 +591,49 @@ def data_prompt(kind: str, calc: dict, prof: dict) -> tuple:
     cy, cm = base("cards_year"), base("cards_month")
     deck = M.get_tarot_deck()
     nm = lambda cid: deck[cid]["name"].replace("Старший Аркан: ", "")
+    ast = calc.get("astro") or {}
+
+    def sky_year() -> str:
+        lines = ["НАТАЛЬНАЯ КАРТА – положения планет в момент рождения (это НЕ транзиты 2027, о них не пиши "
+                 "как о событиях года): " + "; ".join(ast.get("natal") or []),
+                 "ТРАНЗИТЫ 2027 – где медленные планеты будут в 2027 году: " + " | ".join(ast.get("transit_summary") or [])]
+        if not ast.get("time_known"):
+            lines.append("Время рождения неизвестно: асцендента и домов нет, о Луне – осторожно.")
+        if ast.get("ingress"):
+            lines.append("Смена знаков в 2027: " + "; ".join(ast["ingress"]))
+        if ast.get("key_events"):
+            lines.append("События неба 2027: " + "; ".join(ast["key_events"]))
+        return "\n".join(lines)
+
+    def sky_month(i: int) -> str:
+        mo = (ast.get("months") or [{}] * 12)[i]
+        asp = "; ".join(mo.get("aspects") or []) or "точных аспектов нет"
+        ev = "; ".join(mo.get("events") or [])
+        return f"небо: {mo.get('planets', '')}; аспекты к наталу: {asp}" + (f"; события: {ev}" if ev else "")
+
     if kind == "numerology_2027":
         core = f"личный год {calc['personal_year']} по нумерологии: что он значит и чем станет для человека"
         year = f"Личный год {YEAR}: {calc['personal_year']}. База: {years.get(str(calc['personal_year']), '')}"
         short = [f"{MONTHS_RU[i]} – личный месяц {n}" for i, n in enumerate(calc["months"])]
         full = [f"{MONTHS_RU[i]}: личный месяц {n}. База: {months.get(str(n), '')}" for i, n in enumerate(calc["months"])]
+    elif kind == "astro_2027":
+        core = ("главные транзиты 2027 к натальной карте человека: что Юпитер и Сатурн затронут в его жизни, "
+                "с опорой на знак Солнца" + (" и асцендент" if ast.get("time_known") else "") +
+                ". Называй планеты, знаки и дома ровно как в данных, тему дома бери из скобок, ничего не досчитывай")
+        year = sky_year()
+        short = [f"{MONTHS_RU[i]} – " + "; ".join(((ast.get("months") or [{}] * 12)[i].get("events") or [])[:2])
+                 for i in range(12)]
+        full = [f"{MONTHS_RU[i]}: {sky_month(i)}" for i in range(12)]
+    elif kind == "full_2027":
+        yc = calc["year_card"]
+        core = ("как три системы вместе описывают год: личный год по нумерологии, карта года в таро и главные "
+                "транзиты – где они говорят об одном и где дополняют друг друга. Сведи в одну историю, "
+                "не пересказывай три части отдельно")
+        year = (f"Личный год {YEAR}: {calc['personal_year']}. База: {_first(years.get(str(calc['personal_year']), ''))}\n"
+                f"Карта года: {nm(yc)}. База: {_first(cy.get(str(yc), ''))}\n" + sky_year())
+        short = [f"{MONTHS_RU[i]} – месяц {n}, {nm(calc['month_cards'][i])}" for i, n in enumerate(calc["months"])]
+        full = [f"{MONTHS_RU[i]}: личный месяц {n} ({_first(months.get(str(n), ''))}); карта {nm(calc['month_cards'][i])} "
+                f"({_first(cm.get(str(calc['month_cards'][i]), ''))}); {sky_month(i)}" for i, n in enumerate(calc["months"])]
     else:
         yc = calc["year_card"]
         core = "карта года и что она говорит о годе"
@@ -497,7 +690,11 @@ async def ensure_forecast(uid: int, kind: str, lang: str) -> Optional[dict]:
         if not prof.get("birth_date"):
             return None
         if not row:
+            if needs_astro(kind, prof):
+                return None   # без времени и города астро не считаем – бот сначала спросит их
             calc = product_calc(kind, prof["birth_date"])
+            if kind in ASTRO_KINDS:
+                calc["astro"] = await astro_calc(uid, prof)
             row = await p.fetchrow("""
                 INSERT INTO forecasts_2027 (telegram_id, product, calc, lang) VALUES ($1, $2, $3, $4)
                 ON CONFLICT (telegram_id, product) DO UPDATE SET product = EXCLUDED.product RETURNING *
@@ -525,7 +722,7 @@ async def fulfil(uid: int, kind: str):
     """После оплаты: сгенерировать и прислать в чат (серия сообщений + PDF)."""
     user = await M.get_user(uid) or {"telegram_id": uid}
     lang = M.set_lang(user)
-    for part in parts_of(kind):
+    for part in [kind]:   # «Весь 2027» – один связный прогноз, а не три отдельных
         fc = None
         for attempt in range(3):
             fc = await ensure_forecast(uid, part, lang)
@@ -731,7 +928,9 @@ def check_token(tok: str) -> Optional[tuple]:
 # =====================================================================
 # БОТ: меню, сбор данных, тизер, оффер
 # =====================================================================
-waiting: dict = {}   # telegram_id → ("name"|"date", до какого времени ждём)
+waiting: dict = {}   # telegram_id → ("name"|"date"|"time"|"city", до какого времени ждём)
+astro_next: dict = {}   # telegram_id → (что сделать после астроданных: buy / deliver / gift, продукт)
+city_opts: dict = {}    # telegram_id → найденные города для выбора кнопкой
 
 
 def menu_button(user: dict) -> Optional[list]:
@@ -743,7 +942,75 @@ def menu_button(user: dict) -> Optional[list]:
 
 def is_start(args: Optional[str]) -> bool:
     a = (args or "").lower()
-    return a == str(YEAR) or a.startswith(f"{YEAR}_")
+    return a == str(YEAR) or a.startswith(f"{YEAR}_") or a.startswith("gift_")
+
+
+def start_allowed(user: dict, args: Optional[str]) -> bool:
+    """Подарочную ссылку открываем всем, пока модуль не выключен; остальное – по флагу."""
+    if (args or "").lower().startswith("gift_"):
+        return flag() != "off"
+    return visible_for(user)
+
+
+async def open_start(chat_id: int, user: dict, args: str):
+    if args.lower().startswith("gift_"):
+        await redeem_gift(chat_id, user, args[5:])
+    else:
+        await open_flow(chat_id, user, source=args)
+
+
+async def allowed(user: dict) -> bool:
+    """Кнопки модуля: видно по флагу или у человека уже есть подарок/покупка (пока модуль не выключен)."""
+    if visible_for(user):
+        return True
+    return flag() != "off" and bool(await bought(user["telegram_id"]))
+
+
+async def ask_time(chat_id: int):
+    uid = chat_id
+    waiting[uid] = ("time", time.time() + 900)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=T("Не знаю"), callback_data="f27:notime")]])
+    await M.bot.send_message(chat_id, T("🪐 Для астропрогноза нужно время рождения в формате ЧЧ:ММ (например, 07:30). "
+                                        "С ним я посчитаю асцендент и дома. Не знаешь – нажми кнопку."), reply_markup=kb)
+
+
+async def ask_city(chat_id: int):
+    waiting[chat_id] = ("city", time.time() + 900)
+    await M.bot.send_message(chat_id, T("Город рождения? Напиши название, например: Алматы."))
+
+
+async def after_astro(chat_id: int, user: dict):
+    """Астроданные собраны – продолжить то, ради чего спрашивали."""
+    uid = user["telegram_id"]
+    act, kind = astro_next.pop(uid, ("buy", None))
+    if not kind:
+        await send_teaser(chat_id, user)
+    elif act == "deliver":
+        await M.bot.send_message(chat_id, T("✨ Раскладываю карты на твой 2027…"))
+        asyncio.create_task(fulfil(uid, kind))
+    else:
+        await show_buy(chat_id, user, kind, gift=act == "gift")
+
+
+async def show_buy(chat_id: int, user: dict, kind: str, gift: bool = False):
+    uid = user["telegram_id"]
+    if not gift and not can_buy(kind, await owned(uid)):
+        await M.bot.send_message(chat_id, T("Этот прогноз уже открыт."), reply_markup=await offer_kb(user))
+        return
+    if not gift and needs_astro(kind, await get_profile(uid)):
+        astro_next[uid] = ("buy", kind)
+        await ask_time(chat_id)
+        return
+    if gift:
+        text = f"<b>🎁 {_h(ptitle(kind))}</b>\n\n" + T(
+            "Подарок: после оплаты придёт ссылка. Получатель откроет её, введёт свои данные и получит прогноз.")
+    else:
+        text = f"<b>{_h(ptitle(kind))}</b>\n\n" + T(
+            "Личный прогноз на 2027 по твоим данным: главная тема года, 4 квартала по месяцам, лучшие и "
+            "сложные периоды, совет на год. Откроется сразу после оплаты, PDF придёт сюда.")
+        if card_ok(kind, M.ulang(user)):
+            text += "\n\n" + T("Картой: на странице оплаты войди через Telegram, а после входа вернись в браузер.")
+    await M.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=await pay_kb(user, kind, gift))
 
 
 async def open_flow(chat_id: int, user: dict, source: Optional[str] = None):
@@ -810,6 +1077,8 @@ async def offer_kb(user: dict) -> InlineKeyboardMarkup:
             continue
         rows.append([InlineKeyboardButton(text=f"{ptitle(kind)} – {price_label(kind, lang)}",
                                           callback_data=f"f27:buy:{kind}")])
+    if STAGE >= 2:
+        rows.append([InlineKeyboardButton(text=T("🎁 Подарить прогноз"), callback_data="f27:giftmenu")])
     if have:
         rows.append([InlineKeyboardButton(text=T("📜 Мои прогнозы"), callback_data="f27:mine")])
     rows.append([InlineKeyboardButton(text=T("✏️ Изменить данные"), callback_data="f27:edit")])
@@ -834,25 +1103,26 @@ async def send_teaser(chat_id: int, user: dict):
                               teaser_text(calc, prof), await offer_kb(user))
 
 
-async def pay_kb(user: dict, kind: str) -> InlineKeyboardMarkup:
+async def pay_kb(user: dict, kind: str, gift: bool = False) -> InlineKeyboardMarkup:
     """Кнопки оплаты: «Звёздами», затем «Картой» (только ru); ⚡ – если хватает."""
     uid, lang = user["telegram_id"], M.ulang(user)
     stars = InlineKeyboardButton(text=T("⭐ Оплатить звёздами – {n}", n=price(kind, "stars")),
-                                 url=await stars_link(kind, uid))
+                                 url=await stars_link(kind, uid, gift))
     rows = []
     card = None
-    if card_ok(kind, lang) and card_link(kind):
+    if not gift and card_ok(kind, lang) and card_link(kind):   # подарок картой пока нельзя: Tribute не передаёт отметку
         card = InlineKeyboardButton(text=T("💳 Оплатить картой – {n} {cur}", n=price(kind, "card"),
                                            cur=M.TRIBUTE_CURRENCY_SIGN or "₽"), url=card_link(kind))
     rows.append([stars])        # звёзды первыми для всех языков, карта – второй
     if card:
         rows.append([card])
     bal = user.get("balance") or 0
+    ecb = f"f27:{'genergy' if gift else 'energy'}:{kind}"
     if uid in M.ADMIN_IDS:
-        rows.append([InlineKeyboardButton(text=T("⚡ Тест для админа – бесплатно"), callback_data=f"f27:energy:{kind}")])
+        rows.append([InlineKeyboardButton(text=T("⚡ Тест для админа – бесплатно"), callback_data=ecb)])
     elif bal >= price(kind, "energy"):
         rows.append([InlineKeyboardButton(text=T("⚡ Оплатить энергией – {n}", n=price(kind, "energy")),
-                                          callback_data=f"f27:energy:{kind}")])
+                                          callback_data=ecb)])
     rows.append([InlineKeyboardButton(text=T("← Назад"), callback_data="f27:open")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -865,7 +1135,7 @@ def register(dp):
         uid = cq.from_user.id
         user = await M.get_user(uid) or {"telegram_id": uid}
         M.set_lang(user)
-        if not visible_for(user):
+        if not await allowed(user):
             await cq.answer()
             return
         parts = cq.data.split(":")
@@ -881,23 +1151,39 @@ def register(dp):
         elif act == "sphere" and len(parts) > 2 and parts[2] in dict(SPHERES):
             await save_profile(uid, sphere=parts[2])
             M.track(uid, "f27_data", {"sphere": parts[2]})
-            await send_teaser(chat, user)
+            if not await fulfil_pending(chat, user):   # подарок или покупка ждут данных – сразу выдать
+                await send_teaser(chat, user)
         elif act == "edit":
             p = await M.db()
             await p.execute("UPDATE forecast_profiles SET name = NULL, sphere = NULL WHERE telegram_id = $1", uid)
             await open_flow(chat, user)
         elif act == "buy" and len(parts) > 2 and parts[2] in active_products():
-            kind = parts[2]
-            M.track(uid, "f27_click", {"product": kind})
-            if not can_buy(kind, await owned(uid)):
-                await M.bot.send_message(chat, T("Этот прогноз уже открыт."), reply_markup=await offer_kb(user))
-                return
-            text = f"<b>{_h(ptitle(kind))}</b>\n\n" + T(
-                "Личный прогноз на 2027 по твоим данным: главная тема года, 4 квартала по месяцам, лучшие и "
-                "сложные периоды, совет на год. Откроется сразу после оплаты, PDF придёт сюда.")
-            if card_ok(kind, M.ulang(user)):
-                text += "\n\n" + T("Картой: на странице оплаты войди через Telegram, а после входа вернись в браузер.")
-            await M.bot.send_message(chat, text, parse_mode="HTML", reply_markup=await pay_kb(user, kind))
+            M.track(uid, "f27_click", {"product": parts[2]})
+            await show_buy(chat, user, parts[2])
+        elif act == "giftmenu":
+            M.track(uid, "f27_click", {"product": "gift_menu"})
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text=f"🎁 {ptitle(k)} – {price(k, 'stars')} ⭐", callback_data=f"f27:gift:{k}")] for k in active_products()])
+            await M.bot.send_message(chat, T("Какой прогноз подарить? Получатель сам введёт свои данные."), reply_markup=kb)
+        elif act == "gift" and len(parts) > 2 and parts[2] in active_products():
+            M.track(uid, "f27_click", {"product": parts[2], "gift": True})
+            await show_buy(chat, user, parts[2], gift=True)
+        elif act == "genergy" and len(parts) > 2 and parts[2] in active_products():
+            try:
+                await pay_energy(user, parts[2], uid in M.ADMIN_IDS, gift=True)
+            except HTTPException as e:
+                await M.bot.send_message(chat, e.detail)
+        elif act == "notime":
+            waiting.pop(uid, None)
+            await save_profile(uid, birth_time="?")
+            await ask_city(chat)
+        elif act == "city" and len(parts) > 2 and parts[2].isdigit() and uid in city_opts:
+            opts = city_opts.pop(uid)
+            i = int(parts[2])
+            if i < len(opts):
+                c = opts[i]
+                await save_profile(uid, birth_city=f"{c['name']}, {c['country']}", lat=c["lat"], lon=c["lon"], tz=c["tz"])
+                await after_astro(chat, user)
         elif act == "energy" and len(parts) > 2 and parts[2] in active_products():
             M.track(uid, "f27_click", {"product": parts[2], "method": "energy"})
             try:
@@ -934,6 +1220,35 @@ def register(dp):
         await save_profile(uid, name=name)
         await ask_date(message.chat.id, user)
 
+    @dp.message(F.text & ~F.text.startswith("/"), _waiting("time"))
+    async def f27_time(message: Message):
+        uid = message.from_user.id
+        user = await M.get_user(uid) or {"telegram_id": uid}
+        M.set_lang(user)
+        m = re.fullmatch(r"\s*(\d{1,2})[:.\-\s](\d{2})\s*", message.text)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            await message.answer(T("Напиши время так: 07:30. Или нажми «Не знаю»."))
+            return
+        waiting.pop(uid, None)
+        await save_profile(uid, birth_time=f"{int(m.group(1)):02d}:{m.group(2)}")
+        await ask_city(message.chat.id)
+
+    @dp.message(F.text & ~F.text.startswith("/"), _waiting("city"))
+    async def f27_city(message: Message):
+        uid = message.from_user.id
+        user = await M.get_user(uid) or {"telegram_id": uid}
+        M.set_lang(user)
+        opts = await asyncio.to_thread(astro2027.find_city, message.text, 5)
+        if not opts:
+            await message.answer(T("Не нашёл такой город. Попробуй написать иначе или назови ближайший крупный город."))
+            return
+        waiting.pop(uid, None)
+        city_opts[uid] = opts
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{c['name']}, {c['country']}",
+                                                                         callback_data=f"f27:city:{i}")]
+                                                   for i, c in enumerate(opts)])
+        await message.answer(T("Выбери свой город:"), reply_markup=kb)
+
     @dp.message(F.text & ~F.text.startswith("/"), _waiting("date"))
     async def f27_date(message: Message):
         uid = message.from_user.id
@@ -964,7 +1279,11 @@ def register(dp):
         if "new" in args:
             p = await M.db()
             await p.execute("DELETE FROM forecasts_2027 WHERE telegram_id = $1 AND product = ANY($2::text[])",
-                            uid, parts_of(kind))
+                            uid, [kind])
+        if needs_astro(kind, await get_profile(uid)):
+            astro_next[uid] = ("deliver", kind)
+            await ask_time(message.chat.id)
+            return
         await message.answer(f"Тест: {kind}, язык {M.ulang(user)} – генерирую, это до пары минут…")
         asyncio.create_task(fulfil(uid, kind))
 
@@ -982,6 +1301,22 @@ def register(dp):
         await message.answer(f"Сброшено: прогнозов {n1}, бесплатных тестовых покупок {n2}. "
                              "Настоящие оплаты не тронуты.")
 
+    @dp.message(Command("langs"))
+    async def cmd_langs(message: Message, command: CommandObject):
+        """Админ: языки Telegram (телефона) у всех и у новых за N дней; сколько выбрали английский интерфейс."""
+        if not M._is_admin_msg(message):
+            return
+        days = int(command.args) if command.args and command.args.strip().isdigit() else 30
+        p = await M.db()
+        q = ("SELECT COALESCE(NULLIF(split_part(tg_lang, '-', 1), ''), '?') AS l, COUNT(*) AS n FROM users "
+             "WHERE NOT COALESCE(is_test, FALSE) {extra} GROUP BY 1 ORDER BY 2 DESC LIMIT 15")
+        allr = await p.fetch(q.format(extra=""))
+        newr = await p.fetch(q.format(extra="AND created_at > NOW() - make_interval(days => $1)"), days)
+        en = await p.fetchval("SELECT COUNT(*) FROM users WHERE lang = 'en' AND lang_manual")
+        fmt = lambda rows: " · ".join(f"{FLAGS.get(r['l'], '')}{r['l']} {r['n']}" for r in rows) or "–"
+        await message.answer(f"📱 Языки Telegram\n\nВсе: {fmt(allr)}\n\nНовые за {days} дн.: {fmt(newr)}\n\n"
+                             f"Выбрали английский интерфейс: {en}")
+
     @dp.message(Command("who"))
     async def cmd_who(message: Message, command: CommandObject):
         if not M._is_admin_msg(message):
@@ -990,7 +1325,7 @@ def register(dp):
 
 
 async def send_mine(chat_id: int, user: dict):
-    have = [k for k in await owned(user["telegram_id"]) if k in PRODUCTS and k != "full_2027"]
+    have = await bought(user["telegram_id"])
     if not have:
         await M.bot.send_message(chat_id, T("Здесь появятся твои прогнозы на 2027."), reply_markup=await offer_kb(user))
         return
@@ -1020,7 +1355,7 @@ async def send_who(message: Message, args: str):
     prefixes = ["f27_"] if funnel == "2027" else ["guide_"] if funnel == "guide" else ["f27_", "guide_"]
     p = await M.db()
     rows = await p.fetch("""
-        SELECT e.telegram_id, e.name, e.props, e.created_at, u.username, u.first_name, u.lang, fp.source
+        SELECT e.telegram_id, e.name, e.props, e.created_at, u.username, u.first_name, u.lang, u.tg_lang, fp.source
         FROM events e LEFT JOIN users u ON u.telegram_id = e.telegram_id
         LEFT JOIN forecast_profiles fp ON fp.telegram_id = e.telegram_id
         WHERE e.created_at > NOW() - make_interval(days => $1) AND (""" +
@@ -1029,7 +1364,7 @@ async def send_who(message: Message, args: str):
     """, days)
     people: dict = {}
     for r in rows:
-        if lang and (r["lang"] or "ru") != lang:
+        if lang and (r["tg_lang"] or "")[:2] != lang and (r["lang"] or "ru") != lang:
             continue
         d = people.setdefault(r["telegram_id"], {"u": r, "steps": [], "last": r["created_at"]})
         props = json.loads(r["props"] or "{}") if r["props"] else {}
@@ -1045,16 +1380,17 @@ async def send_who(message: Message, args: str):
         await message.answer(f"За {days} дн. никого.")
         return
     lines = [f"👥 За {days} дн.: {len(people)} чел."]
-    csv = ["telegram_id;username;name;lang;source;steps;last"]
+    csv = ["telegram_id;username;name;tg_lang;interface;source;steps;last"]
     for uid, d in sorted(people.items(), key=lambda x: x[1]["last"], reverse=True):
         u = d["u"]
-        lg = u["lang"] or "ru"
+        lg = M.lang_norm(u["lang"])
+        tl = (u["tg_lang"] or "?")[:5]
         nick = f"@{u['username']}" if u["username"] else str(uid)
-        lines.append(f"• {nick} · {M._h(u['first_name'] or '')} · {FLAGS.get(lg, '')} {lg} · "
+        lines.append(f"• {nick} · {M._h(u['first_name'] or '')} · 📱 {FLAGS.get(tl[:2], '')} {tl} · интерфейс {lg} · "
                      f"{' → '.join(d['steps'])}" + (f" · {u['source']}" if u["source"] else "") +
                      f" · {d['last']:%d.%m %H:%M}")
         csv.append(";".join(str(x).replace(";", ",") for x in
-                            (uid, u["username"] or "", u["first_name"] or "", lg, u["source"] or "",
+                            (uid, u["username"] or "", u["first_name"] or "", u["tg_lang"] or "", lg, u["source"] or "",
                              " → ".join(d["steps"]), f"{d['last']:%Y-%m-%d %H:%M}")))
     text = "\n".join(lines)
     if len(text) <= 3900:
@@ -1073,8 +1409,8 @@ def _product_view(kind: str, have: set, lang: str) -> dict:
     return {"id": kind, "emoji": e, "title": T(title), "stars": price(kind, "stars"),
             "energy": price(kind, "energy"), "card": price(kind, "card") if card_ok(kind, lang) else None,
             "card_sign": M.TRIBUTE_CURRENCY_SIGN or "₽",
-            "card_alt": M.alt_price(price(kind, "card")) if card_ok(kind, lang) else "", "owned": kind in have, "can_buy": can_buy(kind, have),
-            "parts": list(parts_of(kind)) if kind == "full_2027" else None}
+            "card_alt": M.alt_price(price(kind, "card")) if card_ok(kind, lang) else "", "owned": kind in have,
+            "can_buy": can_buy(kind, have), "astro": kind in ASTRO_KINDS}
 
 
 def _fmt_date(d) -> Optional[str]:
@@ -1084,10 +1420,11 @@ def _fmt_date(d) -> Optional[str]:
 @api.get("/api/f27/state")
 async def api_state(authorization: str = Header(None)):
     user, admin = await M.auth_user(authorization)
-    if not visible_for(user):
+    if not await allowed(user):
         return {"enabled": False}
     uid, lang = user["telegram_id"], M.ulang(user)
     have = await owned(uid)
+    mine = await bought(uid)
     prof = await get_profile(uid)
     teaser = None
     if prof.get("birth_date"):
@@ -1098,11 +1435,14 @@ async def api_state(authorization: str = Header(None)):
     p = await M.db()
     rows = await p.fetch("SELECT product, status, texts FROM forecasts_2027 WHERE telegram_id = $1", uid)
     status = {r["product"]: {"status": r["status"], "langs": list(json.loads(r["texts"] or "{}"))} for r in rows}
-    return {"enabled": True, "lang": lang, "show_card_first": False, "promo": promo_on(),
+    return {"enabled": True, "lang": lang, "show_card_first": False, "promo": promo_on(), "gifts": STAGE >= 2,
             "products": [_product_view(k, have, lang) for k in active_products()],
+            "bought": [{"id": k, "emoji": PRODUCTS[k][0], "title": T(PRODUCTS[k][1])} for k in mine],
             "profile": {"name": prof.get("name") or "", "sphere": prof.get("sphere") or "",
                         "birth_date": _fmt_date(prof.get("birth_date") or user.get("birth_date")),
-                        "complete": bool(prof.get("name") and prof.get("birth_date") and prof.get("sphere"))},
+                        "complete": bool(prof.get("name") and prof.get("birth_date") and prof.get("sphere")),
+                        "birth_time": prof.get("birth_time") or "", "birth_city": prof.get("birth_city") or "",
+                        "astro_complete": not needs_astro("astro_2027", prof)},
             "spheres": [[k, T(t)] for k, t in SPHERES], "teaser": teaser, "forecasts": status,
             "balance": 99999 if admin else (user.get("balance") or 0)}   # админу ⚡ – бесплатный тест
 
@@ -1110,7 +1450,7 @@ async def api_state(authorization: str = Header(None)):
 @api.post("/api/f27/profile")
 async def api_profile(payload: dict, authorization: str = Header(None)):
     user, _ = await M.auth_user(authorization)
-    if not visible_for(user):
+    if not await allowed(user):
         raise HTTPException(status_code=404, detail="off")
     uid = user["telegram_id"]
     name = re.sub(r"\s+", " ", str(payload.get("name") or "")).strip()[:40]
@@ -1127,7 +1467,53 @@ async def api_profile(payload: dict, authorization: str = Header(None)):
     await save_profile(uid, teaser_at=datetime.utcnow())
     c = teaser_calc(d)
     M.track(uid, "f27_teaser", {"py": c["personal_year"], "card": c["year_card"], "via": "app"})
+    await _start_pending(uid)
     return await api_state(authorization)
+
+
+async def _start_pending(uid: int):
+    """Подарок или покупка ждали данных – запустить генерацию (прогноз и PDF придут в чат, приложение покажет)."""
+    prof = await get_profile(uid)
+    p = await M.db()
+    done = {r["product"] for r in await p.fetch("SELECT product FROM forecasts_2027 WHERE telegram_id = $1", uid)}
+    for kind in await bought(uid):
+        if kind not in done and not needs_astro(kind, prof) and prof.get("sphere"):
+            asyncio.create_task(fulfil(uid, kind))
+
+
+@api.get("/api/f27/city")
+async def api_city(q: str, authorization: str = Header(None)):
+    await M.auth_user(authorization)
+    return {"cities": await asyncio.to_thread(astro2027.find_city, q, 6)}
+
+
+@api.post("/api/f27/astro")
+async def api_astro(payload: dict, authorization: str = Header(None)):
+    """Время рождения («не знаю» – пусто) и город из поиска. Город проверяем по своему списку, не верим клиенту."""
+    user, _ = await M.auth_user(authorization)
+    uid = user["telegram_id"]
+    t = str(payload.get("time") or "").strip()
+    if t and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", t):
+        raise HTTPException(status_code=400, detail=T("Напиши время так: 07:30. Или нажми «Не знаю»."))
+    name, country = str(payload.get("city") or ""), str(payload.get("country") or "")
+    c = next((x for x in await asyncio.to_thread(astro2027.find_city, name, 20) if x["country"] == country), None)
+    if not c:
+        raise HTTPException(status_code=400, detail=T("Не нашёл такой город. Попробуй написать иначе или назови ближайший крупный город."))
+    await save_profile(uid, birth_time=(f"{int(t.split(':')[0]):02d}:{t.split(':')[1]}" if t else "?"),
+                       birth_city=f"{c['name']}, {c['country']}", lat=c["lat"], lon=c["lon"], tz=c["tz"])
+    await _start_pending(uid)
+    return await api_state(authorization)
+
+
+@api.get("/api/f27/gifts")
+async def api_gifts(authorization: str = Header(None)):
+    """Купленные подарки – ссылки, чтобы отправить."""
+    user, _ = await M.auth_user(authorization)
+    p = await M.db()
+    rows = await p.fetch("SELECT code, product, redeemed_by IS NOT NULL AS used, created_at FROM forecast_gifts "
+                         "WHERE buyer_id = $1 ORDER BY created_at DESC LIMIT 20", user["telegram_id"])
+    return {"gifts": [{"code": r["code"], "title": ptitle(r["product"]), "used": r["used"], "url": gift_url(r["code"])}
+                      for r in rows]}
 
 
 @api.post("/api/f27/buy")
@@ -1138,21 +1524,26 @@ async def api_buy(payload: dict, authorization: str = Header(None)):
     M.check_can_pay(user)
     uid = user["telegram_id"]
     kind, method = str(payload.get("product") or ""), str(payload.get("method") or "")
-    if kind not in active_products() or method not in ("stars", "card", "energy"):
+    gift = bool(payload.get("gift")) and STAGE >= 2
+    if kind not in active_products() or method not in ("stars", "card", "energy") or (gift and method == "card"):
         raise HTTPException(status_code=400, detail="bad product")
-    if not (await get_profile(uid)).get("birth_date"):
-        raise HTTPException(status_code=400, detail=T("Сначала заполни данные."))
-    if not can_buy(kind, await owned(uid)):
-        raise HTTPException(status_code=400, detail=T("Этот прогноз уже открыт."))
-    M.track(uid, "f27_click", {"product": kind, "method": method, "via": "app"})
+    prof = await get_profile(uid)
+    if not gift:
+        if not prof.get("birth_date"):
+            raise HTTPException(status_code=400, detail=T("Сначала заполни данные."))
+        if needs_astro(kind, prof):
+            raise HTTPException(status_code=409, detail="astro")
+        if not can_buy(kind, await owned(uid)):
+            raise HTTPException(status_code=400, detail=T("Этот прогноз уже открыт."))
+    M.track(uid, "f27_click", {"product": kind, "method": method, "via": "app", "gift": gift})
     if method == "stars":
-        return {"invoice_link": await stars_link(kind, uid)}
+        return {"invoice_link": await stars_link(kind, uid, gift)}
     if method == "card":
         if not card_ok(kind, M.ulang(user)):
             raise HTTPException(status_code=400, detail=T("Оплата картой пока недоступна."))
         return {"payment_url": card_link(kind)}
-    await pay_energy(user, kind, admin)
-    return {"ok": True}
+    await pay_energy(user, kind, admin, gift)
+    return {"ok": True, "gift": gift}
 
 
 @api.get("/api/f27/forecast")
@@ -1165,6 +1556,8 @@ async def api_forecast(product: str, authorization: str = Header(None)):
     p = await M.db()
     row = await p.fetchrow("SELECT * FROM forecasts_2027 WHERE telegram_id = $1 AND product = $2", uid, product)
     texts = json.loads(row["texts"] or "{}") if row else {}
+    if lang not in texts and needs_astro(product, await get_profile(uid)):
+        return {"status": "need_astro"}
     if lang not in texts:
         lock = _gen_locks.get((uid, product))
         if not (lock and lock.locked()):

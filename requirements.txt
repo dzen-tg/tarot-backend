@@ -7,3 +7,4 @@ skyfield==1.49
 Pillow>=10.0
 fpdf2>=2.8
 uharfbuzz>=0.39
+tzdata>=2024.1

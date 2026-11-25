@@ -25,7 +25,10 @@ async def main():
     # Платёж-прогноз не похож на пакет и не уходит в начисление Энергии
     assert m._parse_invoice_payload("f27:tarot_2027:42:123456") is None
     assert f.is_payload("f27:tarot_2027:42:123456") and not f.is_payload("pack_150:42:1")
-    assert f.parse_payload("f27:tarot_2027:42:123456") == ("tarot_2027", 42)
+    assert f.parse_payload("f27:tarot_2027:42:123456") == ("tarot_2027", 42, False)
+    assert f.parse_payload("f27:tarot_2027:42:123456:g") == ("tarot_2027", 42, True)   # подарок
+    assert f.parse_payload("f27:tarot_2027:42:123456:x") is None
+    assert m._parse_invoice_payload("f27:tarot_2027:42:123456:g") is None
     assert f.parse_payload("f27:pack_150:42:1") is None
     # Товары-прогнозы и пакеты Tribute не пересекаются по названию
     assert not set(f.PRODUCTS) & set(m.PACKS) and not set(f.PRODUCTS) & set(m.SUBS)
@@ -43,7 +46,7 @@ async def main():
 
     # ── Обработчики «2027» стоят раньше общих, но срабатывают только на свои кнопки и ввод ──
     assert m.dp.callback_query.handlers[0].callback.__name__ == "f27_cb"
-    assert [h.callback.__name__ for h in m.dp.message.handlers][:2] == ["f27_name", "f27_date"]
+    assert [h.callback.__name__ for h in m.dp.message.handlers][:4] == ["f27_name", "f27_time", "f27_city", "f27_date"]
     print("✓ порядок обработчиков")
 
     # ── Расчёты ──
@@ -76,6 +79,19 @@ async def main():
     tk = f.pdf_token(5, "tarot_2027", "ru")
     assert f.check_token(tk) == (5, "tarot_2027", "ru") and f.check_token(tk[:-1] + "0") is None
     print("✓ ссылка на PDF подписана")
+
+    # ── Этап 2: астро ──
+    import astro2027 as a
+    c = a.find_city("Алматы", 1)[0]
+    assert c["tz"] == "Asia/Almaty"
+    nat = a.natal(m._sky_load, m._lon, date(1993, 4, 12), "07:30", c["lat"], c["lon"], c["tz"])
+    assert nat["points"]["sun"]["sign"] == "Овен" and nat["points"]["saturn"]["sign"] == "Водолей" and "asc" in nat
+    tr = a.transits(m._sky_load, m._lon, nat, 2027)
+    assert len(tr["months"]) == 12 and tr["months"][0]["planets"][1]["sign"] == "Овен"   # Сатурн в Овне в 2027
+    assert f.needs_astro("astro_2027", {"birth_time": None, "birth_city": None})
+    assert not f.needs_astro("astro_2027", {"birth_time": "?", "birth_city": "Алматы, KZ"})
+    assert not f.needs_astro("tarot_2027", {})
+    print("✓ астро: натал, транзиты, город")
     print("Все проверки пройдены.")
 
 

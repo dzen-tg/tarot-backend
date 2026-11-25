@@ -479,6 +479,11 @@ async def init_schema():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang VARCHAR(8) DEFAULT NULL",
             # Язык выбран вручную в мини-аппе – не перезаписываем его языком Telegram
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang_manual BOOLEAN DEFAULT FALSE",
+            # Язык Telegram (телефона) как есть – для статистики; интерфейс от него больше не зависит
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_lang VARCHAR(16) DEFAULT NULL",
+            # Кто ещё не заходил после обновления: в lang раньше лежал язык Telegram – переносим его в tg_lang
+            "UPDATE users SET tg_lang = lang WHERE tg_lang IS NULL AND lang IS NOT NULL "
+            "AND NOT COALESCE(lang_manual, FALSE)",
             # Код судьбы на каждом языке, где он уже написан (JSON: язык → текст) – при смене языка без ИИ
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS fate_texts TEXT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_clarify INTEGER DEFAULT 0",
@@ -791,6 +796,7 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
     uid = int(tg_user["id"])
     first_name = (tg_user.get("first_name") or "Искатель")[:255]
     lang = lang_of(tg_user.get("language_code")) if tg_user.get("language_code") is not None else None
+    tg_lang = (str(tg_user.get("language_code") or "").strip().lower()[:16]) or None   # язык Telegram как есть
     username = (tg_user.get("username") or None)
     referrer = None
     # Метка источника из ссылки вида t.me/<бот>?start=threads – сохраняется только для новых пользователей
@@ -804,11 +810,11 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
         async with c.transaction():
             row = await c.fetchrow("""
                 INSERT INTO users (telegram_id, username, first_name, email, consent_given, balance, free_readings,
-                                   free_preset, last_seen, lang)
-                VALUES ($1, $2, $3, '', TRUE, 0, $4, $5, NOW(), COALESCE($6, 'ru'))
+                                   free_preset, last_seen, lang, tg_lang)
+                VALUES ($1, $2, $3, '', TRUE, 0, $4, $5, NOW(), COALESCE($6, 'ru'), $7)
                 ON CONFLICT (telegram_id) DO NOTHING
                 RETURNING *
-            """, uid, username, first_name, FREE_READINGS_ON_START, FREE_PRESET_ON_START, lang)
+            """, uid, username, first_name, FREE_READINGS_ON_START, FREE_PRESET_ON_START, lang, tg_lang)
             created = row is not None
             credited_ref = None
             if created and (source or ref_param or is_test_user(uid, username)):
@@ -836,11 +842,12 @@ async def ensure_user(tg_user: dict, ref_param: Optional[str] = None) -> tuple:
                         balance = balance + $4,
                         move_gift_state = CASE WHEN $5 THEN 'given' ELSE move_gift_state END,
                         start_param = COALESCE(start_param, $6), source = COALESCE(source, $7),
-                        lang = CASE WHEN lang_manual THEN lang ELSE COALESCE($8, lang) END
+                        lang = CASE WHEN lang_manual THEN lang ELSE COALESCE($8, lang) END,
+                        tg_lang = COALESCE($9, tg_lang)
                     WHERE telegram_id = $1 RETURNING *
                 """, uid, username, first_name, MOVE_GIFT if move_gift else 0, move_gift,
                     (ref_param or "")[:64] or None, source if (ref_param or "").lower().startswith("src_") else None,
-                    lang)
+                    lang, tg_lang)
     result = dict(row)
     result["_move_gift"] = move_gift
     return result, created, credited_ref
@@ -2438,7 +2445,7 @@ async def send_followups() -> int:
         """, uid, r["id"], FOLLOWUP_DAYS)
         q = (r["question"] or "").strip()
         topic = q if len(q) <= 90 else q[:90].rsplit(" ", 1)[0] + "…"
-        text = tr("followup_week", r["lang"] or "ru", topic=topic)
+        text = tr("followup_week", lang_norm(r["lang"]), topic=topic)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Да, сбылось", callback_data=f"fu:{r['id']}:yes"),
              InlineKeyboardButton(text="❌ Нет", callback_data=f"fu:{r['id']}:no")],
@@ -2559,7 +2566,7 @@ async def send_returns() -> int:
             continue
         if r["what"] == "fate" and is_minor(dict(r)) and not (r["free_preset"] or 0):
             continue
-        uid, lang = r["telegram_id"], r["lang"] or "ru"
+        uid, lang = r["telegram_id"], lang_norm(r["lang"])
         if not await can_message(uid):
             continue
         await p.execute("UPDATE users SET return_sent = $2 WHERE telegram_id = $1", uid, r["what"])
@@ -3678,20 +3685,22 @@ DISCLAIMER = ("🔮 Добро пожаловать в «Послание Тар
 # onboard_step: NULL – старый пользователь; 0 – поздоровались; 1 – первая карта вытянута;
 # 2 – Код судьбы показан (или пропущен); 3 – время карты дня выбрано, предложен расклад
 # =====================================================================
-RU_LANGS = {"ru", "be"}   # белорусам – русский
-SUPPORTED_LANGS = {"ru", "uk", "kk", "en", "es", "ar", "uz", "tr", "pt", "de", "fr"}
+# Языки: по умолчанию у всех русский, английский – только если человек сам выбрал его в мини-аппе (кнопка 🌐).
+# Язык Telegram больше не учитывается. Сохранённые раньше другие языки (es, de…) читаются как русский.
+SUPPORTED_LANGS = {"ru", "en"}
 
 
 def lang_of(code: Optional[str]) -> str:
-    """Язык по языку Telegram: 11 языков; белорусский и пустой – русский, остальные – английский.й."""
-    c = (code or "").lower()[:2]
-    if not c or c in RU_LANGS:
-        return "ru"
-    return c if c in SUPPORTED_LANGS else "en"
+    """Язык нового или вернувшегося человека – всегда русский (английский выбирают вручную)."""
+    return "ru"
+
+
+def lang_norm(lang: Optional[str]) -> str:
+    return "en" if lang == "en" else "ru"
 
 
 def ulang(user: Optional[dict]) -> str:
-    return (user or {}).get("lang") or "ru"
+    return lang_norm((user or {}).get("lang"))
 
 
 def clean_name(name: Optional[str]) -> str:
@@ -3957,8 +3966,8 @@ async def open_start_func(chat_id: int, uid: int, func: str) -> bool:
 
 
 async def sync_bot_profile():
-    """Меню команд, описание и About бота на 11 языках: Telegram показывает их по языку человека,
-    для языков вне списка – английский (default). Ставим только то, что отличается, – так не упираемся в лимиты."""
+    """Меню команд, описание и About бота из bot_profile.json (сейчас – только русский, «default»).
+    Ставим только то, что отличается, – так не упираемся в лимиты Telegram."""
     try:
         prof = json.loads(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_profile.json"),
                                encoding="utf-8").read())
@@ -3985,7 +3994,23 @@ async def sync_bot_profile():
                 log(f"⚠️ Профиль бота ({lang}): {e}")
                 break
         await asyncio.sleep(0.3)
-    log(f"Профиль бота на {len(prof)} языках: обновлено {changed}")
+    # Языковые версии, которых больше нет в файле (раньше было 11 языков), – удалить: Telegram покажет основную
+    for code in ("ru", "en", "uk", "kk", "es", "ar", "uz", "tr", "pt", "de", "fr"):
+        if code in prof:
+            continue
+        try:
+            if await bot.get_my_commands(language_code=code):
+                await bot.delete_my_commands(language_code=code); changed += 1
+            if (await bot.get_my_description(language_code=code)).description:
+                await bot.set_my_description(description="", language_code=code); changed += 1
+            if (await bot.get_my_short_description(language_code=code)).short_description:
+                await bot.set_my_short_description(short_description="", language_code=code); changed += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            log(f"⚠️ Профиль бота, очистка {code}: {e}")
+        await asyncio.sleep(0.3)
+    log(f"Профиль бота: обновлено {changed}")
 
 
 @dp.update.outer_middleware()
@@ -3999,7 +4024,7 @@ async def lang_middleware(handler, event, data):
             lang = await p.fetchval("SELECT lang FROM users WHERE telegram_id = $1", u.id)
         except Exception:
             pass
-        LANG.set(lang or lang_of(u.language_code))
+        LANG.set(lang_norm(lang))
     return await handler(event, data)
 
 
@@ -4018,13 +4043,13 @@ async def cmd_start(message: Message, command: CommandObject):
         func = command.args
     track(u.id, "start", {"param": (command.args or "")[:64] or None, "new": created, "source": src, "func": func})
     lang = ulang(user)
-    # Ссылка t.me/<бот>?start=2027 или 2027_<источник> – сразу сценарий «Мой 2027» (если он включён для человека)
-    if forecast2027.is_start(command.args) and forecast2027.visible_for(user):
+    # Ссылка t.me/<бот>?start=2027, 2027_<источник> или gift_<код> – сразу сценарий «Мой 2027» / подарок
+    if forecast2027.is_start(command.args) and forecast2027.start_allowed(user, command.args):
         if created:
             track(u.id, "signup", {"source": user.get("source")})
             p = await db()
             await p.execute("UPDATE users SET onboard_step = 0 WHERE telegram_id = $1", u.id)
-        await forecast2027.open_flow(message.chat.id, user, source=command.args)
+        await forecast2027.open_start(message.chat.id, user, command.args)
         return
 
     if created:
@@ -5243,7 +5268,7 @@ async def refresh_fate_codes() -> int:
     for r in rows:
         if not r["fate_pending"]:
             _fate_day[1] += 1
-        LANG.set(r["lang"] or "ru")
+        LANG.set(lang_norm(r["lang"]))
         text = await generate_fate_code(r["birth_date"], fallback=False)
         if not text:  # ИИ недоступен или текст не прошёл проверки – старый не затираем
             _fate_fails[r["telegram_id"]] = _fate_fails.get(r["telegram_id"], 0) + 1
@@ -8130,7 +8155,7 @@ async def send_evening_questions() -> int:
     """, config.DEFAULT_TZ_MIN, config.EVENING_ASK_HOUR)
     sent = 0
     for r in rows:
-        uid, lang = r["telegram_id"], r["lang"] or "ru"
+        uid, lang = r["telegram_id"], lang_norm(r["lang"])
         await p.execute("UPDATE users SET evening_ask_date = $2 WHERE telegram_id = $1", uid, r["local_day"])
         cards = json.loads(r["cards"] or "[]")
         if not cards:
