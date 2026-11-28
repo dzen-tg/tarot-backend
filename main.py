@@ -265,7 +265,9 @@ OLD_WEBHOOK_PATH = "/old-bot-webhook"
 OLD_WEBHOOK_SECRET = hashlib.sha256(("wh-old:" + OLD_BOT_TOKEN).encode()).hexdigest()[:48] if OLD_BOT_TOKEN else ""
 MOVED_TEXT = (
     "🔮 Послание Таро переехало в нового бота: @{u}\n\n"
-    "Ваш баланс Энергии и бесплатные расклады перенесены – откройте нового бота и нажмите «Запустить»."
+    "Твой баланс Энергии уже там. А ещё – новый дизайн, Код судьбы, карта дня каждое утро "
+    "и личный прогноз «Мой 2027».\n\n"
+    "Нажми кнопку ниже, а в новом боте – «Запустить»."
 )
 
 
@@ -3594,6 +3596,67 @@ async def send_moved_reminder(cutoff: datetime) -> tuple:
     return sent, failed
 
 
+NEWS_SOURCE = "2027_oldbot"   # метка в ссылке – видно в /f27stats и в базе, сколько пришло из старого бота
+
+
+def moved_news_text(balance: int, with_2027: bool) -> str:
+    lines = [f"🔮 Послание Таро обновилось! Теперь всё в новом боте: @{BOT_USERNAME}\n", "Что нового:",
+             "✨ Новый дизайн приложения – расклады открываются красиво и быстро"]
+    if with_2027:
+        lines.append("📅 «Мой 2027» – личный прогноз на год: таро, нумерология и астрология по твоей дате рождения. "
+                     "Число и карту своего года можно узнать бесплатно")
+    lines += ["🔢 Код судьбы – что говорит о тебе дата рождения",
+              "🃏 Карта дня каждое утро, «Небо сегодня», сонник и совместимость"]
+    text = "\n".join(lines)
+    if balance > 0:
+        text += f"\n\nНа балансе тебя ждут {balance} Энергии."
+    return text + "\n\nНажми кнопку ниже, а в новом боте – «Запустить»."
+
+
+def moved_news_kb(with_2027: bool) -> InlineKeyboardMarkup:
+    return moved_kb(NEWS_SOURCE if with_2027 else None)
+
+
+async def moved_news_targets(days: int) -> list:
+    """Кому новости: были в старом боте (получали сообщение о переезде), но не открывали нового бота days дней.
+    Кому за последние 3 дня уже писали через старого бота – пропускаем, чтобы не задеть дважды."""
+    p = await db()
+    return await p.fetch("""
+        SELECT telegram_id, balance FROM users
+        WHERE moved_notified
+          AND (last_seen IS NULL OR last_seen < NOW() - make_interval(days => $1))
+          AND (moved_reminded_at IS NULL OR moved_reminded_at < NOW() - INTERVAL '3 days')
+    """, days)
+
+
+async def send_moved_news(days: int) -> tuple:
+    """Новости через старого бота. Без подарков и без изменений баланса. Возвращает (отправлено, не доставлено)."""
+    import forecast2027
+    with_2027 = forecast2027.flag() == "on"
+    p = await db()
+    sent = failed = 0
+    for r in await moved_news_targets(days):
+        uid = r["telegram_id"]
+        await p.execute("UPDATE users SET moved_reminded_at = NOW() WHERE telegram_id = $1", uid)
+        delivered = False
+        for attempt in range(2):
+            try:
+                await old_bot.send_message(uid, moved_news_text(r["balance"] or 0, with_2027),
+                                           reply_markup=moved_news_kb(with_2027))
+                delivered = True
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                break  # заблокировал старого бота
+        if delivered:
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return sent, failed
+
+
 async def missed_gift_candidates(cutoff: datetime) -> list:
     """Пользователи старого бота (зарегистрированы до cutoff), по которым ещё не решено, дошёл ли подарок за переезд."""
     p = await db()
@@ -5703,6 +5766,34 @@ async def cmd_moved_remind(message: Message, command: CommandObject):
         return
     await message.answer(f"📨 Отправляю напоминание {len(targets)} пользователям…")
     sent, failed = await send_moved_reminder(cutoff)
+    await message.answer(f"✅ Готово. Доставлено: {sent}. Не доставлено (заблокировали старого бота): {failed}.")
+
+
+@dp.message(Command("moved_news"))
+async def cmd_moved_news(message: Message, command: CommandObject):
+    """Только для админов. /moved_news – посчитать и показать текст; /moved_news go – разослать.
+    /moved_news 30 go – только тем, кто не заходил в новый бот 30 дней (по умолчанию 14)."""
+    import forecast2027
+    user = await get_user(message.from_user.id) or {"telegram_id": message.from_user.id, "username": message.from_user.username}
+    if not is_admin(user):
+        return
+    if not old_bot:
+        await message.answer("OLD_BOT_TOKEN не задан в Render – рассылать не через что.")
+        return
+    args = (command.args or "").lower().split()
+    days = next((int(a) for a in args if a.isdigit()), 14)
+    go = "go" in args
+    with_2027 = forecast2027.flag() == "on"
+    targets = await moved_news_targets(days)
+    if not go:
+        note = "" if with_2027 else ("\n\n(Строки про «Мой 2027» нет: FORECAST_2027_ENABLED не on. "
+                                      "Включи прогнозы для всех – и она появится, кнопка поведёт сразу в прогноз.)")
+        await message.answer(f"Новости получат до {len(targets)} чел. – были в старом боте и не заходили "
+                             f"в новый {days} дн.\nОтправить: /moved_news {days} go{note}\n\nТекст:")
+        await message.answer(moved_news_text(150, with_2027), reply_markup=moved_news_kb(with_2027))
+        return
+    await message.answer(f"📨 Отправляю новости {len(targets)} пользователям через старого бота…")
+    sent, failed = await send_moved_news(days)
     await message.answer(f"✅ Готово. Доставлено: {sent}. Не доставлено (заблокировали старого бота): {failed}.")
 
 
